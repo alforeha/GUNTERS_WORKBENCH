@@ -15,6 +15,8 @@ export const POINT_CLOUD_INDEX_TYPE = 'wpi-octree';
 export const POINT_CLOUD_INDEX_VERSION = 1;
 /** Generator identity recorded on every index so provenance is honest. */
 export const POINT_CLOUD_INDEX_GENERATOR_NAME = 'workbench';
+/** Semantic version of the WPI builder; stamped into generator.version on each index. */
+export const POINT_CLOUD_INDEX_BUILDER_VERSION = '1.0.0';
 
 /** All friendly index warnings share this prefix so open-time checks can dedupe them. */
 export const POINT_CLOUD_INDEX_WARNING_PREFIX = 'Point-cloud index';

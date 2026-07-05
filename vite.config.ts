@@ -10,8 +10,12 @@ export default defineConfig({
   plugins: [
     electron({
       main: {
-        // Shortcut of `build.lib.entry`.
-        entry: 'electron/main.ts',
+        // Multiple lib entries: the app entry plus the index-builder worker thread, both
+        // emitted into dist-electron so the worker sits beside main.js at runtime.
+        entry: {
+          main: 'electron/main.ts',
+          'pointcloud-index.worker': 'electron/pointcloud-index.worker.ts',
+        },
       },
       preload: {
         // Shortcut of `build.rollupOptions.input`.

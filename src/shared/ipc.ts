@@ -1,10 +1,13 @@
 import type {
   CreateProjectInput,
+  GeneratePointCloudIndexInput,
   ImportPointCloudInput,
   LoadPointCloudDensifiedNodesInput,
   LoadPointCloudPreviewInput,
   OpenProjectError,
   OpenProjectInput,
+  PointCloudIndexMetricsSummary,
+  PointCloudIndexProgress,
   PointCloudPreviewProgress,
   PointCloudPreviewState,
   ProjectManifest,
@@ -39,6 +42,12 @@ export interface WorkbenchIpc {
     warning: string | null;
     nodes: { nodeId: number; payload: PointCloudNodePayload }[];
   }>;
+  generatePointCloudIndex(input: GeneratePointCloudIndexInput): Promise<{
+    session: ProjectSession;
+    indexAssetId: string;
+    metrics: PointCloudIndexMetricsSummary;
+  }>;
+  cancelPointCloudIndex(input: GeneratePointCloudIndexInput): Promise<void>;
   readDerivedSurfaceArtifact(managedPath: string): Promise<SerializableSurfaceModel>;
   saveProject(manifest: ProjectManifest): Promise<ProjectSession>;
   closeProject(): Promise<void>;
@@ -48,6 +57,7 @@ export interface WorkbenchIpc {
     surface: SerializableSurfaceModel;
   }>;
   onPointCloudPreviewProgress(listener: (progress: PointCloudPreviewProgress) => void): () => void;
+  onPointCloudIndexProgress(listener: (progress: PointCloudIndexProgress) => void): () => void;
 }
 
 export function isOpenProjectError(error: unknown): error is OpenProjectError {

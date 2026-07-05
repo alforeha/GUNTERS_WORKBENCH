@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { POINT_CLOUD_INDEX_ASSET_KIND } from './pointcloud-index';
 
 export const truthStatusSchema = z.enum([
   'source',
@@ -176,8 +177,16 @@ export const projectManifestSchema = z
     const assetIds = new Set(manifest.assets.map((asset) => asset.id));
 
     for (const asset of manifest.assets) {
-      if (!asset.pointCloudIndex) continue;
-      if (!assetIds.has(asset.pointCloudIndex.sourceAssetId)) {
+      // pointCloudIndex metadata is present exactly when the asset is a fully-indexed
+      // point-cloud-index asset — truth and payload must never drift apart.
+      const isIndexAsset = asset.kind === POINT_CLOUD_INDEX_ASSET_KIND && asset.truthStatus === 'indexed-full';
+      if ((asset.pointCloudIndex !== undefined) !== isIndexAsset) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `asset ${asset.id}: pointCloudIndex metadata must be present exactly when kind is '${POINT_CLOUD_INDEX_ASSET_KIND}' and truthStatus is 'indexed-full'`,
+        });
+      }
+      if (asset.pointCloudIndex && !assetIds.has(asset.pointCloudIndex.sourceAssetId)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `point-cloud index asset ${asset.id} references unknown sourceAssetId ${asset.pointCloudIndex.sourceAssetId}`,

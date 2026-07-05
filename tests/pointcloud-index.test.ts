@@ -261,6 +261,22 @@ describe('point-cloud index manifest record', () => {
     const parsed = projectManifestSchema.safeParse(manifest);
     expect(parsed.success).toBe(false);
   });
+
+  it('rejects pointCloudIndex metadata on a non-index asset', () => {
+    const manifest = baseManifest();
+    // metadata present but kind/truthStatus say it is not an index asset
+    manifest.assets[1]!.kind = 'point-cloud';
+    manifest.assets[1]!.truthStatus = 'source';
+    const parsed = projectManifestSchema.safeParse(manifest);
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects an index-kind/indexed-full asset that lacks pointCloudIndex metadata', () => {
+    const manifest = baseManifest();
+    delete manifest.assets[1]!.pointCloudIndex;
+    const parsed = projectManifestSchema.safeParse(manifest);
+    expect(parsed.success).toBe(false);
+  });
 });
 
 // ── open-time staleness against the real project service ────────────────────────

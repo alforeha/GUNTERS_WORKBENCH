@@ -26,6 +26,12 @@ const api: WorkbenchIpc = {
   loadPointCloudDensifiedNodes(input) {
     return ipcRenderer.invoke('workbench:loadPointCloudDensifiedNodes', input)
   },
+  generatePointCloudIndex(input) {
+    return ipcRenderer.invoke('workbench:generatePointCloudIndex', input)
+  },
+  cancelPointCloudIndex(input) {
+    return ipcRenderer.invoke('workbench:cancelPointCloudIndex', input)
+  },
   readDerivedSurfaceArtifact(managedPath) {
     return ipcRenderer.invoke('workbench:readDerivedSurfaceArtifact', managedPath)
   },
@@ -45,6 +51,11 @@ const api: WorkbenchIpc = {
     const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => listener(progress)
     ipcRenderer.on('workbench:pointCloudPreviewProgress', handler)
     return () => ipcRenderer.removeListener('workbench:pointCloudPreviewProgress', handler)
+  },
+  onPointCloudIndexProgress(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => listener(progress)
+    ipcRenderer.on('workbench:pointCloudIndexProgress', handler)
+    return () => ipcRenderer.removeListener('workbench:pointCloudIndexProgress', handler)
   },
 }
 

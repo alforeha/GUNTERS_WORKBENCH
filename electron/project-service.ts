@@ -8,12 +8,16 @@ import type { PointCloudDataset } from '../src/core/contract';
 import { parseLasMetadata } from '../src/core/las/metadata';
 import { computeStride, handleLasSourceRequest, type ChunkSource } from '../src/workers/las.worker';
 import type {
+  AssetRecord,
   CreateProjectInput,
+  GeneratePointCloudIndexInput,
   ImportPointCloudInput,
   LoadPointCloudDensifiedNodesInput,
   LoadPointCloudPreviewInput,
   OpenProjectError,
   OpenProjectInput,
+  PointCloudIndexMetricsSummary,
+  PointCloudIndexProgress,
   PointCloudPreviewState,
   ProjectManifest,
   SerializableSurfaceModel,
@@ -22,12 +26,15 @@ import type {
 import type { ProjectSession } from '../src/shared/ipc';
 import {
   POINT_CLOUD_INDEX_ASSET_KIND,
+  POINT_CLOUD_INDEX_BUILDER_VERSION,
   POINT_CLOUD_INDEX_WARNING_PREFIX,
   detectIndexStaleness,
   formatStaleIndexWarning,
   isManagedIndexWarning,
   type CurrentSourceFingerprint,
 } from '../src/shared/pointcloud-index';
+import { isWpiIndexComplete, type BuildPointCloudIndexResult } from './pointcloud-index-builder';
+import { createWorkerIndexBuild, type RunIndexBuild } from './pointcloud-index-runner';
 import { generateTestMesh } from '../src/viewer/synthetic';
 import {
   previewCacheRelativePath,
@@ -57,6 +64,12 @@ interface SaveIntent {
 export class ProjectService {
   private currentFolder: string | null = null;
   private currentManifest: ProjectManifest | null = null;
+  private readonly runIndexBuild: RunIndexBuild;
+  private readonly indexBuilds = new Map<string, AbortController>();
+
+  constructor(options?: { runIndexBuild?: RunIndexBuild }) {
+    this.runIndexBuild = options?.runIndexBuild ?? createWorkerIndexBuild();
+  }
 
   async createProject(input: CreateProjectInput): Promise<ProjectSession> {
     const projectFolder = path.join(input.parentDir, input.projectName);
@@ -368,6 +381,113 @@ export class ProjectService {
       warning: null,
       nodes,
     };
+  }
+
+  async generatePointCloudIndex(
+    input: GeneratePointCloudIndexInput,
+    onProgress?: (progress: PointCloudIndexProgress) => void,
+  ): Promise<{ session: ProjectSession; indexAssetId: string; metrics: PointCloudIndexMetricsSummary }> {
+    this.requireOpenProject();
+    const folder = this.currentFolder as string;
+    const sourceAsset = (this.currentManifest as ProjectManifest).assets.find((a) => a.id === input.assetId);
+    if (!sourceAsset || sourceAsset.kind !== 'point-cloud' || !sourceAsset.pointCloud) {
+      throw new Error(`Point cloud asset ${input.assetId} not found.`);
+    }
+    const sourcePath = this.resolvePointCloudSourcePath(folder, sourceAsset);
+    if (!(await this.exists(sourcePath))) {
+      throw new Error(`${MISSING_SOURCE_WARNING} ${sourcePath}`);
+    }
+    const sourceStats = await stat(sourcePath);
+    const headerSha256 = await this.computeSourceHeaderSha256(sourcePath, sourceStats.size);
+
+    // Build into a staging dir and only swap it into place on success so a failed regenerate
+    // never destroys a previously-good index or corrupts the manifest.
+    const indexParent = path.join(folder, 'derived', sourceAsset.id);
+    const finalDir = path.join(indexParent, 'index');
+    const stageDir = path.join(indexParent, 'index.staging');
+    await mkdir(indexParent, { recursive: true });
+    await rm(stageDir, { recursive: true, force: true });
+
+    const controller = new AbortController();
+    this.indexBuilds.set(sourceAsset.id, controller);
+    let result: BuildPointCloudIndexResult;
+    try {
+      result = await this.runIndexBuild(
+        {
+          sourcePath,
+          outDir: stageDir,
+          fileName: sourceAsset.name,
+          sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
+          generatorVersion: POINT_CLOUD_INDEX_BUILDER_VERSION,
+        },
+        {
+          onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
+          signal: controller.signal,
+        },
+      );
+      if (!(await isWpiIndexComplete(stageDir))) {
+        throw new Error('Point-cloud index build finished without a completion marker.');
+      }
+      await rm(finalDir, { recursive: true, force: true });
+      await rename(stageDir, finalDir);
+    } catch (err) {
+      await rm(stageDir, { recursive: true, force: true });
+      throw err;
+    } finally {
+      this.indexBuilds.delete(sourceAsset.id);
+    }
+
+    const manifest = structuredClone(this.currentManifest as ProjectManifest);
+    const indexAssetId = `${sourceAsset.id}-index`;
+    const now = new Date().toISOString();
+    const built = result.manifest;
+    const record: AssetRecord = {
+      id: indexAssetId,
+      name: `${sourceAsset.name} index`,
+      kind: POINT_CLOUD_INDEX_ASSET_KIND,
+      truthStatus: 'indexed-full',
+      importPolicy: 'copy',
+      sourcePath: null,
+      managedPath: path.relative(folder, path.join(finalDir, 'index.json')).replace(/\\/g, '/'),
+      units: built.units,
+      warnings: [],
+      hashes: { importedAt: now, modifiedAt: now },
+      pointCloudIndex: {
+        sourceAssetId: sourceAsset.id,
+        indexType: 'wpi-octree',
+        indexVersion: 1,
+        source: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
+        pointCount: built.source.pointCount,
+        bounds: built.bounds,
+        scale: built.scale,
+        offset: built.offset,
+        units: built.units,
+        generatedAt: built.generatedAt,
+        generator: built.generator,
+      },
+    };
+    // Replace any prior index for this source (regeneration), then register on success only.
+    manifest.assets = manifest.assets.filter((a) => a.id !== indexAssetId);
+    manifest.assets.push(record);
+    const session = await this.saveProject(manifest);
+
+    return {
+      session,
+      indexAssetId,
+      metrics: {
+        pointCount: result.metrics.pointCount,
+        storedPointCount: result.metrics.storedPointCount,
+        tileCount: result.metrics.tileCount,
+        indexSizeBytes: result.metrics.indexSizeBytes,
+        maxDepthUsed: result.metrics.maxDepthUsed,
+        wallTimeMs: result.metrics.wallTimeMs,
+        peakBufferedBytes: result.metrics.peakBufferedBytes,
+      },
+    };
+  }
+
+  cancelPointCloudIndex(input: GeneratePointCloudIndexInput): void {
+    this.indexBuilds.get(input.assetId)?.abort();
   }
 
   async readDerivedSurfaceArtifact(managedPath: string): Promise<SerializableSurfaceModel> {

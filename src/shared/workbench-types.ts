@@ -237,6 +237,26 @@ export interface UnitWarningInput {
   warning: string;
 }
 
+export interface GeneratePointCloudIndexInput {
+  assetId: string;
+}
+
+export interface PointCloudIndexProgress {
+  assetId: string;
+  label: string;
+  pct: number | null;
+}
+
+export interface PointCloudIndexMetricsSummary {
+  pointCount: number;
+  storedPointCount: number;
+  tileCount: number;
+  indexSizeBytes: number;
+  maxDepthUsed: number;
+  wallTimeMs: number;
+  peakBufferedBytes: number;
+}
+
 export interface OpenProjectError {
   code: 'manifest-missing-or-corrupt';
   message: string;

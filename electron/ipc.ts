@@ -94,6 +94,19 @@ export function registerWorkbenchIpc(): void {
   );
 
   ipcMain.handle(
+    'workbench:generatePointCloudIndex',
+    async (event, input: Parameters<WorkbenchIpc['generatePointCloudIndex']>[0]) =>
+      service.generatePointCloudIndex(input, (progress) => {
+        event.sender.send('workbench:pointCloudIndexProgress', progress);
+      }),
+  );
+
+  ipcMain.handle(
+    'workbench:cancelPointCloudIndex',
+    (_event, input: Parameters<WorkbenchIpc['cancelPointCloudIndex']>[0]) => service.cancelPointCloudIndex(input),
+  );
+
+  ipcMain.handle(
     'workbench:readDerivedSurfaceArtifact',
     (_event, managedPath: Parameters<WorkbenchIpc['readDerivedSurfaceArtifact']>[0]) =>
       service.readDerivedSurfaceArtifact(managedPath),
