@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = '1.0.0';
+export const SCHEMA_VERSION = '1.1.0';
 
 export type TruthStatus =
   | 'source'
@@ -28,6 +28,31 @@ export interface AssetRecord {
     importedAt?: string;
     modifiedAt?: string;
   };
+  pointCloud?: PointCloudAssetMetadata;
+}
+
+export interface PointCloudAssetMetadata {
+  format: 'las' | 'laz';
+  extension: string;
+  fileSize: number;
+  pointCount: number;
+  lasVersion: string;
+  pointFormat: number;
+  pointRecordLength: number;
+  bounds: {
+    minX: number;
+    minY: number;
+    minZ: number;
+    maxX: number;
+    maxY: number;
+    maxZ: number;
+  };
+  scale: [number, number, number];
+  offset: [number, number, number];
+  crsText: string | null;
+  unitsLinear: 'usSurveyFoot' | 'foot' | 'meter' | 'unknown';
+  unitsRaw: string;
+  headerSha256: string;
 }
 
 export interface RealitySimulation {
@@ -132,6 +157,41 @@ export interface CreateProjectInput {
 
 export interface OpenProjectInput {
   projectFolder: string;
+}
+
+export interface ImportPointCloudInput {
+  filePath: string;
+  importPolicy: 'copy' | 'reference';
+}
+
+export interface LoadPointCloudPreviewInput {
+  assetId: string;
+  quality?: 'fast' | 'balanced' | 'all-detail';
+}
+
+export interface LoadPointCloudDensifiedNodesInput {
+  assetId: string;
+  nodeIds: number[];
+}
+
+export interface PointCloudPreviewProgress {
+  assetId: string;
+  label: string;
+  pct: number | null;
+}
+
+export interface PointCloudPreviewState {
+  assetId: string;
+  sourceAssetTruthStatus: 'source';
+  displayTruthStatus: 'preview-sampled';
+  sampledPointCount: number;
+  totalPointCount: number;
+  densifiedPointCount: number;
+  sourceAvailable: boolean;
+  disclosure: string;
+  sourcePath: string;
+  cachePath: string;
+  warnings: string[];
 }
 
 export interface UnitWarningInput {

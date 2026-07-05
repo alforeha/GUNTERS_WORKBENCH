@@ -28,6 +28,31 @@ const assetRecordSchema = z.object({
     importedAt: z.string().optional(),
     modifiedAt: z.string().optional(),
   }),
+  pointCloud: z
+    .object({
+      format: z.enum(['las', 'laz']),
+      extension: z.string().min(1),
+      fileSize: z.number().nonnegative(),
+      pointCount: z.number().nonnegative(),
+      lasVersion: z.string().min(1),
+      pointFormat: z.number().int().nonnegative(),
+      pointRecordLength: z.number().int().positive(),
+      bounds: z.object({
+        minX: z.number(),
+        minY: z.number(),
+        minZ: z.number(),
+        maxX: z.number(),
+        maxY: z.number(),
+        maxZ: z.number(),
+      }),
+      scale: z.tuple([z.number(), z.number(), z.number()]),
+      offset: z.tuple([z.number(), z.number(), z.number()]),
+      crsText: z.string().nullable(),
+      unitsLinear: z.enum(['usSurveyFoot', 'foot', 'meter', 'unknown']),
+      unitsRaw: z.string().min(1),
+      headerSha256: z.string().min(1),
+    })
+    .optional(),
 });
 
 const simulationLayerSchema = z.object({

@@ -23,52 +23,51 @@ export interface NodeScore {
 
 export interface NodeLodResult {
   index: number;
-  /** sample stride to apply (1 = full density). 0 means the node draws nothing. */
+  /** sample stride to apply (1 = full density). */
   stride: number;
 }
-
-type LodStride = (typeof LOD_STRIDES)[number];
 
 /**
  * Distance-based LOD selection. Nodes are sorted nearest-first; the nearest get full
  * density (stride 1) and farther nodes are progressively thinned so the *estimated*
- * drawn-point total lands inside [min,max]. A node already chosen is never dropped to
- * zero unless it falls outside the frustum (callers pass only frustum-visible nodes).
+ * drawn-point total stays near [min,max] without ever dropping a frustum-visible node
+ * entirely. If even the coarsest stride still exceeds budgetMax, coverage wins and the
+ * estimate is allowed to overflow the budget instead of leaving holes.
  *
  * The estimate uses sampleCount/stride; callers apply per-class/return filtering on top,
  * which only ever reduces the real drawn count, so the budget is an upper bound.
  */
 export function selectLod(
   scores: NodeScore[],
-  budgetMin = POINT_BUDGET_MIN,
+  _budgetMin = POINT_BUDGET_MIN,
   budgetMax = POINT_BUDGET_MAX,
 ): NodeLodResult[] {
   const ordered = [...scores].sort((a, b) => a.distance - b.distance);
-  const results: NodeLodResult[] = [];
-  let drawn = 0;
+  const coarsest = LOD_STRIDES[LOD_STRIDES.length - 1];
+  const results = ordered.map<NodeLodResult>((node) => ({
+    index: node.index,
+    stride: coarsest,
+  }));
+  let drawn = ordered.reduce((sum, node) => sum + Math.ceil(node.sampleCount / coarsest), 0);
 
-  for (const node of ordered) {
-    if (node.sampleCount === 0) {
-      results.push({ index: node.index, stride: 0 });
-      continue;
-    }
-    // Pick the finest stride that keeps us under budgetMax; nearest nodes naturally
-    // get stride 1 because the running total is still small.
-    let stride: LodStride = LOD_STRIDES[0];
-    for (const candidate of LOD_STRIDES) {
+  // Coverage floor alone already exceeds the hard ceiling: keep every visible node at the
+  // coarsest tier and accept the overflow rather than blanking far geometry.
+  if (drawn > budgetMax) {
+    return results;
+  }
+
+  for (let i = 0; i < ordered.length; i++) {
+    const node = ordered[i]!;
+    if (node.sampleCount === 0) continue;
+    let stride = coarsest;
+    for (let candidateIndex = LOD_STRIDES.length - 2; candidateIndex >= 0; candidateIndex--) {
+      const candidate = LOD_STRIDES[candidateIndex]!;
+      const delta = Math.ceil(node.sampleCount / candidate) - Math.ceil(node.sampleCount / stride);
+      if (drawn + delta > budgetMax) continue;
+      drawn += delta;
       stride = candidate;
-      const add = Math.ceil(node.sampleCount / candidate);
-      if (drawn + add <= budgetMax) break;
+      results[i] = { index: node.index, stride };
     }
-    const add = Math.ceil(node.sampleCount / stride);
-    // If even the coarsest stride blows the hard max AND we already have a usable scene,
-    // stop adding distant nodes entirely.
-    if (drawn + add > budgetMax && drawn >= budgetMin) {
-      results.push({ index: node.index, stride: 0 });
-      continue;
-    }
-    drawn += add;
-    results.push({ index: node.index, stride });
   }
   return results;
 }

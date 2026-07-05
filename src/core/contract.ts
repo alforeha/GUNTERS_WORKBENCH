@@ -226,6 +226,21 @@ export interface PointCloudBounds {
   maxZ: number;
 }
 
+export interface PointCloudSourceRange {
+  startIndex: number;
+  pointCount: number;
+}
+
+export interface PointCloudNodePayload {
+  pointCount: number;
+  positions: Float32Array;
+  colors: Uint8Array;
+  intensities: Float32Array;
+  classifications: Uint8Array;
+  returnNumbers: Uint8Array;
+  numberOfReturns: Uint8Array;
+}
+
 export interface PointCloudOctreeNode {
   id: number;
   depth: number;
@@ -241,6 +256,8 @@ export interface PointCloudOctreeNode {
   returnNumbers: Uint8Array;
   /** LAS number-of-returns per sampled point. Single-return files = all 1. */
   numberOfReturns: Uint8Array;
+  /** Source record spans for this node's full point set; used for near-camera densification. */
+  sourceRanges: PointCloudSourceRange[];
   children: PointCloudOctreeNode[];
 }
 
@@ -292,6 +309,8 @@ export interface PointCloudDataset {
   scale: [number, number, number];
   offset: [number, number, number];
   bounds: PointCloudBounds;
+  crsText: string | null;
+  unitSource: 'vlr' | 'assumed';
   attributes: LasAttributeSummary;
   pointDensityPerSqFt: number | null;
   octree?: PointCloudOctree;

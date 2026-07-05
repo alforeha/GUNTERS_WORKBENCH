@@ -3,7 +3,7 @@
 // DEPENDENCY RULE: viewer → core only.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import type { DxfDataset, GeotiffDataset, PointCloudDataset, SurfaceModel } from '../core/contract';
+import type { DxfDataset, GeotiffDataset, PointCloudDataset, PointCloudNodePayload, SurfaceModel } from '../core/contract';
 import { computeBBox, type Vec3 } from './geometry';
 import { pickClosestScreenPoint, worldUnitsPerPixel } from './editing';
 import { RenderSurface, type OverlayKind, type ResolvedDisplay } from './RenderSurface';
@@ -32,6 +32,7 @@ export type EditSelectionCallback = (selection: {
 export type EditDragCallback = (dragging: boolean) => void;
 export type EditCommitCallback = (command: VertexEditCommand) => void;
 export type EditMessageCallback = (message: string | null) => void;
+export type PointCloudSettleCallback = (info: { handle: string; nodeIds: number[] }) => void;
 
 interface VertexEditCommand {
   type: 'moveVertex' | 'swapEdge';
@@ -125,7 +126,10 @@ export class ViewerEngine {
   private hoverHeightCb: ((h: number) => void) | null = null;
   private hoverSpeedCb: ((s: number) => void) | null = null;
   private exitHoverCb: (() => void) | null = null;
+  private pointCloudSettleCb: PointCloudSettleCallback | null = null;
   private lastFrameTime = 0;
+  private lastCameraMotionAt = 0;
+  private lastPointCloudSettleKey = '';
   private labelRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private lastOrbitDirection = new THREE.Vector3(0.45, -0.65, -0.35).normalize();
   private lastOrbitDistance = 1200;
@@ -136,6 +140,14 @@ export class ViewerEngine {
   private hoverKeys = new Set<string>();
   private hoverLookDragging = false;
   private zoomSensitivity3D = 1.0;
+  private fogEnabled = false;
+  private edlEnabled = true;
+  private postScene = new THREE.Scene();
+  private postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private postQuad: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
+  private sceneTarget = new THREE.WebGLRenderTarget(1, 1, {
+    depthBuffer: true,
+  });
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -147,6 +159,75 @@ export class ViewerEngine {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setClearColor(BG_COLOR, 1);
     container.appendChild(this.renderer.domElement);
+    this.sceneTarget.depthTexture = new THREE.DepthTexture(1, 1, THREE.UnsignedIntType);
+    this.postQuad = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.ShaderMaterial({
+        uniforms: {
+          tColor: { value: this.sceneTarget.texture },
+          tDepth: { value: this.sceneTarget.depthTexture },
+          resolution: { value: new THREE.Vector2(1, 1) },
+          cameraNear: { value: 0.1 },
+          cameraFar: { value: 1_000_000 },
+          edlStrength: { value: 1.15 },
+          edlOrtho: { value: 0 }, //
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = vec4(position.xy, 0.0, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform sampler2D tColor;
+          uniform sampler2D tDepth;
+          uniform vec2 resolution;
+          uniform float cameraNear;
+          uniform float cameraFar;
+          uniform float edlStrength;
+uniform float edlOrtho;
+          varying vec2 vUv;
+
+          float linearizeDepth(float depth) {
+            if (edlOrtho > 0.5) return mix(cameraNear, cameraFar, depth);
+            float z = depth * 2.0 - 1.0;
+            return (2.0 * cameraNear * cameraFar) / (cameraFar + cameraNear - z * (cameraFar - cameraNear));
+          }
+
+          void main() {
+            vec4 color = texture2D(tColor, vUv);
+            float centerRaw = texture2D(tDepth, vUv).r;
+            if (centerRaw >= 1.0) {
+              gl_FragColor = color;
+              return;
+            }
+            float center = linearizeDepth(centerRaw);
+            vec2 dx = vec2(1.0 / resolution.x, 0.0);
+            vec2 dy = vec2(0.0, 1.0 / resolution.y);
+            float accum = 0.0;
+            float samples = 0.0;
+            vec2 offsets[4];
+            offsets[0] = dx;
+            offsets[1] = -dx;
+            offsets[2] = dy;
+            offsets[3] = -dy;
+            for (int i = 0; i < 4; i++) {
+              float raw = texture2D(tDepth, vUv + offsets[i]).r;
+              if (raw >= 1.0) continue;
+              float neighbor = linearizeDepth(raw);
+              accum += max(0.0, neighbor - center);
+              samples += 1.0;
+            }
+            float shade = exp(-((samples > 0.0 ? accum / samples : 0.0) * edlStrength));
+            gl_FragColor = vec4(color.rgb * shade, color.a);
+          }
+        `,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+    this.postScene.add(this.postQuad);
 
     this.scene.add(this.contentGroup);
 
@@ -240,6 +321,9 @@ export class ViewerEngine {
     this.pdfs.clear();
     for (const p of this.pointClouds.values()) p.dispose();
     this.pointClouds.clear();
+    this.postQuad.geometry.dispose();
+    this.postQuad.material.dispose();
+    this.sceneTarget.dispose();
     this.renderer.dispose();
     el.remove();
   }
@@ -681,6 +765,27 @@ export class ViewerEngine {
     this.requestRender();
   }
 
+  setPointCloudDensifiedPointBudget(handle: string, pointBudget: number): void {
+    this.pointClouds.get(handle)?.setDensifiedPointBudget(pointBudget);
+    this.requestRender();
+  }
+
+  applyPointCloudDensifiedNode(handle: string, nodeId: number, payload: PointCloudNodePayload): void {
+    if (this.pointClouds.get(handle)?.applyDensifiedNode(nodeId, payload)) this.requestRender();
+  }
+
+  releasePointCloudDensifiedNode(handle: string, nodeId: number): void {
+    if (this.pointClouds.get(handle)?.releaseDensifiedNode(nodeId)) this.requestRender();
+  }
+
+  pointCloudHasDensifiedPoints(handle: string): boolean {
+    return this.pointClouds.get(handle)?.hasDensifiedPoints() ?? false;
+  }
+
+  getPointCloudDensifiedPointCount(handle: string): number {
+    return this.pointClouds.get(handle)?.getDensifiedPointCount() ?? 0;
+  }
+
   setPointCloudDensity(handle: string, density: number): void {
     this.pointClouds.get(handle)?.setDensity(density);
     this.requestRender();
@@ -693,6 +798,17 @@ export class ViewerEngine {
 
   setPointCloudFilter(handle: string, filter: FilterState): void {
     this.pointClouds.get(handle)?.setFilter(filter);
+    this.requestRender();
+  }
+
+  setPointCloudFog(enabled: boolean): void {
+    this.fogEnabled = enabled;
+    this.scene.fog = enabled && this.sceneRadius > 0 ? new THREE.FogExp2(0x0c1420, 0.00018) : null;
+    this.requestRender();
+  }
+
+  setPointCloudEdl(enabled: boolean): void {
+    this.edlEnabled = enabled;
     this.requestRender();
   }
 
@@ -867,6 +983,10 @@ export class ViewerEngine {
 
   onHoverSpeedChange(cb: (s: number) => void): void {
     this.hoverSpeedCb = cb;
+  }
+
+  onPointCloudSettled(cb: PointCloudSettleCallback): void {
+    this.pointCloudSettleCb = cb;
   }
 
   onRequestExitHover(cb: () => void): void {
@@ -1060,6 +1180,7 @@ export class ViewerEngine {
    *  pre-clamp; this catches any edge case from pan/rotate). */
   private handleOrbitChange = (): void => {
     this.applyFlyThroughDolly();
+    this.markCameraMotion();
     this.requestRender();
   };
 
@@ -1114,6 +1235,7 @@ export class ViewerEngine {
     this.perspCamera.position.add(move);
     this.orbitControls.target.add(move);
     this.orbitControls.update();
+    this.markCameraMotion();
     this.rememberOrbitView();
     this.emitZoomChanged();
     this.scheduleLabelRefresh();
@@ -1244,6 +1366,7 @@ export class ViewerEngine {
     if (z === null) return false;
     this.perspCamera.position.set(nextX, nextY, (z + this.hoverHeight) * this.exaggeration);
     this.applyHoverLook();
+    this.markCameraMotion();
     return true;
   }
 
@@ -1282,6 +1405,9 @@ export class ViewerEngine {
       this.topControls.minZoom = 1e-4;
       this.topControls.maxZoom = 1e4;
     }
+    if (this.fogEnabled) {
+      this.scene.fog = this.sceneRadius > 0 ? new THREE.FogExp2(0x0c1420, 0.00018) : null;
+    }
   }
 
   /** Dynamic near/far from scene bounds + camera distance (close-zoom fix, 07 Phase 2):
@@ -1319,6 +1445,8 @@ export class ViewerEngine {
     const h = this.container.clientHeight;
     if (w === 0 || h === 0) return;
     this.renderer.setSize(w, h, false);
+    this.sceneTarget.setSize(w, h);
+    this.postQuad.material.uniforms['resolution'].value.set(w, h);
     this.perspCamera.aspect = w / h;
     this.perspCamera.updateProjectionMatrix();
     this.setOrthoFrustum(this.orthoCamera.top);
@@ -1376,6 +1504,7 @@ export class ViewerEngine {
       this.hoverYaw -= ev.movementX * 0.0024;
       this.hoverPitch = THREE.MathUtils.clamp(this.hoverPitch - ev.movementY * 0.0018, -1.35, 1.35);
       this.applyHoverLook();
+      this.markCameraMotion();
       this.requestRender();
     }
     const rect = this.renderer.domElement.getBoundingClientRect();
@@ -1497,6 +1626,7 @@ export class ViewerEngine {
   private renderFrame = (time: number): void => {
     this.frameScheduled = false;
     if (this.disposed) return;
+    if (this.lastCameraMotionAt === 0) this.lastCameraMotionAt = time;
     const dt = this.lastFrameTime > 0 ? time - this.lastFrameTime : 16;
     this.lastFrameTime = time;
     if (this.stepHover(dt)) this.renderRequested = true;
@@ -1514,7 +1644,8 @@ export class ViewerEngine {
 
     const cameraSettled =
       !this.controlsActive &&
-      !(this.mode === 'hover' && (this.hoverKeys.size > 0 || this.hoverLookDragging));
+      !(this.mode === 'hover' && (this.hoverKeys.size > 0 || this.hoverLookDragging)) &&
+      time - this.lastCameraMotionAt >= 260;
     let geotiffChanged = false;
     for (const geotiff of this.geotiffs.values()) {
       if (geotiff.updateVisible(this.activeCamera, this.exaggeration, cameraSettled, this.mode === 'hover')) {
@@ -1538,10 +1669,20 @@ export class ViewerEngine {
       if (pointCloud.updateVisible(this.activeCamera, this.exaggeration, cameraSettled)) pointCloudChanged = true;
     }
     if (pointCloudChanged) this.renderRequested = true;
+    if (cameraSettled && this.pointCloudSettleCb) {
+      for (const [handle, pointCloud] of this.pointClouds) {
+        const nodeIds = pointCloud.nearestLeafNodeIds(this.activeCamera, this.exaggeration, 2);
+        const key = `${handle}:${nodeIds.join(',')}`;
+        if (nodeIds.length > 0 && key !== this.lastPointCloudSettleKey) {
+          this.lastPointCloudSettleKey = key;
+          this.pointCloudSettleCb({ handle, nodeIds });
+        }
+      }
+    }
 
     if (doRender) {
       this.updateClipPlanes();
-      this.renderer.render(this.scene, this.activeCamera);
+      this.renderScene();
       this.renderGizmo();
       this.emitZoomChanged();
 
@@ -1552,6 +1693,26 @@ export class ViewerEngine {
     }
     if (this.mode === 'hover' && this.hoverKeys.size > 0) this.scheduleFrame();
   };
+
+  private markCameraMotion(): void {
+    this.lastCameraMotionAt = performance.now();
+  }
+
+  private renderScene(): void {
+    if (!this.edlEnabled) {
+      this.renderer.setRenderTarget(null);
+      this.renderer.render(this.scene, this.activeCamera);
+      return;
+    }
+    this.postQuad.material.uniforms['cameraNear'].value = (this.activeCamera as THREE.PerspectiveCamera).near;
+    this.postQuad.material.uniforms['cameraFar'].value = (this.activeCamera as THREE.PerspectiveCamera).far;
+this.postQuad.material.uniforms['edlOrtho'].value = this.activeCamera instanceof THREE.OrthographicCamera ? 1 : 0;
+    this.renderer.setRenderTarget(this.sceneTarget);
+    this.renderer.clear();
+    this.renderer.render(this.scene, this.activeCamera);
+    this.renderer.setRenderTarget(null);
+    this.renderer.render(this.postScene, this.postCamera);
+  }
 
   /** Corner north gizmo: overlay pass in its own viewport — live-rotates with the camera. */
   private renderGizmo(): void {

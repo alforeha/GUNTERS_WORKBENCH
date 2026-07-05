@@ -8,11 +8,23 @@ const api: WorkbenchIpc = {
   pickProjectFolder() {
     return ipcRenderer.invoke('workbench:pickProjectFolder')
   },
+  pickPointCloudImport() {
+    return ipcRenderer.invoke('workbench:pickPointCloudImport')
+  },
   createProject(input) {
     return ipcRenderer.invoke('workbench:createProject', input)
   },
   openProject(input) {
     return ipcRenderer.invoke('workbench:openProject', input)
+  },
+  importPointCloud(input) {
+    return ipcRenderer.invoke('workbench:importPointCloud', input)
+  },
+  loadPointCloudPreview(input) {
+    return ipcRenderer.invoke('workbench:loadPointCloudPreview', input)
+  },
+  loadPointCloudDensifiedNodes(input) {
+    return ipcRenderer.invoke('workbench:loadPointCloudDensifiedNodes', input)
   },
   readDerivedSurfaceArtifact(managedPath) {
     return ipcRenderer.invoke('workbench:readDerivedSurfaceArtifact', managedPath)
@@ -28,6 +40,11 @@ const api: WorkbenchIpc = {
   },
   generatePlaceholderDerivedLayer() {
     return ipcRenderer.invoke('workbench:generatePlaceholderDerivedLayer')
+  },
+  onPointCloudPreviewProgress(listener) {
+    const handler = (_event: Electron.IpcRendererEvent, progress: Parameters<typeof listener>[0]) => listener(progress)
+    ipcRenderer.on('workbench:pointCloudPreviewProgress', handler)
+    return () => ipcRenderer.removeListener('workbench:pointCloudPreviewProgress', handler)
   },
 }
 

@@ -33,6 +33,26 @@ function syntheticLasHeader(pointCount = 2): ArrayBuffer {
   return buffer;
 }
 
+function syntheticPreambleWithGeoAscii(): ArrayBuffer {
+  const header = syntheticLasHeader()
+  const view = new DataView(header)
+  const asciiPayload = 'Colorado State Plane US survey foot|'
+  view.setUint32(96, 375 + 54 + asciiPayload.length, true)
+  view.setUint32(100, 1, true)
+  const preamble = new Uint8Array(375 + 54 + asciiPayload.length)
+  preamble.set(new Uint8Array(header), 0)
+  const vlr = new DataView(preamble.buffer, 375, 54 + asciiPayload.length)
+  const ascii = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i++) vlr.setUint8(offset + i, value.charCodeAt(i))
+  }
+  ascii(2, 'LASF_Projection')
+  vlr.setUint16(18, 34737, true)
+  vlr.setUint16(20, asciiPayload.length, true)
+  ascii(22, 'GeoAscii')
+  ascii(54, asciiPayload)
+  return preamble.buffer
+}
+
 function syntheticPointSample(): ArrayBuffer {
   const buffer = new ArrayBuffer(72);
   const view = new DataView(buffer);
@@ -71,6 +91,19 @@ describe('LAS metadata parser', () => {
     ]);
     expect(dataset.attributes.classificationCounts).toEqual({ '1': 1, '2': 1 });
   });
+
+  it('reads CRS and units from LAS VLR text when present', () => {
+    const preamble = syntheticPreambleWithGeoAscii()
+    const dataset = parseLasMetadata({
+      fileName: 'sample.las',
+      fileSize: preamble.byteLength + 72,
+      header: preamble.slice(0, 375),
+      preamble,
+    })
+    expect(dataset.crsText).toContain('Colorado State Plane')
+    expect(dataset.meta.units.linear).toBe('usSurveyFoot')
+    expect(dataset.unitSource).toBe('vlr')
+  })
 
   it('worker handler returns a point cloud dataset', async () => {
     const header = syntheticLasHeader();

@@ -1,25 +1,44 @@
-import { mkdir, readFile, rename, rm, writeFile, copyFile, access, appendFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile, copyFile, access, appendFile, open, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { projectManifestSchema } from '../src/shared/manifest-schema';
 import { createDefaultManifest } from '../src/shared/project-defaults';
+import type { PointCloudDataset } from '../src/core/contract';
+import { parseLasMetadata } from '../src/core/las/metadata';
+import { computeStride, handleLasSourceRequest, type ChunkSource } from '../src/workers/las.worker';
 import type {
   CreateProjectInput,
+  ImportPointCloudInput,
+  LoadPointCloudDensifiedNodesInput,
+  LoadPointCloudPreviewInput,
   OpenProjectError,
   OpenProjectInput,
+  PointCloudPreviewState,
   ProjectManifest,
   SerializableSurfaceModel,
   UnitWarningInput,
 } from '../src/shared/workbench-types';
 import type { ProjectSession } from '../src/shared/ipc';
 import { generateTestMesh } from '../src/viewer/synthetic';
+import {
+  previewCacheRelativePath,
+  readPreviewCache,
+  readPreviewCacheDescriptor,
+  removePreviewCache,
+  validatePreviewCache,
+  writePreviewCache,
+} from './pointcloud-preview-cache';
 
 const PROJECT_FILE = 'project.json';
 const PROJECT_BACKUP_FILE = 'project.json.bak';
 const SAVE_TEMP_FILE = 'project.json.tmp';
 const JOURNAL_FILE = 'history/journal.log';
 const REQUIRED_DIRS = ['sources', 'derived', 'edited', 'exports', 'reports', 'history', 'cache'];
+const MISSING_SOURCE_WARNING = 'Referenced point cloud source is missing.';
+const MISSING_SOURCE_CACHE_WARNING = 'Source file is missing; showing cached preview that may be stale.';
+const UNIT_WARNING = 'Point-cloud units could not be confirmed from LAS VLRs.';
+const DENSIFIED_DISCLOSURE_SUFFIX = 'full density near camera';
 
 interface SaveIntent {
   id: string;
@@ -70,7 +89,7 @@ export class ProjectService {
     }
 
     const recoveryDetected = await this.detectUncleanShutdown(input.projectFolder);
-    const manifest = parsed.data;
+    const manifest = await this.applyPointCloudOpenChecks(input.projectFolder, parsed.data);
 
     if (recoveryDetected) {
       manifest.recovery.uncleanShutdown = true;
@@ -81,6 +100,266 @@ export class ProjectService {
     this.currentManifest = manifest;
 
     return this.toSession(input.projectFolder, manifest, recoveryDetected);
+  }
+
+  async importPointCloud(input: ImportPointCloudInput): Promise<ProjectSession> {
+    this.requireOpenProject();
+    const folder = this.currentFolder as string;
+    const manifest = structuredClone(this.currentManifest as ProjectManifest);
+    const sourceStats = await stat(input.filePath);
+    const extension = path.extname(input.filePath).toLowerCase();
+    if (extension === '.laz') {
+      throw new Error('LAZ is not supported yet in this build. Import LAS files for now.');
+    }
+    if (extension !== '.las') {
+      throw new Error(`Unsupported point-cloud format: ${extension || 'unknown'}`);
+    }
+
+    const preamble = await this.readLasPreamble(input.filePath);
+    const dataset = parseLasMetadata({
+      fileName: path.basename(input.filePath),
+      fileSize: sourceStats.size,
+      header: preamble.slice(0, Math.min(375, preamble.byteLength)),
+      preamble,
+    });
+    const headerSha256 = createHash('sha256')
+      .update(new Uint8Array(preamble))
+      .update(Buffer.from(String(sourceStats.size)))
+      .digest('hex');
+
+    let managedPath: string | null = null;
+    if (input.importPolicy === 'copy') {
+      const fileName = this.uniqueManagedFileName(manifest, path.basename(input.filePath));
+      const targetPath = path.join(folder, 'sources', fileName);
+      await copyFile(input.filePath, targetPath);
+      managedPath = path.relative(folder, targetPath).replace(/\\/g, '/');
+    }
+
+    const now = new Date().toISOString();
+    const assetId = `point-cloud-${Date.now()}`;
+    const warnings: string[] = [];
+    if (dataset.unitSource === 'assumed') warnings.push(UNIT_WARNING);
+
+    manifest.assets.push({
+      id: assetId,
+      name: path.basename(input.filePath),
+      kind: 'point-cloud',
+      truthStatus: 'source',
+      importPolicy: input.importPolicy,
+      sourcePath: input.filePath,
+      managedPath,
+      units: dataset.meta.units.linear,
+      warnings,
+      hashes: {
+        importedAt: now,
+        modifiedAt: sourceStats.mtime.toISOString(),
+      },
+      pointCloud: {
+        format: 'las',
+        extension,
+        fileSize: sourceStats.size,
+        pointCount: dataset.pointCount,
+        lasVersion: dataset.lasVersion,
+        pointFormat: dataset.pointFormat,
+        pointRecordLength: dataset.pointRecordLength,
+        bounds: dataset.bounds,
+        scale: dataset.scale,
+        offset: dataset.offset,
+        crsText: dataset.crsText,
+        unitsLinear: dataset.meta.units.linear,
+        unitsRaw: dataset.meta.units.raw,
+        headerSha256,
+      },
+    });
+
+    manifest.simulationLayers.push({
+      id: `layer-${assetId}`,
+      simulationId: manifest.realitySimulation.id,
+      name: `${path.basename(input.filePath)} preview`,
+      status: 'active',
+      assetId,
+      createdAt: now,
+      modifiedAt: now,
+    });
+
+    manifest.realitySimulation.status = 'point-cloud-source-loaded';
+
+    return this.saveProject(manifest);
+  }
+
+  async loadPointCloudPreview(
+    input: LoadPointCloudPreviewInput,
+    onProgress?: (progress: { assetId: string; label: string; pct: number | null }) => void,
+  ): Promise<{ assetId: string; dataset: PointCloudDataset; preview: PointCloudPreviewState }> {
+    this.requireOpenProject();
+    const folder = this.currentFolder as string;
+    const manifest = this.currentManifest as ProjectManifest;
+    const asset = manifest.assets.find((candidate) => candidate.id === input.assetId);
+    if (!asset || asset.kind !== 'point-cloud') {
+      throw new Error(`Point cloud asset ${input.assetId} not found.`);
+    }
+    if (!asset.pointCloud) {
+      throw new Error(`Point cloud asset ${input.assetId} is missing metadata.`);
+    }
+
+    const sourcePath = this.resolvePointCloudSourcePath(folder, asset);
+    const quality = input.quality ?? 'balanced';
+    const sourceExists = await this.exists(sourcePath);
+    const cachePath = previewCacheRelativePath(asset.id);
+    const sourceStats = sourceExists ? await stat(sourcePath) : null;
+    const headerSha256 = sourceExists ? await this.computeSourceHeaderSha256(sourcePath, sourceStats!.size) : undefined;
+    const cacheValidation = await validatePreviewCache(folder, {
+      assetId: asset.id,
+      sourceExists,
+      quality,
+      pointCloud: asset.pointCloud,
+      fileSize: sourceStats?.size,
+      mtimeMs: sourceStats?.mtimeMs,
+      headerSha256,
+    });
+
+    if (cacheValidation.valid) {
+      try {
+        const cached = await readPreviewCache(folder, asset.id);
+        const preview = this.buildPointCloudPreview({
+          assetId: asset.id,
+          dataset: cached.dataset,
+          sourcePath,
+          cachePath,
+          warnings: sourceExists ? [] : [MISSING_SOURCE_CACHE_WARNING],
+        });
+        return { assetId: asset.id, dataset: cached.dataset, preview };
+      } catch {
+        await removePreviewCache(folder, asset.id);
+      }
+    } else if (cacheValidation.reason === 'schema-version-mismatch' && cacheValidation.descriptor?.schemaVersion === 1) {
+      if (!sourceExists) {
+        const cached = await readPreviewCache(folder, asset.id);
+        const preview = this.buildPointCloudPreview({
+          assetId: asset.id,
+          dataset: cached.dataset,
+          sourcePath,
+          cachePath,
+          warnings: [MISSING_SOURCE_CACHE_WARNING],
+        });
+        preview.sourceAvailable = false;
+        return { assetId: asset.id, dataset: cached.dataset, preview };
+      }
+      await removePreviewCache(folder, asset.id);
+    } else if (cacheValidation.descriptor === null || cacheValidation.reason) {
+      await removePreviewCache(folder, asset.id);
+    }
+
+    if (!sourceExists) {
+      throw new Error(`${MISSING_SOURCE_WARNING} ${sourcePath}`);
+    }
+
+    const source = await this.fileChunkSource(sourcePath);
+    const result = await handleLasSourceRequest(
+      {
+        id: 1,
+        fileName: asset.name,
+        source,
+        quality,
+      },
+      (label, pct) => onProgress?.({ assetId: input.assetId, label, pct }),
+    );
+
+    if (result.response.type !== 'result') {
+      throw new Error('Point-cloud preview did not return a result message.');
+    }
+    if (!result.response.ok) {
+      throw new Error(result.response.error);
+    }
+
+    const dataset = result.response.dataset;
+    const ensuredSourceStats = sourceStats;
+    if (!ensuredSourceStats || !headerSha256) {
+      throw new Error(`Point cloud source became unavailable while loading preview: ${sourcePath}`);
+    }
+    await writePreviewCache(folder, {
+      assetId: asset.id,
+      fileSize: ensuredSourceStats.size,
+      mtimeMs: ensuredSourceStats.mtimeMs,
+      headerSha256,
+      quality,
+      attributeStride: computeStride(dataset.pointCount),
+      dataset,
+    });
+    const preview = this.buildPointCloudPreview({
+      assetId: asset.id,
+      dataset,
+      sourcePath,
+      cachePath,
+      warnings: [],
+    });
+
+    return { assetId: asset.id, dataset, preview };
+  }
+
+  async loadPointCloudDensifiedNodes(
+    input: LoadPointCloudDensifiedNodesInput,
+  ): Promise<{
+    assetId: string;
+    sourceAvailable: boolean;
+    warning: string | null;
+    nodes: { nodeId: number; payload: import('../src/core/contract').PointCloudNodePayload }[];
+  }> {
+    this.requireOpenProject();
+    const folder = this.currentFolder as string;
+    const manifest = this.currentManifest as ProjectManifest;
+    const asset = manifest.assets.find((candidate) => candidate.id === input.assetId);
+    if (!asset || asset.kind !== 'point-cloud' || !asset.pointCloud) {
+      throw new Error(`Point cloud asset ${input.assetId} not found.`);
+    }
+    const sourcePath = this.resolvePointCloudSourcePath(folder, asset);
+    if (!(await this.exists(sourcePath))) {
+      return {
+        assetId: input.assetId,
+        sourceAvailable: false,
+        warning: MISSING_SOURCE_CACHE_WARNING,
+        nodes: [],
+      };
+    }
+    const descriptor = await readPreviewCacheDescriptor(folder, asset.id);
+    const nodeIndex = new Map<number, typeof descriptor.dataset.octree.root>();
+    const visit = (node: typeof descriptor.dataset.octree.root) => {
+      nodeIndex.set(node.id, node);
+      node.children.forEach(visit);
+    };
+    visit(descriptor.dataset.octree.root);
+    const source = await this.fileChunkSource(sourcePath);
+    const { loadDensifiedNodeFromSource } = await import('../src/workers/las.worker');
+    const nodes = [];
+    for (const nodeId of [...new Set(input.nodeIds)]) {
+      const node = nodeIndex.get(nodeId);
+      if (!node || (node.sourceRanges?.length ?? 0) === 0) continue;
+      nodes.push(
+        await loadDensifiedNodeFromSource(source, {
+          dataset: {
+            pointFormat: descriptor.dataset.pointFormat,
+            pointRecordLength: descriptor.dataset.pointRecordLength,
+            scale: descriptor.dataset.scale,
+            offset: descriptor.dataset.offset,
+            offsetToPointData: descriptor.dataset.offsetToPointData,
+            octree: {
+              origin: descriptor.dataset.octree.origin,
+            },
+          },
+          node: {
+            id: node.id,
+            sourceRanges: node.sourceRanges ?? [],
+            bounds: node.bounds,
+          },
+        }),
+      );
+    }
+    return {
+      assetId: input.assetId,
+      sourceAvailable: true,
+      warning: null,
+      nodes,
+    };
   }
 
   async readDerivedSurfaceArtifact(managedPath: string): Promise<SerializableSurfaceModel> {
@@ -172,7 +451,7 @@ export class ProjectService {
     manifest.simulationLayers.push({
       id: `layer-${artifactId}`,
       simulationId,
-      name: `${surface.name} (derived)` ,
+      name: `${surface.name} (derived)`,
       status: 'active',
       assetId: artifactId,
       createdAt: now,
@@ -241,6 +520,24 @@ export class ProjectService {
     return lastEntry.event !== 'complete';
   }
 
+  private async applyPointCloudOpenChecks(projectFolder: string, manifest: ProjectManifest): Promise<ProjectManifest> {
+    const next = structuredClone(manifest);
+    for (const asset of next.assets) {
+      if (asset.kind !== 'point-cloud') continue;
+      const layer = next.simulationLayers.find((candidate) => candidate.assetId === asset.id);
+      const sourcePath = this.resolvePointCloudSourcePath(projectFolder, asset);
+      const exists = await this.exists(sourcePath);
+      asset.warnings = asset.warnings.filter((warning) => warning !== MISSING_SOURCE_WARNING);
+      if (!exists) {
+        if (!asset.warnings.includes(MISSING_SOURCE_WARNING)) asset.warnings.push(MISSING_SOURCE_WARNING);
+        if (layer) layer.status = 'error';
+      } else if (layer && layer.status === 'error') {
+        layer.status = 'active';
+      }
+    }
+    return next;
+  }
+
   private toSession(projectFolder: string, manifest: ProjectManifest, recoveryDetected: boolean): ProjectSession {
     return {
       projectFolder,
@@ -255,6 +552,102 @@ export class ProjectService {
     if (!this.currentFolder || !this.currentManifest) {
       throw new Error('No project is currently open.');
     }
+  }
+
+  private async fileChunkSource(filePath: string): Promise<ChunkSource> {
+    const sourceStats = await stat(filePath);
+    return {
+      size: sourceStats.size,
+      async read(start: number, end: number): Promise<ArrayBuffer> {
+        const handle = await open(filePath, 'r');
+        try {
+          const length = Math.max(0, end - start);
+          const buffer = Buffer.alloc(length);
+          let offset = 0;
+          while (offset < length) {
+            const { bytesRead } = await handle.read(buffer, offset, length - offset, start + offset);
+            if (bytesRead <= 0) break;
+            offset += bytesRead;
+          }
+          return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+        } finally {
+          await handle.close();
+        }
+      },
+    };
+  }
+
+  private async readLasPreamble(filePath: string): Promise<ArrayBuffer> {
+    const handle = await open(filePath, 'r');
+    try {
+      const headerBuffer = Buffer.alloc(375);
+      await handle.read(headerBuffer, 0, headerBuffer.length, 0);
+      const header = headerBuffer.buffer.slice(headerBuffer.byteOffset, headerBuffer.byteOffset + headerBuffer.byteLength);
+      const offsetToPointData = new DataView(header).getUint32(96, true);
+      const preambleBuffer = Buffer.alloc(offsetToPointData);
+      await handle.read(preambleBuffer, 0, preambleBuffer.length, 0);
+      return preambleBuffer.buffer.slice(preambleBuffer.byteOffset, preambleBuffer.byteOffset + preambleBuffer.byteLength);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private uniqueManagedFileName(manifest: ProjectManifest, baseName: string): string {
+    const taken = new Set(manifest.assets.map((asset) => asset.managedPath).filter((value): value is string => Boolean(value)));
+    if (!taken.has(`sources/${baseName}`)) return baseName;
+    const parsed = path.parse(baseName);
+    let index = 1;
+    while (taken.has(`sources/${parsed.name}-${index}${parsed.ext}`)) index++;
+    return `${parsed.name}-${index}${parsed.ext}`;
+  }
+
+  private resolvePointCloudSourcePath(projectFolder: string, asset: ProjectManifest['assets'][number]): string {
+    if (asset.importPolicy === 'copy') {
+      if (!asset.managedPath) throw new Error(`Point cloud asset ${asset.id} has no managedPath.`);
+      return this.resolveManagedPath(projectFolder, asset.managedPath);
+    }
+    if (!asset.sourcePath) throw new Error(`Point cloud asset ${asset.id} has no sourcePath.`);
+    return asset.sourcePath;
+  }
+
+  private buildPointCloudPreview(input: {
+    assetId: string;
+    dataset: PointCloudDataset;
+    sourcePath: string;
+    cachePath: string;
+    warnings: string[];
+  }): PointCloudPreviewState {
+    const disclosure = this.buildPointCloudDisclosure(
+      input.dataset.octree?.totalSampledPoints ?? 0,
+      input.dataset.pointCount,
+      false,
+    );
+    return {
+      assetId: input.assetId,
+      sourceAssetTruthStatus: 'source',
+      displayTruthStatus: 'preview-sampled',
+      sampledPointCount: input.dataset.octree?.totalSampledPoints ?? 0,
+      totalPointCount: input.dataset.pointCount,
+      densifiedPointCount: 0,
+      sourceAvailable: input.warnings.length === 0 || !input.warnings.includes(MISSING_SOURCE_CACHE_WARNING),
+      disclosure,
+      sourcePath: input.sourcePath,
+      cachePath: input.cachePath,
+      warnings: [...input.warnings],
+    };
+  }
+
+  private buildPointCloudDisclosure(sampledPointCount: number, totalPointCount: number, hasDensifiedPoints: boolean): string {
+    const sampled = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(sampledPointCount);
+    const total = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(totalPointCount);
+    return hasDensifiedPoints
+      ? `Preview - sampled ${sampled} of ${total} points · ${DENSIFIED_DISCLOSURE_SUFFIX}`
+      : `Preview - sampled ${sampled} of ${total} points`;
+  }
+
+  private async computeSourceHeaderSha256(filePath: string, fileSize: number): Promise<string> {
+    const preamble = await this.readLasPreamble(filePath);
+    return createHash('sha256').update(new Uint8Array(preamble)).update(Buffer.from(String(fileSize))).digest('hex');
   }
 
   private async exists(filePath: string): Promise<boolean> {

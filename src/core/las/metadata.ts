@@ -4,15 +4,41 @@ export interface LasMetadataInput {
   fileName: string;
   fileSize: number;
   header: ArrayBuffer;
+  preamble?: ArrayBuffer;
   sample?: ArrayBuffer;
 }
 
 const HEADER_MIN_BYTES = 375;
+const GEO_KEY_DIRECTORY_TAG = 34735;
+const GEO_ASCII_PARAMS_TAG = 34737;
+const OGC_WKT_RECORD_IDS = new Set([2111, 2112]);
+
+interface ParsedVlr {
+  userId: string;
+  recordId: number;
+  data: Uint8Array;
+  description: string;
+}
+
+interface LasUnitInfo {
+  linear: SourceMeta['units']['linear'];
+  raw: string;
+  source: 'vlr' | 'assumed';
+}
+
+interface LasProjectionInfo {
+  crsText: string | null;
+  units: LasUnitInfo;
+}
 
 function text(view: DataView, offset: number, length: number): string {
   let out = '';
   for (let i = 0; i < length; i++) out += String.fromCharCode(view.getUint8(offset + i));
   return out;
+}
+
+function trimNulls(value: string): string {
+  return value.replace(/\0+$/g, '').trim();
 }
 
 function emptyCounts(): Record<string, number> {
@@ -63,12 +89,118 @@ function readPointCount(view: DataView, versionMinor: number): number {
   return view.getUint32(107, true);
 }
 
-function sourceMeta(fileName: string, version: string): SourceMeta {
+function unitFromGeoCode(code: number): LasUnitInfo | null {
+  switch (code) {
+    case 9001:
+      return { linear: 'meter', raw: 'EPSG:9001 metre', source: 'vlr' };
+    case 9002:
+      return { linear: 'foot', raw: 'EPSG:9002 foot', source: 'vlr' };
+    case 9003:
+      return { linear: 'usSurveyFoot', raw: 'EPSG:9003 US survey foot', source: 'vlr' };
+    default:
+      return null;
+  }
+}
+
+function unitFromText(raw: string | null): LasUnitInfo | null {
+  if (!raw) return null;
+  const textValue = raw.toLowerCase();
+  if (textValue.includes('survey foot') || textValue.includes('us-ft') || textValue.includes('us survey')) {
+    return { linear: 'usSurveyFoot', raw, source: 'vlr' };
+  }
+  if (textValue.includes('meter') || textValue.includes('metre')) {
+    return { linear: 'meter', raw, source: 'vlr' };
+  }
+  if (textValue.includes('foot') || textValue.includes('feet') || textValue.includes('ft')) {
+    return { linear: 'foot', raw, source: 'vlr' };
+  }
+  return null;
+}
+
+function readAsciiValue(payload: string, offset: number, count: number): string {
+  const start = Math.max(0, offset);
+  const end = Math.min(payload.length, start + Math.max(count - 1, 0));
+  return trimNulls(payload.slice(start, end));
+}
+
+function parseVlrs(preamble: ArrayBuffer, headerSize: number, vlrCount: number, offsetToPointData: number): ParsedVlr[] {
+  const view = new DataView(preamble);
+  const vlrs: ParsedVlr[] = [];
+  let offset = headerSize;
+  for (let i = 0; i < vlrCount; i++) {
+    if (offset + 54 > Math.min(offsetToPointData, preamble.byteLength)) break;
+    const userId = trimNulls(text(view, offset + 2, 16));
+    const recordId = view.getUint16(offset + 18, true);
+    const recordLength = view.getUint16(offset + 20, true);
+    const description = trimNulls(text(view, offset + 22, 32));
+    const dataStart = offset + 54;
+    const dataEnd = dataStart + recordLength;
+    if (dataEnd > Math.min(offsetToPointData, preamble.byteLength)) break;
+    vlrs.push({
+      userId,
+      recordId,
+      description,
+      data: new Uint8Array(preamble.slice(dataStart, dataEnd)),
+    });
+    offset = dataEnd;
+  }
+  return vlrs;
+}
+
+function parseProjection(vlrs: ParsedVlr[]): LasProjectionInfo {
+  const asciiVlr = vlrs.find((vlr) => vlr.recordId === GEO_ASCII_PARAMS_TAG);
+  const asciiText = asciiVlr ? trimNulls(new TextDecoder('ascii').decode(asciiVlr.data)).replace(/\|/g, ' ').trim() : '';
+
+  let crsText = asciiText || null;
+  for (const vlr of vlrs) {
+    if (vlr.userId === 'LASF_Projection' && OGC_WKT_RECORD_IDS.has(vlr.recordId)) {
+      const wkt = trimNulls(new TextDecoder('utf-8').decode(vlr.data));
+      if (wkt) {
+        crsText = wkt;
+        break;
+      }
+    }
+  }
+
+  const geoKeyVlr = vlrs.find((vlr) => vlr.recordId === GEO_KEY_DIRECTORY_TAG);
+  let units = unitFromText(crsText);
+
+  if (geoKeyVlr) {
+    const keyView = new DataView(geoKeyVlr.data.buffer, geoKeyVlr.data.byteOffset, geoKeyVlr.data.byteLength);
+    if (keyView.byteLength >= 8) {
+      const keyCount = keyView.getUint16(6, true);
+      for (let i = 0; i < keyCount; i++) {
+        const base = 8 + i * 8;
+        if (base + 8 > keyView.byteLength) break;
+        const keyId = keyView.getUint16(base, true);
+        const location = keyView.getUint16(base + 2, true);
+        const count = keyView.getUint16(base + 4, true);
+        const valueOffset = keyView.getUint16(base + 6, true);
+        if ((keyId === 3076 || keyId === 4099) && location === 0) {
+          units = unitFromGeoCode(valueOffset) ?? units;
+        }
+        if ((keyId === 1026 || keyId === 2049 || keyId === 3073) && location === GEO_ASCII_PARAMS_TAG && asciiText) {
+          const citation = readAsciiValue(asciiText, valueOffset, count);
+          if (citation) crsText = citation;
+        }
+      }
+    }
+  }
+
+  if (!units && asciiText) units = unitFromText(asciiText);
+
+  return {
+    crsText,
+    units: units ?? { linear: 'unknown', raw: 'unconfirmed from LAS VLRs', source: 'assumed' },
+  };
+}
+
+function sourceMeta(fileName: string, version: string, projection: LasProjectionInfo): SourceMeta {
   return {
     fileName,
     format: 'las',
     formatVersion: `LAS ${version}`,
-    units: { linear: 'usSurveyFoot', raw: 'assumed project feet' },
+    units: projection.units,
   };
 }
 
@@ -101,6 +233,12 @@ function buildReport(dataset: Omit<PointCloudDataset, 'report'>): ImportReport {
   report.infos.push(`attributes detected: ${present.join(', ')}`);
   if (dataset.pointFormat !== 7) report.warnings.push(`point format ${dataset.pointFormat} is not the Phase 5 reference format 7`);
   if (!attrs.hasRgb) report.warnings.push('RGB is not present in this LAS point format');
+  if (dataset.crsText) report.infos.push(`CRS: ${dataset.crsText}`);
+  if (dataset.unitSource === 'assumed') {
+    report.warnings.push('linear units could not be confirmed from LAS VLRs');
+  } else {
+    report.infos.push(`units confirmed from LAS VLRs: ${dataset.meta.units.raw}`);
+  }
   if (dataset.pointDensityPerSqFt !== null) {
     report.infos.push(`average density ${dataset.pointDensityPerSqFt.toFixed(1)} points/sq ft from header bounds`);
   }
@@ -132,13 +270,15 @@ export function parseLasMetadata(input: LasMetadataInput): PointCloudDataset {
     maxZ: view.getFloat64(211, true),
     minZ: view.getFloat64(219, true),
   };
+  const preamble = input.preamble ?? input.header;
+  const projection = parseProjection(parseVlrs(preamble, headerSize, vlrCount, offsetToPointData));
   const attributes = sampleAttributes(pointFormat, pointRecordLength, input.sample);
   const area = (bounds.maxX - bounds.minX) * (bounds.maxY - bounds.minY);
-  const pointDensityPerSqFt = area > 0 ? pointCount / area : null;
+  const pointDensityPerSqFt = projection.units.linear === 'meter' ? null : area > 0 ? pointCount / area : null;
   const base: Omit<PointCloudDataset, 'report'> = {
     id: `las:${input.fileName}`,
     name: input.fileName,
-    meta: sourceMeta(input.fileName, version),
+    meta: sourceMeta(input.fileName, version, projection),
     lasVersion: version,
     pointFormat,
     pointRecordLength,
@@ -148,6 +288,8 @@ export function parseLasMetadata(input: LasMetadataInput): PointCloudDataset {
     scale,
     offset,
     bounds,
+    crsText: projection.crsText,
+    unitSource: projection.units.source,
     attributes,
     pointDensityPerSqFt,
   };

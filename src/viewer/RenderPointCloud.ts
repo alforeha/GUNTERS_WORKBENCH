@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { PointCloudDataset, PointCloudOctreeNode } from '../core/contract';
+import type { PointCloudDataset, PointCloudNodePayload, PointCloudOctreeNode } from '../core/contract';
 import type { Vec3 } from './geometry';
 import {
   GeotiffOverviewSampler,
@@ -18,36 +18,24 @@ interface RenderNode {
   source: PointCloudOctreeNode;
   points: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial> | null;
   localBounds: THREE.Box3;
-  /** full sample count for this node (octree-sampled). */
   sampleCount: number;
-  /** stride the node is currently drawn at (1 = every sample). 0 = not selected this pass. */
   currentStride: number;
-  /** colorEpoch the node's color buffer was last computed at. */
   colorBuiltEpoch: number;
-  /** whether the node currently has a usable packed buffer (drawRange may still be 0). */
   built: boolean;
-  /** reusable packed position buffer (xyz), sized to sampleCount. */
   position: Float32Array;
-  /** reusable packed color buffer (rgb 0–1), sized to sampleCount. */
   color: Float32Array;
+  dense: PointCloudNodePayload | null;
+  densePosition: Float32Array;
+  denseColor: Float32Array;
+  lastDensifiedUseAt: number;
 }
 
-/**
- * Renders one LAS point cloud from its octree.
- *
- * Invariant that keeps RGB rock-solid: every visible node always has a fully-populated
- * position + color buffer. The first time a node is selected it is packed once (positions +
- * colors for the active display mode). After that, only three cheap things ever happen:
- *   • visibility flips (frustum in/out),
- *   • a draw-range change (LOD stride),
- *   • a color recompute (display mode / filter / GeoTIFF overview changed).
- * Nothing about rendering is gated on the camera being "settled" — settle only decides when
- * we *re-thin* an already-drawn node to a coarser/finer LOD tier, so RGB shows on first paint.
- */
 export class RenderPointCloud {
   readonly handle: string;
   readonly dataset: PointCloudDataset;
   readonly group = new THREE.Group();
+
+  private static diskTexture: THREE.Texture | null = null;
 
   private nodes: RenderNode[] = [];
   private material: THREE.PointsMaterial;
@@ -56,12 +44,13 @@ export class RenderPointCloud {
   private density = 1;
   private originDelta: Vec3;
   private origin: Vec3;
-
   private displayMode: PointDisplayMode = 'rgb';
   private filter: FilterState = defaultFilterState();
   private overviewSampler: GeotiffOverviewSampler | null = null;
-  /** bumps whenever color inputs (mode / filter / overview) change. */
   private colorEpoch = 0;
+  private densifiedPointBudget = 1_500_000;
+  private densifiedPointCount = 0;
+  private lastCameraPosition = new THREE.Vector3();
 
   constructor(handle: string, dataset: PointCloudDataset, sceneOrigin: Vec3) {
     if (!dataset.octree) throw new Error('Point cloud dataset has no octree');
@@ -76,10 +65,14 @@ export class RenderPointCloud {
     this.group.name = `point-cloud:${handle}`;
     this.group.position.set(this.originDelta[0], this.originDelta[1], this.originDelta[2]);
     this.material = new THREE.PointsMaterial({
-      size: this.pointSize,
-      sizeAttenuation: false,
+      size: this.worldPointSize(this.pointSize),
+      sizeAttenuation: true,
       vertexColors: true,
       toneMapped: false,
+      map: RenderPointCloud.getDiskTexture(),
+      alphaTest: 0.35,
+      transparent: true,
+      fog: true,
     });
     this.displayMode = dataset.attributes.hasRgb ? 'rgb' : 'elevation';
     this.nodes = this.flattenNodes(dataset.octree.root);
@@ -108,7 +101,7 @@ export class RenderPointCloud {
     this.visibleAll = visible;
     this.pointSize = THREE.MathUtils.clamp(pointSize, 1, 5);
     this.group.visible = visible;
-    this.material.size = this.pointSize;
+    this.material.size = this.worldPointSize(this.pointSize);
     this.material.needsUpdate = true;
   }
 
@@ -132,11 +125,65 @@ export class RenderPointCloud {
     if (this.displayMode === 'geotiff') this.colorEpoch++;
   }
 
+  setDensifiedPointBudget(pointBudget: number): void {
+    this.densifiedPointBudget = Math.max(100_000, Math.round(pointBudget));
+    this.evictDensifiedNodes();
+  }
+
   get displayModeValue(): PointDisplayMode {
     return this.displayMode;
   }
 
+  hasDensifiedPoints(): boolean {
+    return this.densifiedPointCount > 0;
+  }
+
+  getDensifiedPointCount(): number {
+    return this.densifiedPointCount;
+  }
+
+  applyDensifiedNode(nodeId: number, payload: PointCloudNodePayload): boolean {
+    const node = this.nodes.find((candidate) => candidate.source.id === nodeId);
+    if (!node || !node.points) return false;
+    if (node.dense) this.densifiedPointCount -= node.dense.pointCount;
+    node.dense = payload;
+    node.densePosition = new Float32Array(payload.pointCount * 3);
+    node.denseColor = new Float32Array(payload.pointCount * 3);
+    node.built = false;
+    node.currentStride = 0;
+    node.lastDensifiedUseAt = performance.now();
+    this.densifiedPointCount += payload.pointCount;
+    this.evictDensifiedNodes(nodeId);
+    return true;
+  }
+
+  releaseDensifiedNode(nodeId: number): boolean {
+    const node = this.nodes.find((candidate) => candidate.source.id === nodeId);
+    if (!node?.dense) return false;
+    this.densifiedPointCount -= node.dense.pointCount;
+    node.dense = null;
+    node.densePosition = new Float32Array(0);
+    node.denseColor = new Float32Array(0);
+    node.built = false;
+    node.currentStride = 0;
+    return true;
+  }
+
+  nearestLeafNodeIds(camera: THREE.Camera, exaggeration: number, limit = 2): number[] {
+    const center = new THREE.Vector3();
+    return this.nodes
+      .filter((node) => node.source.children.length === 0 && node.source.sourceRanges.length > 0)
+      .map((node) => ({
+        id: node.source.id,
+        distance: camera.position.distanceTo(this.renderedBounds(node.localBounds, exaggeration).getCenter(center.clone())),
+      }))
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, limit)
+      .map((entry) => entry.id);
+  }
+
   updateVisible(camera: THREE.Camera, exaggeration: number, cameraSettled: boolean): boolean {
+    this.lastCameraPosition.copy(camera.position);
     this.group.visible = this.visibleAll;
     if (!this.group.visible) {
       let changed = false;
@@ -146,62 +193,50 @@ export class RenderPointCloud {
 
     const projScreen = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new THREE.Frustum().setFromProjectionMatrix(projScreen);
-
-    // Score every frustum-visible node by camera distance.
     const scores: NodeScore[] = [];
     const nodeByIndex: RenderNode[] = [];
+    const center = new THREE.Vector3();
     for (const node of this.nodes) {
-      if (!node.points || node.sampleCount === 0) continue;
+      if (!node.points) continue;
+      const candidateCount = node.dense?.pointCount ?? node.sampleCount;
+      if (candidateCount === 0) continue;
       const testBox = this.renderedBounds(node.localBounds, exaggeration);
       if (!frustum.intersectsBox(testBox)) continue;
       const index = nodeByIndex.length;
       nodeByIndex.push(node);
       scores.push({
         index,
-        distance: camera.position.distanceTo(testBox.getCenter(new THREE.Vector3())),
-        sampleCount: node.sampleCount,
+        distance: camera.position.distanceTo(testBox.getCenter(center.clone())),
+        sampleCount: candidateCount,
       });
     }
 
     const lod = selectLod(scores, POINT_BUDGET_MIN, POINT_BUDGET_MAX);
     const selected = new Set<RenderNode>();
     let changed = false;
-
     for (const result of lod) {
       const node = nodeByIndex[result.index]!;
       selected.add(node);
-
-      // Budget-dropped: keep hidden, do not repack. Must come before !node.built check.
-      if (result.stride === 0) {
-        // Beyond budget: only drop the node once motion stops, never blank it mid-orbit.
-        if (cameraSettled) changed = this.hideNode(node, true) || changed;
-        continue;
-      }
-
-      const targetStride = this.densityAdjustedStride(result.stride);
+      if (node.dense) node.lastDensifiedUseAt = performance.now();
+      const targetStride = node.dense ? 1 : this.densityAdjustedStride(result.stride);
       const colorsStale = node.colorBuiltEpoch !== this.colorEpoch;
-
       if (!node.built || colorsStale || node.currentStride !== targetStride) {
-        // First paint for this node, or display mode / filter changed → (re)pack immediately.
-        // This is what makes RGB appear on load with no settle dependency.
         if (cameraSettled || !node.built || colorsStale) {
           this.packNode(node, targetStride);
           changed = true;
-        } else if (!node.points!.visible) {
-          node.points!.visible = true;
+        } else if (node.points && !node.points.visible) {
+          node.points.visible = true;
           changed = true;
         }
-      } else if (!node.points!.visible) {
-        node.points!.visible = true;
+      } else if (node.points && !node.points.visible) {
+        node.points.visible = true;
         changed = true;
       }
     }
 
-    // Nodes no longer in the frustum: hide right away (off-screen).
     for (const node of this.nodes) {
       if (!selected.has(node)) changed = this.hideNode(node) || changed;
     }
-
     return changed;
   }
 
@@ -221,9 +256,9 @@ export class RenderPointCloud {
       let points: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial> | null = null;
       let position = new Float32Array(0);
       let color = new Float32Array(0);
-      if (source.sampleCount > 0) {
-        position = new Float32Array(source.sampleCount * 3);
-        color = new Float32Array(source.sampleCount * 3);
+      if (source.sampleCount > 0 || source.sourceRanges.length > 0) {
+        position = new Float32Array(Math.max(source.sampleCount, 1) * 3);
+        color = new Float32Array(Math.max(source.sampleCount, 1) * 3);
         const geometry = new THREE.BufferGeometry();
         geometry.setAttribute('position', new THREE.BufferAttribute(position, 3));
         geometry.setAttribute('color', new THREE.BufferAttribute(color, 3));
@@ -242,7 +277,11 @@ export class RenderPointCloud {
         colorBuiltEpoch: -1,
         built: false,
         position,
-        color, // Float32Array, values 0–1
+        color,
+        dense: null,
+        densePosition: new Float32Array(0),
+        denseColor: new Float32Array(0),
+        lastDensifiedUseAt: 0,
         localBounds: new THREE.Box3(
           new THREE.Vector3(source.localBounds.minX, source.localBounds.minY, source.localBounds.minZ),
           new THREE.Vector3(source.localBounds.maxX, source.localBounds.maxY, source.localBounds.maxZ),
@@ -254,54 +293,55 @@ export class RenderPointCloud {
     return out;
   }
 
-  /**
-   * Pack a node's drawable points: walk the sampled points at the given stride, apply the
-   * active class/return filter, write a contiguous prefix of positions + colors, and set the
-   * draw range. No re-parse, no reallocation — reuses the node's buffers.
-   */
   private packNode(node: RenderNode, stride: number): void {
     if (!node.points) return;
     const src = node.source;
+    const dense = node.dense;
+    const count = dense?.pointCount ?? node.sampleCount;
     const positionAttr = node.points.geometry.getAttribute('position') as THREE.BufferAttribute;
-    const colorAttr = node.points.geometry.getAttribute('color') as THREE.BufferAttribute;
-    const pos = node.position;
-    const col = node.color;
-    // Defensive: octree.zRange + per-point return arrays are Milestone-3 additions. If an older
-    // worker build produced an octree without them, fall back to dataset bounds / "single return"
-    // so packing NEVER throws and RGB still renders.
+    const pos = dense ? node.densePosition : node.position;
+    const col = dense ? node.denseColor : node.color;
     const zRange = this.dataset.octree?.zRange;
     const zMin = zRange ? zRange[0] : this.dataset.bounds.minZ;
     const zMax = zRange ? zRange[1] : this.dataset.bounds.maxZ;
     const zSpan = zMax - zMin || 1;
-    const classifications = src.classifications;
-    const returnNumbers = src.returnNumbers;
-    const numberOfReturns = src.numberOfReturns;
+    const classifications = dense?.classifications ?? src.classifications;
+    const returnNumbers = dense?.returnNumbers ?? src.returnNumbers;
+    const numberOfReturns = dense?.numberOfReturns ?? src.numberOfReturns;
     const step = Math.max(1, stride);
 
-    let written = 0;
-    for (let i = 0; i < node.sampleCount; i += step) {
-      const cls = classifications ? (classifications[i] ?? 0) : 0;
-      const rn = returnNumbers ? (returnNumbers[i] ?? 1) : 1;
-      const nr = numberOfReturns ? (numberOfReturns[i] ?? 1) : 1;
-      if (!pointPasses(cls, rn, nr, this.filter)) continue;
+    if (dense && positionAttr.array !== node.densePosition) {
+      node.points.geometry.setAttribute('position', new THREE.BufferAttribute(node.densePosition, 3));
+      node.points.geometry.setAttribute('color', new THREE.BufferAttribute(node.denseColor, 3));
+    } else if (!dense && positionAttr.array !== node.position) {
+      node.points.geometry.setAttribute('position', new THREE.BufferAttribute(node.position, 3));
+      node.points.geometry.setAttribute('color', new THREE.BufferAttribute(node.color, 3));
+    }
+    const livePositionAttr = node.points.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const liveColorAttr = node.points.geometry.getAttribute('color') as THREE.BufferAttribute;
 
-      const sx = src.positions[i * 3] ?? 0;
-      const sy = src.positions[i * 3 + 1] ?? 0;
-      const sz = src.positions[i * 3 + 2] ?? 0;
+    let written = 0;
+    for (let i = 0; i < count; i += step) {
+      const cls = classifications[i] ?? 0;
+      const rn = returnNumbers[i] ?? 1;
+      const nr = numberOfReturns[i] ?? 1;
+      if (!pointPasses(cls, rn, nr, this.filter)) continue;
+      const sx = dense?.positions[i * 3] ?? src.positions[i * 3] ?? 0;
+      const sy = dense?.positions[i * 3 + 1] ?? src.positions[i * 3 + 1] ?? 0;
+      const sz = dense?.positions[i * 3 + 2] ?? src.positions[i * 3 + 2] ?? 0;
       const o = written * 3;
       pos[o] = sx;
       pos[o + 1] = sy;
       pos[o + 2] = sz;
-
-      const c = this.colorFor(src, i, sx, sy, sz, zMin, zSpan);
+      const c = this.colorFor(src, dense, i, sx, sy, sz, zMin, zSpan);
       col[o] = c[0];
       col[o + 1] = c[1];
       col[o + 2] = c[2];
       written++;
     }
 
-    positionAttr.needsUpdate = true;
-    colorAttr.needsUpdate = true;
+    livePositionAttr.needsUpdate = true;
+    liveColorAttr.needsUpdate = true;
     node.points.geometry.setDrawRange(0, written);
     node.points.geometry.computeBoundingSphere();
     node.points.visible = written > 0;
@@ -314,12 +354,9 @@ export class RenderPointCloud {
     return Math.max(1, Math.round(stride / this.density));
   }
 
-  /**
-   * Returns a [r, g, b] triple with values in the range 0–1 for use in the Float32
-   * color attribute. All LAS source colors (0–255 uint8) are divided by 255 here.
-   */
   private colorFor(
     src: PointCloudOctreeNode,
+    dense: PointCloudNodePayload | null,
     i: number,
     localX: number,
     localY: number,
@@ -329,7 +366,8 @@ export class RenderPointCloud {
   ): [number, number, number] {
     switch (this.displayMode) {
       case 'intensity': {
-        const g = THREE.MathUtils.clamp(src.intensities[i] ?? 0, 0, 1);
+        const intensity = dense?.intensities[i] ?? src.intensities[i] ?? 0;
+        const g = THREE.MathUtils.clamp(intensity, 0, 1);
         return [g, g, g];
       }
       case 'elevation': {
@@ -342,21 +380,26 @@ export class RenderPointCloud {
           const sampled = this.overviewSampler.sample(localX + this.origin[0], localY + this.origin[1]);
           if (sampled) return [sampled[0] / 255, sampled[1] / 255, sampled[2] / 255];
         }
-        // No overview yet / outside coverage → fall back to the point's real RGB, not black.
-        return [
-          (src.colors[i * 3] ?? 200) / 255,
-          (src.colors[i * 3 + 1] ?? 200) / 255,
-          (src.colors[i * 3 + 2] ?? 200) / 255,
-        ];
+        return this.rgbColor(src, dense, i, 200);
       }
       case 'rgb':
       default:
-        return [
-          (src.colors[i * 3] ?? 255) / 255,
-          (src.colors[i * 3 + 1] ?? 255) / 255,
-          (src.colors[i * 3 + 2] ?? 255) / 255,
-        ];
+        return this.rgbColor(src, dense, i, 255);
     }
+  }
+
+  private rgbColor(
+    src: PointCloudOctreeNode,
+    dense: PointCloudNodePayload | null,
+    i: number,
+    fallback: number,
+  ): [number, number, number] {
+    const colors = dense?.colors ?? src.colors;
+    return [
+      (colors[i * 3] ?? fallback) / 255,
+      (colors[i * 3 + 1] ?? fallback) / 255,
+      (colors[i * 3 + 2] ?? fallback) / 255,
+    ];
   }
 
   private renderedBounds(localBounds: THREE.Box3, exaggeration: number): THREE.Box3 {
@@ -380,8 +423,57 @@ export class RenderPointCloud {
     node.points.geometry.setDrawRange(0, 0);
     node.points.visible = false;
     node.currentStride = 0;
-    // Mark unbuilt so a node re-entering the frustum repacks immediately (no settle wait).
     if (!keepBuilt) node.built = false;
     return true;
+  }
+
+  private evictDensifiedNodes(protectedNodeId?: number): void {
+    if (this.densifiedPointCount <= this.densifiedPointBudget) return;
+    const center = new THREE.Vector3();
+    const evictable = this.nodes
+      .filter((node) => node.dense && node.source.id !== protectedNodeId)
+      .map((node) => ({
+        node,
+        distance: this.lastCameraPosition.distanceTo(this.renderedBounds(node.localBounds, 1).getCenter(center.clone())),
+      }))
+      .sort((a, b) => {
+        if (a.node.lastDensifiedUseAt !== b.node.lastDensifiedUseAt) {
+          return a.node.lastDensifiedUseAt - b.node.lastDensifiedUseAt;
+        }
+        return b.distance - a.distance;
+      });
+    for (const entry of evictable) {
+      if (this.densifiedPointCount <= this.densifiedPointBudget) break;
+      this.releaseDensifiedNode(entry.node.source.id);
+    }
+  }
+
+  private worldPointSize(multiplier: number): number {
+    return THREE.MathUtils.lerp(0.04, 0.18, (THREE.MathUtils.clamp(multiplier, 1, 5) - 1) / 4);
+  }
+
+  private static getDiskTexture(): THREE.Texture {
+    if (RenderPointCloud.diskTexture) return RenderPointCloud.diskTexture;
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      RenderPointCloud.diskTexture = new THREE.Texture();
+      return RenderPointCloud.diskTexture;
+    }
+    const gradient = ctx.createRadialGradient(32, 32, 5, 32, 32, 32);
+    gradient.addColorStop(0, 'rgba(255,255,255,1)');
+    gradient.addColorStop(0.72, 'rgba(255,255,255,1)');
+    gradient.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = gradient;
+    ctx.beginPath();
+    ctx.arc(32, 32, 32, 0, Math.PI * 2);
+    ctx.fill();
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.needsUpdate = true;
+    RenderPointCloud.diskTexture = texture;
+    return texture;
   }
 }

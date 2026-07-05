@@ -34,12 +34,63 @@ export function registerWorkbenchIpc(): void {
     return result.filePaths[0];
   });
 
+  ipcMain.handle('workbench:pickPointCloudImport', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Select point cloud source',
+      buttonLabel: 'Choose Point Cloud',
+      properties: ['openFile'],
+      filters: [{ name: 'Point Clouds', extensions: ['las', 'laz'] }],
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return null;
+    }
+    const filePath = result.filePaths[0] as string;
+    const stats = await import('node:fs/promises').then((fs) => fs.stat(filePath));
+    const response = await dialog.showMessageBox({
+      type: 'warning',
+      title: 'Import Policy',
+      message: 'Choose how to register this point cloud source.',
+      detail:
+        stats.size >= 1024 * 1024 * 1024
+          ? 'This file is large. Reference is recommended to avoid copying multi-GB source data into the project.'
+          : 'Reference keeps the file in place. Copy duplicates it into the project sources folder.',
+      buttons: ['Reference', 'Copy', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+    });
+    if (response.response === 2) {
+      return null;
+    }
+    return {
+      filePath,
+      importPolicy: response.response === 1 ? 'copy' : 'reference',
+    } as const;
+  });
+
   ipcMain.handle('workbench:createProject', (_event, input: Parameters<WorkbenchIpc['createProject']>[0]) =>
     service.createProject(input),
   );
 
   ipcMain.handle('workbench:openProject', (_event, input: Parameters<WorkbenchIpc['openProject']>[0]) =>
     service.openProject(input),
+  );
+
+  ipcMain.handle('workbench:importPointCloud', (_event, input: Parameters<WorkbenchIpc['importPointCloud']>[0]) =>
+    service.importPointCloud(input),
+  );
+
+  ipcMain.handle(
+    'workbench:loadPointCloudPreview',
+    async (event, input: Parameters<WorkbenchIpc['loadPointCloudPreview']>[0]) =>
+      service.loadPointCloudPreview(input, (progress) => {
+        event.sender.send('workbench:pointCloudPreviewProgress', progress);
+      }),
+  );
+
+  ipcMain.handle(
+    'workbench:loadPointCloudDensifiedNodes',
+    (_event, input: Parameters<WorkbenchIpc['loadPointCloudDensifiedNodes']>[0]) =>
+      service.loadPointCloudDensifiedNodes(input),
   );
 
   ipcMain.handle(
