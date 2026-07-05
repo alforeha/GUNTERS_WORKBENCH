@@ -20,6 +20,14 @@ import type {
   UnitWarningInput,
 } from '../src/shared/workbench-types';
 import type { ProjectSession } from '../src/shared/ipc';
+import {
+  POINT_CLOUD_INDEX_ASSET_KIND,
+  POINT_CLOUD_INDEX_WARNING_PREFIX,
+  detectIndexStaleness,
+  formatStaleIndexWarning,
+  isManagedIndexWarning,
+  type CurrentSourceFingerprint,
+} from '../src/shared/pointcloud-index';
 import { generateTestMesh } from '../src/viewer/synthetic';
 import {
   previewCacheRelativePath,
@@ -535,7 +543,33 @@ export class ProjectService {
         layer.status = 'active';
       }
     }
+
+    for (const asset of next.assets) {
+      if (asset.kind !== POINT_CLOUD_INDEX_ASSET_KIND || !asset.pointCloudIndex) continue;
+      // Drop any stale/missing warning we added on a prior open so this stays idempotent.
+      asset.warnings = asset.warnings.filter((warning) => !isManagedIndexWarning(warning));
+      const sourceAsset = next.assets.find((candidate) => candidate.id === asset.pointCloudIndex!.sourceAssetId);
+      if (!sourceAsset) continue; // dangling refs are rejected by the schema; defensive only
+      try {
+        const current = await this.computeCurrentSourceFingerprint(projectFolder, sourceAsset);
+        const warning = formatStaleIndexWarning(detectIndexStaleness(asset.pointCloudIndex.source, current));
+        if (warning) asset.warnings.push(warning);
+      } catch {
+        asset.warnings.push(`${POINT_CLOUD_INDEX_WARNING_PREFIX} freshness could not be verified from the current source.`);
+      }
+    }
     return next;
+  }
+
+  private async computeCurrentSourceFingerprint(
+    projectFolder: string,
+    sourceAsset: ProjectManifest['assets'][number],
+  ): Promise<CurrentSourceFingerprint> {
+    const sourcePath = this.resolvePointCloudSourcePath(projectFolder, sourceAsset);
+    if (!(await this.exists(sourcePath))) return { exists: false };
+    const sourceStats = await stat(sourcePath);
+    const headerSha256 = await this.computeSourceHeaderSha256(sourcePath, sourceStats.size);
+    return { exists: true, headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs };
   }
 
   private toSession(projectFolder: string, manifest: ProjectManifest, recoveryDetected: boolean): ProjectSession {

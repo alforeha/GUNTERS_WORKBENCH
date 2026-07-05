@@ -13,6 +13,40 @@ export const truthStatusSchema = z.enum([
 
 export const simulationLayerStatusSchema = z.enum(['active', 'hidden', 'error']);
 
+const boundsSchema = z.object({
+  minX: z.number(),
+  minY: z.number(),
+  minZ: z.number(),
+  maxX: z.number(),
+  maxY: z.number(),
+  maxZ: z.number(),
+});
+
+const xyzTupleSchema = z.tuple([z.number(), z.number(), z.number()]);
+
+export const pointCloudIndexTypeSchema = z.literal('wpi-octree');
+
+const pointCloudIndexSchema = z.object({
+  sourceAssetId: z.string().min(1),
+  indexType: pointCloudIndexTypeSchema,
+  indexVersion: z.literal(1),
+  source: z.object({
+    headerSha256: z.string().min(1),
+    fileSize: z.number().nonnegative(),
+    mtimeMs: z.number().nullable(),
+  }),
+  pointCount: z.number().nonnegative(),
+  bounds: boundsSchema,
+  scale: xyzTupleSchema,
+  offset: xyzTupleSchema,
+  units: z.string().min(1),
+  generatedAt: z.string().min(1),
+  generator: z.object({
+    name: z.literal('workbench'),
+    version: z.string().min(1),
+  }),
+});
+
 const assetRecordSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -37,22 +71,16 @@ const assetRecordSchema = z.object({
       lasVersion: z.string().min(1),
       pointFormat: z.number().int().nonnegative(),
       pointRecordLength: z.number().int().positive(),
-      bounds: z.object({
-        minX: z.number(),
-        minY: z.number(),
-        minZ: z.number(),
-        maxX: z.number(),
-        maxY: z.number(),
-        maxZ: z.number(),
-      }),
-      scale: z.tuple([z.number(), z.number(), z.number()]),
-      offset: z.tuple([z.number(), z.number(), z.number()]),
+      bounds: boundsSchema,
+      scale: xyzTupleSchema,
+      offset: xyzTupleSchema,
       crsText: z.string().nullable(),
       unitsLinear: z.enum(['usSurveyFoot', 'foot', 'meter', 'unknown']),
       unitsRaw: z.string().min(1),
       headerSha256: z.string().min(1),
     })
     .optional(),
+  pointCloudIndex: pointCloudIndexSchema.optional(),
 });
 
 const simulationLayerSchema = z.object({
@@ -145,6 +173,17 @@ export const projectManifestSchema = z
   .strict()
   .superRefine((manifest, ctx) => {
     const simId = manifest.realitySimulation.id;
+    const assetIds = new Set(manifest.assets.map((asset) => asset.id));
+
+    for (const asset of manifest.assets) {
+      if (!asset.pointCloudIndex) continue;
+      if (!assetIds.has(asset.pointCloudIndex.sourceAssetId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `point-cloud index asset ${asset.id} references unknown sourceAssetId ${asset.pointCloudIndex.sourceAssetId}`,
+        });
+      }
+    }
 
     for (const layer of manifest.simulationLayers) {
       if (layer.simulationId !== simId) {

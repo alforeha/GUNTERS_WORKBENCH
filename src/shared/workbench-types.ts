@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = '1.1.0';
+export const SCHEMA_VERSION = '1.2.0';
 
 export type TruthStatus =
   | 'source'
@@ -29,6 +29,44 @@ export interface AssetRecord {
     modifiedAt?: string;
   };
   pointCloud?: PointCloudAssetMetadata;
+  pointCloudIndex?: PointCloudIndexMetadata;
+}
+
+export interface PointCloudBoundsBox {
+  minX: number;
+  minY: number;
+  minZ: number;
+  maxX: number;
+  maxY: number;
+  maxZ: number;
+}
+
+export type PointCloudIndexType = 'wpi-octree';
+
+/**
+ * Metadata for a WPI v1 point-cloud index asset (kind `point-cloud-index`, truthStatus
+ * `indexed-full`). The index is a workbench-internal, COPC-shaped octree — never real
+ * COPC. `source` fingerprints the LAS the index was built from so staleness is detectable
+ * independently of the disposable preview cache. See src/shared/pointcloud-index.ts.
+ */
+export interface PointCloudIndexMetadata {
+  /** Points back to the immutable source point-cloud asset. */
+  sourceAssetId: string;
+  indexType: PointCloudIndexType;
+  indexVersion: 1;
+  source: {
+    headerSha256: string;
+    fileSize: number;
+    /** Nullable: reference imports may not expose a reliable mtime. */
+    mtimeMs: number | null;
+  };
+  pointCount: number;
+  bounds: PointCloudBoundsBox;
+  scale: [number, number, number];
+  offset: [number, number, number];
+  units: string;
+  generatedAt: string;
+  generator: { name: 'workbench'; version: string };
 }
 
 export interface PointCloudAssetMetadata {
