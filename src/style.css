@@ -1,0 +1,132 @@
+:root {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  color: #d6dfeb;
+  background: radial-gradient(circle at 15% 15%, #243956 0%, #111a27 45%, #0a1018 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+#app {
+  min-height: 100vh;
+  padding: 14px;
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  gap: 12px;
+  min-height: calc(100vh - 28px);
+}
+
+.toolbar {
+  grid-column: 1 / 3;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+button {
+  border: 1px solid #33506e;
+  background: #1b2a3b;
+  color: #d6dfeb;
+  padding: 8px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #22354a;
+}
+
+.status-panel,
+.viewer-wrap {
+  border: 1px solid #2d425d;
+  border-radius: 10px;
+  background: rgba(12, 20, 31, 0.82);
+  padding: 10px;
+}
+
+h1,
+h2 {
+  margin: 6px 0;
+}
+
+#project-path,
+#recovery {
+  margin: 6px 0;
+  font-size: 13px;
+}
+
+#asset-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.asset-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  background: #122130;
+  border: 1px solid #2b425c;
+  border-radius: 7px;
+  padding: 6px 8px;
+}
+
+.truth-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.truth-source,
+.truth-source-normalized {
+  background: #274f2f;
+}
+
+.truth-preview-sampled,
+.truth-indexed-full {
+  background: #4d3e13;
+}
+
+.truth-derived,
+.truth-authored,
+.truth-edited,
+.truth-export {
+  background: #24486f;
+}
+
+.warn-text {
+  grid-column: 1 / 3;
+  font-size: 12px;
+  color: #ffd6a2;
+}
+
+#viewer-host {
+  width: 100%;
+  height: 100%;
+  min-height: 420px;
+}
+
+@media (max-width: 980px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  .toolbar {
+    grid-column: 1;
+  }
+}

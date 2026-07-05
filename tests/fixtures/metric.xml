@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+<Units><Metric areaUnit="squareMeter" linearUnit="meter" volumeUnit="cubicMeter"/></Units>
+<Application name="SyntheticFixture" version="1.0"/>
+<Surfaces>
+<Surface name="METRIC_S1">
+<Definition surfType="TIN">
+<Pnts>
+<P id="1">5000.100 2000.200 100.10</P>
+<P id="2">5001.000 2001.000 101.00</P>
+<P id="3">5002.000 2000.000 102.00</P>
+<P id="4">5003.000 2002.000 103.00</P>
+</Pnts>
+<Faces>
+<F>1 2 3</F>
+<F i="1">2 4 3</F>
+</Faces>
+</Definition>
+</Surface>
+</Surfaces>
+</LandXML>

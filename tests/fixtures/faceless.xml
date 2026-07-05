@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+<Units><Imperial areaUnit="squareFoot" linearUnit="USSurveyFoot" volumeUnit="cubicFeet"/></Units>
+<Surfaces>
+<Surface name="POINTS_ONLY">
+<Definition surfType="TIN">
+<Pnts>
+<P id="1">1511101.218 3510094.284 4185.801</P>
+<P id="2">1511088.927 3510089.925 4186.074</P>
+<P id="3">1511113.897 3510108.414 4185.437</P>
+</Pnts>
+</Definition>
+</Surface>
+</Surfaces>
+</LandXML>

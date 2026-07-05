@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+<Units><Metric areaUnit="squareMeter" linearUnit="meter" volumeUnit="cubicMeter"/></Units>
+<Surfaces>
+<Surface name="SPEC_BL">
+<Definition surfType="TIN">
+<Pnts>
+<P id="1">100.0 200.0 10.0</P>
+<P id="2">101.0 201.0 11.0</P>
+<P id="3">102.0 200.5 12.0</P>
+<P id="4">103.0 202.0 13.0</P>
+</Pnts>
+<Faces>
+<F>1 2 3</F>
+<F>2 4 3</F>
+</Faces>
+<Breaklines>
+<Breakline brkType="standard" desc="bl-1">
+<PntList3D>100.0 200.0 10.0 101.0 201.0 11.0 102.0 200.5 12.0</PntList3D>
+</Breakline>
+<Breakline brkType="standard" desc="bl-2">
+<PntList3D>101.0 201.0 11.0 103.0 202.0 13.0</PntList3D>
+</Breakline>
+</Breaklines>
+<Boundaries>
+<Boundary bndType="outer" edgeTrim="true">
+<PntList3D>99.0 199.0 0.0 104.0 199.0 0.0 104.0 203.0 0.0 99.0 203.0 0.0</PntList3D>
+</Boundary>
+<Boundary bndType="island">
+<PntList3D>100.5 200.5 0.0 101.5 200.5 0.0 101.0 201.5 0.0</PntList3D>
+</Boundary>
+<Boundary bndType="void">
+<PntList2D>102.0 201.0 102.5 201.0 102.25 201.5</PntList2D>
+</Boundary>
+</Boundaries>
+</Definition>
+</Surface>
+</Surfaces>
+</LandXML>

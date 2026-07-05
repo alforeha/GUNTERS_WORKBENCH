@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!-- fixture: unknown elements anywhere must be counted, never thrown on -->
+<LandXML xmlns="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+<Units><Imperial areaUnit="squareFoot" linearUnit="USSurveyFoot" volumeUnit="cubicFeet"/></Units>
+<VendorMagic level="11"><Sparkles/></VendorMagic>
+<Surfaces>
+<Surface name="JUNKY">
+<Definition surfType="TIN">
+<Pnts>
+<P id="1">1000.0 2000.0 10.0</P>
+<P id="2">1001.0 2001.0 11.0</P>
+<P id="3">1002.0 2000.5 12.0</P>
+</Pnts>
+<FrobnicatorSettings mode="aggressive">
+<Frob value="3"/>
+<Frob value="7"/>
+</FrobnicatorSettings>
+<Faces>
+<F>1 2 3</F>
+</Faces>
+<![CDATA[ stray cdata that should be ignored ]]>
+</Definition>
+<Telemetry><Beacon/></Telemetry>
+</Surface>
+</Surfaces>
+<TrailingJunk/>
+</LandXML>

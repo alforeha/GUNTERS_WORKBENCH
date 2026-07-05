@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<lx:LandXML xmlns:lx="http://www.landxml.org/schema/LandXML-1.2" version="1.2">
+<lx:Units><lx:Metric areaUnit="squareMeter" linearUnit="meter" volumeUnit="cubicMeter"/></lx:Units>
+<lx:Surfaces>
+<lx:Surface name="PREFIXED">
+<lx:Definition surfType="TIN">
+<lx:Pnts>
+<lx:P id="1">100.0 200.0 10.0</lx:P>
+<lx:P id="2">101.0 201.0 11.0</lx:P>
+<lx:P id="3">102.0 200.5 12.0</lx:P>
+</lx:Pnts>
+<lx:Faces>
+<lx:F>1 2 3</lx:F>
+</lx:Faces>
+</lx:Definition>
+</lx:Surface>
+</lx:Surfaces>
+</lx:LandXML>

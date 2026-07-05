@@ -1,0 +1,39 @@
+{
+  "name": "gunters-workbench",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build && electron-builder",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src electron --ext .ts",
+    "format": "prettier --write src electron tests"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/three": "^0.185.0",
+    "electron": "^30.0.1",
+    "electron-builder": "^24.13.3",
+    "eslint": "^10.6.0",
+    "prettier": "^3.9.4",
+    "typescript": "^5.2.2",
+    "typescript-eslint": "^8.62.1",
+    "vite": "^5.1.6",
+    "vite-plugin-electron": "^0.28.6",
+    "vite-plugin-electron-renderer": "^0.14.5",
+    "vitest": "^4.1.9"
+  },
+  "main": "dist-electron/main.js",
+  "dependencies": {
+    "dxf-parser": "^1.1.2",
+    "geotiff": "^3.0.5",
+    "pdfjs-dist": "^6.1.200",
+    "three": "^0.185.1",
+    "three-mesh-bvh": "^0.9.10",
+    "troika-three-text": "^0.52.4",
+    "zod": "^4.4.3"
+  }
+}
