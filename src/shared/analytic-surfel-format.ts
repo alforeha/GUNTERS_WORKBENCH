@@ -21,6 +21,7 @@ export interface AnalyticSurfelManifest {
   surfelType: 'analytic-surfel-octree';
   generator: { name: 'workbench'; version: string };
   generatedAt: string;
+  surfelCellScale: number;
   sourceAssetId: string;
   indexAssetId: string | null;
   source: {

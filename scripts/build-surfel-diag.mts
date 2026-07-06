@@ -8,8 +8,10 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const lasPath = args.find((arg) => !arg.startsWith('--'));
   const buildIndex = !args.includes('--skip-index');
+  const surfelCellScaleArg = args.find((arg) => arg.startsWith('--surfel-cell-scale='));
+  const surfelCellScale = surfelCellScaleArg ? Number(surfelCellScaleArg.split('=')[1]) : 1;
   if (!lasPath) {
-    console.error('usage: npx tsx scripts/build-surfel-diag.mts <path-to-las> [--skip-index]');
+    console.error('usage: npx tsx scripts/build-surfel-diag.mts <path-to-las> [--skip-index] [--surfel-cell-scale=<number>]');
     process.exitCode = 1;
     return;
   }
@@ -31,8 +33,8 @@ async function main(): Promise<void> {
     indexMetrics = indexed.metrics;
   }
 
-  console.log(`[surfel-diag] building analytic surfels for ${lasPath}`);
-  const surfels = await service.generateAnalyticSurfels({ assetId: sourceAsset.id }, (progress) => {
+  console.log(`[surfel-diag] building analytic surfels for ${lasPath} (cell scale ${surfelCellScale})`);
+  const surfels = await service.generateAnalyticSurfels({ assetId: sourceAsset.id, surfelCellScale }, (progress) => {
     const pct = progress.pct === null ? '' : ` ${progress.pct}%`;
     console.log(`[surfels] ${progress.label}${pct}`);
   });
@@ -41,6 +43,7 @@ async function main(): Promise<void> {
     projectFolder: created.projectFolder,
     sourceAssetId: sourceAsset.id,
     indexBuilt: buildIndex,
+    surfelCellScale,
     indexMetrics,
     surfelAssetId: surfels.surfelAssetId,
     surfelMetrics: surfels.metrics,

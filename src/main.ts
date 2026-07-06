@@ -92,6 +92,11 @@ app.innerHTML = `
         Point size
         <input id="pointcloud-size" type="range" min="1" max="5" value="2" />
       </label>
+      <label class="viewer-control">
+        Surfel cell scale
+        <input id="surfel-cell-scale" type="number" min="0.25" max="4" step="0.05" value="1" />
+      </label>
+      <div class="note">Lower surfel cell scale creates more, smaller derived surfels. Current default: 1.0.</div>
       <h2>Layers</h2>
       <ul id="layer-list"></ul>
       <h2>Assets</h2>
@@ -112,6 +117,7 @@ const pointCloudProgressEl = document.querySelector<HTMLDivElement>('#pointcloud
 const pointCloudDisclosureEl = document.querySelector<HTMLDivElement>('#pointcloud-disclosure')
 const pointCloudModeEl = document.querySelector<HTMLSelectElement>('#pointcloud-mode')
 const pointCloudSizeEl = document.querySelector<HTMLInputElement>('#pointcloud-size')
+const surfelCellScaleEl = document.querySelector<HTMLInputElement>('#surfel-cell-scale')
 const pointCloudEdlEl = document.querySelector<HTMLInputElement>('#pointcloud-edl')
 const pointCloudFogEl = document.querySelector<HTMLInputElement>('#pointcloud-fog')
 
@@ -125,6 +131,7 @@ if (
   !pointCloudDisclosureEl ||
   !pointCloudModeEl ||
   !pointCloudSizeEl ||
+  !surfelCellScaleEl ||
   !pointCloudEdlEl ||
   !pointCloudFogEl
 ) {
@@ -140,6 +147,7 @@ const safePointCloudProgressEl = pointCloudProgressEl
 const safePointCloudDisclosureEl = pointCloudDisclosureEl
 const safePointCloudModeEl = pointCloudModeEl
 const safePointCloudSizeEl = pointCloudSizeEl
+const safeSurfelCellScaleEl = surfelCellScaleEl
 const safePointCloudEdlEl = pointCloudEdlEl
 const safePointCloudFogEl = pointCloudFogEl
 const OPEN_PROJECT_FAILURE_MESSAGE =
@@ -740,11 +748,12 @@ document.querySelector<HTMLButtonElement>('#btn-derived')?.addEventListener('cli
     if (latestSurfaceLayer) await ensureLayerLoaded(latestSurfaceLayer.id)
     return
   }
-  const result = await window.workbench.generateAnalyticSurfels({ assetId })
+  const surfelCellScale = Number(safeSurfelCellScaleEl.value)
+  const result = await window.workbench.generateAnalyticSurfels({ assetId, surfelCellScale })
   renderSession(result.session)
   const surfelLayer = result.session.manifest.simulationLayers.find((layer) => layer.assetId === result.surfelAssetId)
   if (surfelLayer) await ensureLayerLoaded(surfelLayer.id, true)
-  safePointCloudProgressEl.textContent = `Surfels ready: ${compactCount(result.metrics.surfelCount)} surfels across ${result.metrics.nodeCount.toLocaleString()} nodes`
+  safePointCloudProgressEl.textContent = `Surfels ready: ${compactCount(result.metrics.surfelCount)} surfels across ${result.metrics.nodeCount.toLocaleString()} nodes at cell scale ${surfelCellScale.toFixed(2)}`
 })
 
 safePointCloudModeEl.addEventListener('change', () => {

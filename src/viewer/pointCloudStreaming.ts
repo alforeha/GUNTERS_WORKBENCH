@@ -149,16 +149,54 @@ export interface LoadedStreamEntry {
 }
 
 /**
+ * For each visible loaded node, compute the finest visible descendant level in its branch.
+ * Ancestors inherit the deepest visible level below them so a refined region renders one
+ * consistent splat size instead of mixing per-level sizes within the same branch.
+ */
+export function deriveFinestVisibleLevels(
+  nodesByKey: Map<string, StreamNode>,
+  loadedVisibleKeys: Set<string>,
+): Map<string, number> {
+  const memo = new Map<string, number>();
+
+  const visit = (key: string): number | null => {
+    if (memo.has(key)) return memo.get(key)!;
+    const node = nodesByKey.get(key);
+    if (!node) return null;
+
+    let finest = loadedVisibleKeys.has(key) ? node.level : null;
+    for (const childKey of node.childKeys) {
+      const childFinest = visit(childKey);
+      if (childFinest === null) continue;
+      finest = finest === null ? childFinest : Math.max(finest, childFinest);
+    }
+
+    if (finest !== null) memo.set(key, finest);
+    return finest;
+  };
+
+  for (const key of loadedVisibleKeys) visit(key);
+  return memo;
+}
+
+/**
  * Decide which loaded nodes to evict to stay within budget. Only nodes not in the current
  * selection are eligible, least-recently-used first; selected nodes are never evicted (if the
  * selection alone exceeds budget it was already capped, so this returns within-budget results).
  */
-export function planEviction(loaded: LoadedStreamEntry[], selectedKeys: Set<string>, budgetMax: number): string[] {
+export function planEviction(
+  loaded: LoadedStreamEntry[],
+  selectedKeys: Set<string>,
+  budgetMax: number,
+  pinnedKeys: Set<string> = new Set(),
+): string[] {
   let total = 0;
   for (const entry of loaded) total += entry.pointCount;
   if (total <= budgetMax) return [];
 
-  const evictable = loaded.filter((entry) => !selectedKeys.has(entry.key)).sort((a, b) => a.lastUsedTick - b.lastUsedTick);
+  const evictable = loaded
+    .filter((entry) => !selectedKeys.has(entry.key) && !pinnedKeys.has(entry.key))
+    .sort((a, b) => a.lastUsedTick - b.lastUsedTick);
   const evict: string[] = [];
   for (const entry of evictable) {
     if (total <= budgetMax) break;

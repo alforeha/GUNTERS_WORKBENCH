@@ -38,11 +38,13 @@ export const pointCloudIndexTypeSchema = z.literal('wpi-octree');
 const pointCloudIndexSchema = z.object({
   sourceAssetId: z.string().min(1),
   indexType: pointCloudIndexTypeSchema,
-  indexVersion: z.literal(1),
+  indexVersion: z.union([z.literal(1), z.literal(2)]),
+  ownership: z.enum(['file-order', 'strided']).optional(),
   source: z.object({
     headerSha256: z.string().min(1),
     fileSize: z.number().nonnegative(),
     mtimeMs: z.number().nullable(),
+    rgbEncoding: z.enum(['u16', 'u8-in-u16']).optional(),
   }),
   pointCount: z.number().nonnegative(),
   bounds: boundsSchema,
@@ -61,6 +63,7 @@ const analyticSurfelSchema = z.object({
   indexAssetId: z.string().nullable(),
   surfelType: z.literal('analytic-surfel-octree'),
   surfelVersion: z.literal(1),
+  surfelCellScale: z.number().positive().optional(),
   source: z.object({
     headerSha256: z.string().min(1),
     fileSize: z.number().nonnegative(),
@@ -106,6 +109,7 @@ const assetRecordSchema = z.object({
       unitsLinear: z.enum(['usSurveyFoot', 'foot', 'meter', 'unknown']),
       unitsRaw: z.string().min(1),
       headerSha256: z.string().min(1),
+      rgbEncoding: z.enum(['u16', 'u8-in-u16']).optional(),
     })
     .optional(),
   pointCloudIndex: pointCloudIndexSchema.optional(),

@@ -4,7 +4,7 @@ import { StreamingPointCloud, type TileFetcher } from '../src/viewer/StreamingPo
 import type { PointCloudNodePayload } from '../src/core/contract';
 import type { PointCloudIndexHierarchy } from '../src/shared/workbench-types';
 
-// Chain hierarchy: root(0..8) → child(0..4) → grandchild(0..2), centered at [4,4,4].
+// 4-level chain hierarchy: levels 0..2 are pinned base, level 3 refines on zoom.
 function hierarchy(): PointCloudIndexHierarchy {
   return {
     assetId: 'pc',
@@ -17,11 +17,12 @@ function hierarchy(): PointCloudIndexHierarchy {
     units: 'usSurveyFoot',
     pointFormat: 7,
     hasRgb: true,
-    totalPoints: 240_000,
+    totalPoints: 320_000,
     nodes: [
       { key: '0-0-0-0', level: 0, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 8, maxY: 8, maxZ: 8 }, pointCount: 80_000, childKeys: ['1-0-0-0'] },
       { key: '1-0-0-0', level: 1, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 4, maxY: 4, maxZ: 4 }, pointCount: 80_000, childKeys: ['2-0-0-0'] },
-      { key: '2-0-0-0', level: 2, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 2, maxY: 2, maxZ: 2 }, pointCount: 80_000, childKeys: [] },
+      { key: '2-0-0-0', level: 2, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 2, maxY: 2, maxZ: 2 }, pointCount: 80_000, childKeys: ['3-0-0-0'] },
+      { key: '3-0-0-0', level: 3, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }, pointCount: 80_000, childKeys: [] },
     ],
   };
 }
@@ -53,6 +54,12 @@ function camAt(worldZ: number): THREE.PerspectiveCamera {
   return cam;
 }
 
+function camInLeaf(): THREE.PerspectiveCamera {
+  const cam = new THREE.PerspectiveCamera(60, 1, 0.1, 100000);
+  cam.position.set(-3.5, -3.5, -3.5); // world [0.5, 0.5, 0.5] inside level-3 node
+  return cam;
+}
+
 async function flush(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
@@ -61,38 +68,40 @@ async function flush(): Promise<void> {
 describe('StreamingPointCloud', () => {
   it('loads the root first, becomes settled, and discloses loaded-of-total', async () => {
     const spc = new StreamingPointCloud('pc', hierarchy(), SCENE_ORIGIN, immediateFetcher());
-    spc.update(camAt(5000), VIEWPORT_H, FOV_Y); // far → only root selected, dispatch fetch
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y); // far → pinned base loads even if only root is selected
     await flush();
     spc.update(camAt(5000), VIEWPORT_H, FOV_Y); // root now loaded
 
-    expect(spc.getLoadedPointCount()).toBe(80_000);
+    expect(spc.getLoadedPointCount()).toBe(240_000);
     expect(spc.isSettledState()).toBe(true);
     expect(spc.getDisclosure()).toMatch(/Indexed-full/);
     expect(spc.getDisclosure()).toMatch(/settled/);
-    expect(spc.group.children.length).toBe(1);
-    expect(spc.group.children[0]!.visible).toBe(true);
+    expect(spc.group.children.length).toBe(3);
+    expect(spc.group.children.every((child) => child.visible)).toBe(true);
   });
 
   it('refines to more nodes as the camera approaches', async () => {
     const spc = new StreamingPointCloud('pc', hierarchy(), SCENE_ORIGIN, immediateFetcher());
-    spc.update(camAt(20), VIEWPORT_H, FOV_Y); // near → root + child selected
+    spc.setSseThreshold(1);
+    spc.update(camInLeaf(), VIEWPORT_H, FOV_Y); // inside the leaf → deepest node selected
     await flush();
-    spc.update(camAt(20), VIEWPORT_H, FOV_Y);
-    expect(spc.getLoadedPointCount()).toBe(160_000); // root + child
-    expect(spc.group.children.length).toBe(2);
+    spc.update(camInLeaf(), VIEWPORT_H, FOV_Y);
+    expect(spc.getLoadedPointCount()).toBe(320_000);
+    expect(spc.group.children.length).toBe(4);
   });
 
   it('evicts non-selected nodes when over the budget', async () => {
     const spc = new StreamingPointCloud('pc', hierarchy(), SCENE_ORIGIN, immediateFetcher());
-    spc.update(camAt(20), VIEWPORT_H, FOV_Y); // load root + child
+    spc.setSseThreshold(1);
+    spc.update(camInLeaf(), VIEWPORT_H, FOV_Y); // load pinned base + leaf
     await flush();
-    spc.update(camAt(20), VIEWPORT_H, FOV_Y);
-    expect(spc.getLoadedPointCount()).toBe(160_000);
+    spc.update(camInLeaf(), VIEWPORT_H, FOV_Y);
+    expect(spc.getLoadedPointCount()).toBe(320_000);
 
-    spc.setStreamingBudget(120_000); // root+child (160k) now exceeds budget
-    spc.update(camAt(5000), VIEWPORT_H, FOV_Y); // far → only root selected; child is evictable
-    expect(spc.getLoadedPointCount()).toBe(80_000);
-    expect(spc.group.children.length).toBe(1);
+    spc.setStreamingBudget(280_000); // pinned base (240k) remains; level-3 is evictable
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y); // far → level-3 no longer selected and may evict
+    expect(spc.getLoadedPointCount()).toBe(240_000);
+    expect(spc.group.children.length).toBe(3);
   });
 
   it('drops a stale in-flight tile when the camera moves off it', async () => {
@@ -103,15 +112,33 @@ describe('StreamingPointCloud', () => {
     const fetcher: TileFetcher = (keys) => deferred.then(() => keys.map((key) => ({ key, payload: payloadFor() })));
 
     const spc = new StreamingPointCloud('pc', hierarchy(), SCENE_ORIGIN, fetcher);
-    spc.update(camAt(20), VIEWPORT_H, FOV_Y); // near → dispatch fetch for root + child (in flight)
-    spc.update(camAt(5000), VIEWPORT_H, FOV_Y); // far → child no longer selected → marked stale
+    spc.update(camAt(20), VIEWPORT_H, FOV_Y); // near → dispatch fetch for pinned base + leaf (in flight)
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y); // far → level-3 no longer selected → marked stale
     release();
     await flush();
 
-    // root built, child dropped as stale
-    expect(spc.getLoadedPointCount()).toBe(80_000);
-    expect(spc.group.children.length).toBe(1);
-    expect(spc.group.children[0]!.name).toContain('0-0-0-0');
+    // pinned base built, level-3 dropped as stale
+    expect(spc.getLoadedPointCount()).toBe(240_000);
+    expect(spc.group.children.length).toBe(3);
+    expect(spc.group.children.every((child) => !child.name.includes('3-0-0-0'))).toBe(true);
+  });
+
+  it('uses smaller materials when all children are loaded and visible', async () => {
+    const spc = new StreamingPointCloud('pc', hierarchy(), SCENE_ORIGIN, immediateFetcher());
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y);
+    await flush();
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y);
+
+    const grandchildBefore = spc.group.children.find((child) => child.name.includes('2-0-0-0')) as THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
+    const beforeMaterial = grandchildBefore.material;
+
+    spc.setSseThreshold(1);
+    spc.update(camInLeaf(), VIEWPORT_H, FOV_Y);
+    await flush();
+    spc.update(camInLeaf(), VIEWPORT_H, FOV_Y);
+
+    const grandchildAfter = spc.group.children.find((child) => child.name.includes('2-0-0-0')) as THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
+    expect(grandchildAfter.material).not.toBe(beforeMaterial);
   });
 
   it('recolors loaded nodes when the display mode changes (display parity)', async () => {

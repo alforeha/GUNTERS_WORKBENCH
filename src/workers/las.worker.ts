@@ -7,7 +7,7 @@ import type {
   PointCloudOctreeNode,
   PointCloudSourceRange,
 } from '../core/contract';
-import { parseLasMetadata } from '../core/las/metadata';
+import { inferRgbEncoding, parseLasMetadata } from '../core/las/metadata';
 
 const LAS_HEADER_BYTES = 375;
 const SAMPLE_POINT_LIMIT = 1_000_000;
@@ -51,6 +51,7 @@ export interface LasWorkerRequest {
 
 export interface LoadDensifiedNodeRequest {
   dataset: Pick<PointCloudDataset, 'pointFormat' | 'pointRecordLength' | 'scale' | 'offset' | 'offsetToPointData'> & {
+    rgbEncoding: LasAttributeSummary['rgbEncoding'];
     octree: Pick<PointCloudOctree, 'origin'>;
   };
   node: Pick<PointCloudOctreeNode, 'id' | 'sourceRanges' | 'bounds'>;
@@ -102,6 +103,7 @@ function defaultAttributes(pointFormat: number): LasAttributeSummary {
     hasPointSourceId: true,
     hasGpsTime: pointFormat === 1 || pointFormat === 3 || pointFormat === 4 || pointFormat === 5 || pointFormat >= 6,
     hasRgb: pointFormat === 2 || pointFormat === 3 || pointFormat === 5 || pointFormat === 7 || pointFormat === 8 || pointFormat === 10,
+    rgbEncoding: null,
     intensityRange: null,
     rgbRange: null,
     sampledPoints: 0,
@@ -110,6 +112,11 @@ function defaultAttributes(pointFormat: number): LasAttributeSummary {
     numberOfReturnsCounts: {},
     userDataCounts: {},
   };
+}
+
+function normalizeRgbChannel(value: number, encoding: LasAttributeSummary['rgbEncoding']): number {
+  if (encoding === 'u8-in-u16') return value;
+  return value >> 8;
 }
 
 function addCount(counts: Record<string, number>, key: number): void {
@@ -548,10 +555,32 @@ function decodePoint(
   const intensity = view.getUint16(recordOffset + 12, true) / 65535;
   const classification = view.getUint8(recordOffset + classAt) & (dataset.pointFormat >= 6 ? 0xff : 0x1f);
   const { returnNumber, numberOfReturns } = readReturns(view, recordOffset, dataset.pointFormat);
-  const r = rgbAt !== null && recordOffset + rgbAt + 5 < view.byteLength ? view.getUint16(recordOffset + rgbAt, true) >> 8 : 255;
-  const g = rgbAt !== null && recordOffset + rgbAt + 5 < view.byteLength ? view.getUint16(recordOffset + rgbAt + 2, true) >> 8 : 255;
-  const b = rgbAt !== null && recordOffset + rgbAt + 5 < view.byteLength ? view.getUint16(recordOffset + rgbAt + 4, true) >> 8 : 255;
+  const rgbEncoding = dataset.attributes.rgbEncoding ?? inferRgbEncoding(dataset.attributes.rgbRange) ?? 'u16';
+  const r =
+    rgbAt !== null && recordOffset + rgbAt + 5 < view.byteLength
+      ? normalizeRgbChannel(view.getUint16(recordOffset + rgbAt, true), rgbEncoding)
+      : 255;
+  const g =
+    rgbAt !== null && recordOffset + rgbAt + 5 < view.byteLength
+      ? normalizeRgbChannel(view.getUint16(recordOffset + rgbAt + 2, true), rgbEncoding)
+      : 255;
+  const b =
+    rgbAt !== null && recordOffset + rgbAt + 5 < view.byteLength
+      ? normalizeRgbChannel(view.getUint16(recordOffset + rgbAt + 4, true), rgbEncoding)
+      : 255;
   return { x, y, z, intensity, classification, returnNumber, numberOfReturns, r, g, b };
+}
+
+async function readAttributeSample(source: ChunkSource, header: ArrayBuffer): Promise<ArrayBuffer | undefined> {
+  const headerView = new DataView(header);
+  const offsetToPointData = headerView.getUint32(96, true);
+  const pointRecordLength = headerView.getUint16(105, true);
+  const pointCount = Number(headerView.getBigUint64(247, true) || BigInt(headerView.getUint32(107, true)));
+  if (pointRecordLength <= 0 || pointCount <= 0) return undefined;
+  const samplePoints = Math.min(4096, pointCount);
+  const sampleEnd = Math.min(source.size, offsetToPointData + samplePoints * pointRecordLength);
+  if (sampleEnd <= offsetToPointData) return undefined;
+  return source.read(offsetToPointData, sampleEnd);
 }
 
 async function buildOctree(
@@ -634,11 +663,13 @@ export async function handleLasSourceRequest(
     const header = await readHeader(req.source);
     const preamble = await readPreamble(req.source, header);
     onProgress?.('reading LAS metadata...', 20);
+    const sample = await readAttributeSample(req.source, header);
     const dataset = parseLasMetadata({
       fileName: req.fileName,
       fileSize: req.source.size,
       header,
       preamble,
+      sample,
     });
     const quality = req.quality ?? 'balanced';
     onProgress?.(`building ${LAS_QUALITY[quality].label} octree...`, 0);
@@ -703,9 +734,10 @@ export async function loadDensifiedNodeFromSource(
       const intensity = view.getUint16(o + 12, true) / 65535;
       const classification = view.getUint8(o + classAt) & (request.dataset.pointFormat >= 6 ? 0xff : 0x1f);
       const { returnNumber, numberOfReturns: numReturns } = readReturns(view, o, request.dataset.pointFormat);
-      const r = rgbAt !== null && o + rgbAt + 5 < view.byteLength ? view.getUint16(o + rgbAt, true) >> 8 : 255;
-      const g = rgbAt !== null && o + rgbAt + 5 < view.byteLength ? view.getUint16(o + rgbAt + 2, true) >> 8 : 255;
-      const b = rgbAt !== null && o + rgbAt + 5 < view.byteLength ? view.getUint16(o + rgbAt + 4, true) >> 8 : 255;
+      const rgbEncoding = request.dataset.rgbEncoding ?? 'u16';
+      const r = rgbAt !== null && o + rgbAt + 5 < view.byteLength ? normalizeRgbChannel(view.getUint16(o + rgbAt, true), rgbEncoding) : 255;
+      const g = rgbAt !== null && o + rgbAt + 5 < view.byteLength ? normalizeRgbChannel(view.getUint16(o + rgbAt + 2, true), rgbEncoding) : 255;
+      const b = rgbAt !== null && o + rgbAt + 5 < view.byteLength ? normalizeRgbChannel(view.getUint16(o + rgbAt + 4, true), rgbEncoding) : 255;
       const base = writeIndex * 3;
       positions[base] = x - origin[0];
       positions[base + 1] = y - origin[1];

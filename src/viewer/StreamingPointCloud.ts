@@ -11,6 +11,7 @@ import {
   type PointDisplayMode,
 } from './pointCloudLod';
 import {
+  deriveFinestVisibleLevels,
   formatIndexedFullDisclosure,
   isSettled,
   planEviction,
@@ -30,6 +31,7 @@ export interface StreamingHierarchy {
   root: string;
   origin: [number, number, number];
   bounds: StreamBounds;
+  units: string;
   hasRgb: boolean;
   totalPoints: number;
   nodes: StreamNode[];
@@ -39,6 +41,7 @@ export interface StreamingHierarchy {
 export const DEFAULT_SSE_THRESHOLD = 400;
 /** Cap tile requests issued per update so a fast camera can't flood IPC; the rest come next frame. */
 const MAX_FETCH_PER_UPDATE = 6;
+const PINNED_BASE_LEVEL = 2;
 
 interface LoadedStreamNode {
   key: string;
@@ -48,6 +51,7 @@ interface LoadedStreamNode {
   lastUsedTick: number;
   colorEpoch: number;
   builtStride: number;
+  materialLevel: number;
 }
 
 /**
@@ -67,9 +71,12 @@ export class StreamingPointCloud {
   private readonly sceneOrigin: Vec3;
   private readonly totalPoints: number;
   private readonly hasRgb: boolean;
+  private readonly units: string;
   private readonly zRange: [number, number];
   private readonly worldBounds: StreamBounds;
-  private readonly material: THREE.PointsMaterial;
+  private readonly levelStats = new Map<number, { edge: number; averagePointCount: number }>();
+  private readonly levelMaterials = new Map<number, THREE.PointsMaterial>();
+  private readonly pinnedKeys = new Set<string>();
   private readonly fetchTiles: TileFetcher;
   private readonly onChanged?: () => void;
 
@@ -88,6 +95,7 @@ export class StreamingPointCloud {
   private budgetMax = POINT_BUDGET_MAX;
   private loadedPointCount = 0;
   private selectionKeys = new Set<string>();
+  private finestVisibleLevels = new Map<string, number>();
   private settled = false;
 
   constructor(
@@ -103,10 +111,12 @@ export class StreamingPointCloud {
     this.sceneOrigin = sceneOrigin;
     this.totalPoints = hierarchy.totalPoints;
     this.hasRgb = hierarchy.hasRgb;
+    this.units = hierarchy.units;
     this.worldBounds = hierarchy.bounds;
     this.zRange = [hierarchy.bounds.minZ, hierarchy.bounds.maxZ];
     this.fetchTiles = fetchTiles;
     this.onChanged = onChanged;
+    const levelAcc = new Map<number, { edge: number; pointCountSum: number; nodeCount: number }>();
     for (const node of hierarchy.nodes) {
       this.nodesByKey.set(node.key, {
         key: node.key,
@@ -115,6 +125,16 @@ export class StreamingPointCloud {
         pointCount: node.pointCount,
         childKeys: node.childKeys,
       });
+      if (node.level <= PINNED_BASE_LEVEL) this.pinnedKeys.add(node.key);
+      const edge = node.bounds.maxX - node.bounds.minX;
+      const stat = levelAcc.get(node.level) ?? { edge, pointCountSum: 0, nodeCount: 0 };
+      stat.edge = edge;
+      stat.pointCountSum += node.pointCount;
+      stat.nodeCount++;
+      levelAcc.set(node.level, stat);
+    }
+    for (const [level, stat] of levelAcc) {
+      this.levelStats.set(level, { edge: stat.edge, averagePointCount: stat.pointCountSum / Math.max(stat.nodeCount, 1) });
     }
     this.displayMode = hierarchy.hasRgb ? 'rgb' : 'elevation';
     this.group.name = `point-cloud-index:${handle}`;
@@ -123,16 +143,6 @@ export class StreamingPointCloud {
       this.origin[1] - sceneOrigin[1],
       this.origin[2] - sceneOrigin[2],
     );
-    this.material = new THREE.PointsMaterial({
-      size: this.worldPointSize(this.pointSize),
-      sizeAttenuation: true,
-      vertexColors: true,
-      toneMapped: false,
-      map: StreamingPointCloud.getDiskTexture(),
-      alphaTest: 0.35,
-      transparent: true,
-      fog: true,
-    });
   }
 
   get bounds(): THREE.Box3 {
@@ -156,8 +166,10 @@ export class StreamingPointCloud {
     this.visibleAll = visible;
     this.pointSize = THREE.MathUtils.clamp(pointSize, 1, 5);
     this.group.visible = visible;
-    this.material.size = this.worldPointSize(this.pointSize);
-    this.material.needsUpdate = true;
+    for (const [level, material] of this.levelMaterials) {
+      material.size = this.materialSizeForLevel(level);
+      material.needsUpdate = true;
+    }
   }
 
   setDisplayMode(mode: PointDisplayMode): void {
@@ -235,13 +247,23 @@ export class StreamingPointCloud {
       sseThreshold: this.sseThreshold,
       budgetMax: this.budgetMax,
     });
-    this.selectionKeys = selection.keys;
+    this.selectionKeys = new Set([...selection.keys, ...this.pinnedKeys]);
+    this.finestVisibleLevels = deriveFinestVisibleLevels(
+      this.nodesByKey,
+      new Set([...this.loaded.keys()].filter((key) => this.selectionKeys.has(key))),
+    );
     let changed = false;
 
-    for (const key of selection.keys) {
+    for (const key of this.selectionKeys) {
       const ln = this.loaded.get(key);
       if (ln) {
         ln.lastUsedTick = this.tick;
+        const materialLevel = this.displayLevelForNode(ln);
+        if (ln.materialLevel !== materialLevel) {
+          ln.points.material = this.materialForLevel(materialLevel);
+          ln.materialLevel = materialLevel;
+          changed = true;
+        }
         if (ln.colorEpoch !== this.colorEpoch) {
           this.packNode(ln);
           changed = true;
@@ -253,31 +275,40 @@ export class StreamingPointCloud {
       }
     }
     for (const [key, ln] of this.loaded) {
-      if (!selection.keys.has(key) && ln.points.visible) {
+      if (!this.selectionKeys.has(key) && ln.points.visible) {
         ln.points.visible = false;
         changed = true;
       }
     }
 
-    for (const key of staleRequestKeys(this.inFlight, selection.keys)) this.dropped.add(key);
+    for (const key of staleRequestKeys(this.inFlight, this.selectionKeys)) this.dropped.add(key);
 
     const toFetch: string[] = [];
-    for (const scored of selection.nodes) {
-      if (this.loaded.has(scored.key) || this.inFlight.has(scored.key)) continue;
-      toFetch.push(scored.key);
+    const queued = new Set<string>();
+    for (const key of [...this.pinnedKeys].sort()) {
+      if (this.loaded.has(key) || this.inFlight.has(key) || queued.has(key)) continue;
+      toFetch.push(key);
+      queued.add(key);
       if (toFetch.length >= MAX_FETCH_PER_UPDATE) break;
+    }
+    for (const scored of selection.nodes) {
+      if (toFetch.length >= MAX_FETCH_PER_UPDATE) break;
+      if (this.loaded.has(scored.key) || this.inFlight.has(scored.key) || queued.has(scored.key)) continue;
+      toFetch.push(scored.key);
+      queued.add(scored.key);
     }
     if (toFetch.length > 0) void this.dispatchFetch(toFetch);
 
     const evictKeys = planEviction(
       [...this.loaded.values()].map((ln) => ({ key: ln.key, pointCount: ln.payload.pointCount, lastUsedTick: ln.lastUsedTick })),
-      selection.keys,
+      this.selectionKeys,
       this.budgetMax,
+      this.pinnedKeys,
     );
     for (const key of evictKeys) this.evict(key);
     if (evictKeys.length > 0) changed = true;
 
-    this.settled = this.inFlight.size === 0 && isSettled(selection.keys, new Set(this.loaded.keys()));
+    this.settled = this.inFlight.size === 0 && isSettled(this.selectionKeys, new Set(this.loaded.keys()));
     return changed;
   }
 
@@ -290,7 +321,8 @@ export class StreamingPointCloud {
     this.inFlight.clear();
     this.dropped.clear();
     this.loadedPointCount = 0;
-    this.material.dispose();
+    for (const material of this.levelMaterials.values()) material.dispose();
+    this.levelMaterials.clear();
     this.group.removeFromParent();
   }
 
@@ -322,7 +354,7 @@ export class StreamingPointCloud {
     geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(payload.pointCount * 3), 3));
     geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(payload.pointCount * 3), 3));
     geometry.setDrawRange(0, 0);
-    const points = new THREE.Points(geometry, this.material);
+    const points = new THREE.Points(geometry, this.materialForLevel(node.level));
     points.name = `point-cloud-index-node:${this.handle}:${node.key}`;
     points.frustumCulled = false;
     this.group.add(points);
@@ -334,6 +366,7 @@ export class StreamingPointCloud {
       lastUsedTick: this.tick,
       colorEpoch: -1,
       builtStride: 1,
+      materialLevel: node.level,
     };
     this.loaded.set(node.key, ln);
     this.loadedPointCount += payload.pointCount;
@@ -427,8 +460,50 @@ export class StreamingPointCloud {
     this.loadedPointCount -= ln.payload.pointCount;
   }
 
-  private worldPointSize(multiplier: number): number {
-    return THREE.MathUtils.lerp(0.04, 0.18, (THREE.MathUtils.clamp(multiplier, 1, 5) - 1) / 4);
+  private displayLevelForNode(node: LoadedStreamNode): number {
+    return this.finestVisibleLevels.get(node.key) ?? node.node.level;
+  }
+
+  private materialForLevel(level: number): THREE.PointsMaterial {
+    const existing = this.levelMaterials.get(level);
+    if (existing) return existing;
+    const material = new THREE.PointsMaterial({
+      size: this.materialSizeForLevel(level),
+      sizeAttenuation: true,
+      vertexColors: true,
+      toneMapped: false,
+      map: StreamingPointCloud.getDiskTexture(),
+      alphaTest: 0.35,
+      transparent: true,
+      fog: true,
+    });
+    this.levelMaterials.set(level, material);
+    return material;
+  }
+
+  private materialSizeForLevel(level: number): number {
+    const stat = this.levelStats.get(level);
+    if (!stat) return this.worldPointDiameter(1);
+    const minRadius = THREE.MathUtils.lerp(this.inchesToUnits(1), this.inchesToUnits(2), (this.pointSize - 1) / 4);
+    const fillRadius = 0.7 * stat.edge / Math.sqrt(Math.max(stat.averagePointCount, 1));
+    const maxRadius = stat.edge * 0.05;
+    const radius = Math.max(minRadius, Math.min(fillRadius, maxRadius));
+    return radius * 2;
+  }
+
+  private inchesToUnits(inches: number): number {
+    switch (this.units) {
+      case 'meter':
+        return inches * 0.0254;
+      case 'foot':
+      case 'usSurveyFoot':
+      default:
+        return inches / 12;
+    }
+  }
+
+  private worldPointDiameter(multiplier: number): number {
+    return THREE.MathUtils.lerp(0.08, 0.34, (THREE.MathUtils.clamp(multiplier, 1, 5) - 1) / 4);
   }
 
   private static diskTexture: THREE.Texture | null = null;

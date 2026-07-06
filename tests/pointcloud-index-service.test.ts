@@ -56,9 +56,64 @@ function syntheticPointSample(pointCount = 2): ArrayBuffer {
   return buffer;
 }
 
+function syntheticPointSample8BitRgb(pointCount = 2): ArrayBuffer {
+  const buffer = new ArrayBuffer(pointCount * 36);
+  const view = new DataView(buffer);
+  for (let i = 0; i < pointCount; i++) {
+    const offset = i * 36;
+    view.setInt32(offset, i * 100, true);
+    view.setInt32(offset + 4, i * 200, true);
+    view.setInt32(offset + 8, i * 50, true);
+    view.setUint16(offset + 12, 100 + i * 100, true);
+    view.setUint8(offset + 14, 0x11);
+    view.setUint8(offset + 16, i % 2 === 0 ? 1 : 2);
+    view.setUint16(offset + 30, 12 + i, true);
+    view.setUint16(offset + 32, 34 + i, true);
+    view.setUint16(offset + 34, 56 + i, true);
+  }
+  return buffer;
+}
+
+function clusteredPointSample(grid = 16): ArrayBuffer {
+  const pointCount = grid * grid;
+  const buffer = new ArrayBuffer(pointCount * 36);
+  const view = new DataView(buffer);
+  for (let y = 0; y < grid; y++) {
+    for (let x = 0; x < grid; x++) {
+      const i = y * grid + x;
+      const offset = i * 36;
+      view.setInt32(offset, x * 10, true);
+      view.setInt32(offset + 4, y * 10, true);
+      view.setInt32(offset + 8, 0, true);
+      view.setUint16(offset + 12, 100, true);
+      view.setUint8(offset + 14, 0x11);
+      view.setUint8(offset + 16, 1);
+      view.setUint16(offset + 30, 256, true);
+      view.setUint16(offset + 32, 512, true);
+      view.setUint16(offset + 34, 768, true);
+    }
+  }
+  return buffer;
+}
+
 async function writeSyntheticLasFile(folder: string, fileName = 'fixture.las', pointCount = 8): Promise<string> {
   const filePath = path.join(folder, fileName);
   const payload = Buffer.concat([Buffer.from(syntheticLasHeader(pointCount)), Buffer.from(syntheticPointSample(pointCount))]);
+  await writeFile(filePath, payload);
+  return filePath;
+}
+
+async function writeSynthetic8BitRgbLasFile(folder: string, fileName = 'fixture-8bit-rgb.las', pointCount = 8): Promise<string> {
+  const filePath = path.join(folder, fileName);
+  const payload = Buffer.concat([Buffer.from(syntheticLasHeader(pointCount)), Buffer.from(syntheticPointSample8BitRgb(pointCount))]);
+  await writeFile(filePath, payload);
+  return filePath;
+}
+
+async function writeClusteredLasFile(folder: string, fileName = 'clustered-fixture.las', grid = 16): Promise<string> {
+  const pointCount = grid * grid;
+  const filePath = path.join(folder, fileName);
+  const payload = Buffer.concat([Buffer.from(syntheticLasHeader(pointCount)), Buffer.from(clusteredPointSample(grid))]);
   await writeFile(filePath, payload);
   return filePath;
 }
@@ -88,6 +143,8 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(indexAsset.truthStatus).toBe('indexed-full');
     expect(indexAsset.pointCloudIndex?.sourceAssetId).toBe(assetId);
     expect(indexAsset.pointCloudIndex?.indexType).toBe('wpi-octree');
+    expect(indexAsset.pointCloudIndex?.indexVersion).toBe(2);
+    expect(indexAsset.pointCloudIndex?.ownership).toBe('strided');
 
     expect(existsSync(path.join(projectFolder, 'derived', assetId, 'index', 'index.json'))).toBe(true);
     expect(existsSync(path.join(projectFolder, 'derived', assetId, 'index', 'COMPLETE'))).toBe(true);
@@ -218,6 +275,19 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(tiles[0]!.payload.radii.length).toBe(tiles[0]!.payload.surfelCount);
   });
 
+  it('exposes surfel cell scale as a generation control', async () => {
+    const parent = await mkdtemp(path.join(tmpdir(), 'wb-scale-'));
+    const fixtureDir = await mkdtemp(path.join(tmpdir(), 'las-scale-'));
+    const sourceFile = await writeClusteredLasFile(fixtureDir, 'scale-fixture.las', 24);
+    const svc = new ProjectService({ runIndexBuild: inlineIndexBuild });
+    await svc.createProject({ parentDir: parent, projectName: 'SCALE' });
+    const imported = await svc.importPointCloud({ filePath: sourceFile, importPolicy: 'reference' });
+    const assetId = imported.manifest.assets.find((asset) => asset.kind === 'point-cloud')!.id;
+    const generated = await svc.generateAnalyticSurfels({ assetId, surfelCellScale: 0.5 });
+    const surfelAsset = generated.session.manifest.assets.find((asset) => asset.id === generated.surfelAssetId)!;
+    expect(surfelAsset.analyticSurfel?.surfelCellScale).toBe(0.5);
+  });
+
   it('builds analytic surfels from an index and survives reopen', async () => {
     const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
     const index = await svc.generatePointCloudIndex({ assetId });
@@ -231,6 +301,46 @@ describe('ProjectService.generatePointCloudIndex', () => {
     const reopenedAsset = reopened.manifest.assets.find((a) => a.id === surfels.surfelAssetId);
     expect(reopenedAsset?.truthStatus).toBe('derived');
     expect(reopenedAsset?.warnings ?? []).toEqual([]);
+  });
+
+  it('treats a v1 index as streamable but warns that the format is outdated', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    const generated = await svc.generatePointCloudIndex({ assetId });
+    const manifest = structuredClone(generated.session.manifest);
+    const indexAsset = manifest.assets.find((a) => a.id === generated.indexAssetId)!;
+    if (!indexAsset.pointCloudIndex) throw new Error('missing pointCloudIndex metadata');
+    indexAsset.pointCloudIndex.indexVersion = 1;
+    delete indexAsset.pointCloudIndex.ownership;
+    await svc.saveProject(manifest);
+    await svc.closeProject();
+
+    const reopened = await svc.openProject({ projectFolder });
+    const reopenedIndex = reopened.manifest.assets.find((a) => a.id === generated.indexAssetId)!;
+    expect(reopenedIndex.warnings.some((warning) => /format is outdated/i.test(warning))).toBe(true);
+    expect(reopenedIndex.warnings.some((warning) => /out of date/i.test(warning))).toBe(false);
+  });
+
+  it('keeps 8-bit RGB stored in u16 bright in both preview and indexed paths', async () => {
+    const parent = await mkdtemp(path.join(tmpdir(), 'wb-rgb-'));
+    const fixtureDir = await mkdtemp(path.join(tmpdir(), 'las-rgb-'));
+    const sourceFile = await writeSynthetic8BitRgbLasFile(fixtureDir);
+    const svc = new ProjectService({ runIndexBuild: inlineIndexBuild });
+    await svc.createProject({ parentDir: parent, projectName: 'RGB' });
+    const imported = await svc.importPointCloud({ filePath: sourceFile, importPolicy: 'reference' });
+    const asset = imported.manifest.assets.find((a) => a.kind === 'point-cloud')!;
+    expect(asset.pointCloud?.rgbEncoding).toBe('u8-in-u16');
+
+    const preview = await svc.loadPointCloudPreview({ assetId: asset.id });
+    expect(preview.dataset.octree?.root.colors[0]).toBe(12);
+    expect(preview.dataset.octree?.root.colors[1]).toBe(34);
+    expect(preview.dataset.octree?.root.colors[2]).toBe(56);
+
+    await svc.generatePointCloudIndex({ assetId: asset.id });
+    const hierarchy = await svc.loadPointCloudIndexHierarchy({ assetId: asset.id });
+    const { tiles } = await svc.loadPointCloudIndexTiles({ assetId: asset.id, keys: [hierarchy.root] });
+    expect(tiles[0]!.payload.colors[0]).toBe(12);
+    expect(tiles[0]!.payload.colors[1]).toBe(34);
+    expect(tiles[0]!.payload.colors[2]).toBe(56);
   });
 
   it('marks a missing analytic surfel artifact as error on reopen without crashing', async () => {

@@ -94,11 +94,9 @@ export class StreamingSurfels {
         attribute vec3 instanceNormal;
         attribute vec3 instanceColor;
         attribute float instanceRadius;
-        attribute float instanceConfidence;
         attribute float instanceFlags;
         varying vec2 vCorner;
         varying vec3 vColor;
-        varying float vConfidence;
         void main() {
           vec2 corner = position.xy;
           bool screenAligned = mod(instanceFlags, 2.0) >= 1.0;
@@ -118,22 +116,20 @@ export class StreamingSurfels {
           gl_Position = projectionMatrix * mvPosition;
           vCorner = corner;
           vColor = instanceColor;
-          vConfidence = instanceConfidence;
         }
       `,
       fragmentShader: `
         varying vec2 vCorner;
         varying vec3 vColor;
-        varying float vConfidence;
         void main() {
           float dist = dot(vCorner, vCorner);
           if (dist > 1.0) discard;
-          float edge = smoothstep(1.0, 0.7, 1.0 - dist);
-          float alpha = mix(0.55, 0.95, clamp(vConfidence, 0.0, 1.0)) * edge;
+          float edge = 1.0 - smoothstep(0.7, 1.0, dist);
+          float alpha = edge;
           gl_FragColor = vec4(vColor, alpha);
         }
       `,
-      transparent: true,
+      transparent: false,
       alphaTest: 0.12,
       depthWrite: true,
       toneMapped: false,
@@ -287,7 +283,6 @@ export class StreamingSurfels {
     geometry.setAttribute('instanceNormal', new THREE.InstancedBufferAttribute(payload.normals, 3));
     geometry.setAttribute('instanceColor', new THREE.InstancedBufferAttribute(payload.colors, 3, true));
     geometry.setAttribute('instanceRadius', new THREE.InstancedBufferAttribute(payload.radii, 1));
-    geometry.setAttribute('instanceConfidence', new THREE.InstancedBufferAttribute(payload.confidence, 1));
     geometry.setAttribute('instanceFlags', new THREE.InstancedBufferAttribute(payload.flags, 1));
     geometry.instanceCount = payload.surfelCount;
     geometry.computeBoundingSphere();

@@ -34,6 +34,8 @@ interface BuildCommonInput {
   outDir: string;
   sourceAssetId: string;
   indexAssetId: string | null;
+  rgbEncoding: 'u16' | 'u8-in-u16' | null;
+  surfelCellScale?: number;
   sourceFingerprint: { headerSha256: string; fileSize: number; mtimeMs: number | null };
   onProgress?: (label: string, pct: number | null) => void;
   shouldCancel?: () => boolean;
@@ -70,6 +72,9 @@ export async function buildAnalyticSurfelsFromIndex(
   let totalSurfels = 0;
   let spacingSum = 0;
   const nodes: AnalyticSurfelManifestNode[] = [];
+  const globalSpacing = deriveGlobalSpacing(input.indexManifest.bounds, input.indexManifest.source.pointCount);
+  const globalCellSize = Math.max(globalSpacing * 1.5 * (input.surfelCellScale ?? 1), 1e-4);
+  const gridOrigin = input.indexManifest.cube.origin;
 
   for (let i = 0; i < input.indexManifest.nodes.length; i++) {
     if (shouldCancel()) throw new AnalyticSurfelBuildCancelled();
@@ -82,9 +87,9 @@ export async function buildAnalyticSurfelsFromIndex(
       positions[p * 3 + 1] = decoded.y[p]! * input.indexManifest.scale[1] + input.indexManifest.offset[1];
       positions[p * 3 + 2] = decoded.z[p]! * input.indexManifest.scale[2] + input.indexManifest.offset[2];
       if (decoded.hasRgb) {
-        colors[p * 3] = decoded.r![p]! >> 8;
-        colors[p * 3 + 1] = decoded.g![p]! >> 8;
-        colors[p * 3 + 2] = decoded.b![p]! >> 8;
+        colors[p * 3] = normalizeRgbChannel(decoded.r![p]!, input.rgbEncoding);
+        colors[p * 3 + 1] = normalizeRgbChannel(decoded.g![p]!, input.rgbEncoding);
+        colors[p * 3 + 2] = normalizeRgbChannel(decoded.b![p]!, input.rgbEncoding);
       } else {
         colors[p * 3] = 255;
         colors[p * 3 + 1] = 255;
@@ -96,6 +101,9 @@ export async function buildAnalyticSurfelsFromIndex(
       colors,
       pointCount: decoded.pointCount,
       bounds: node.bounds,
+      cellSize: globalCellSize,
+      gridOrigin,
+      spacingEstimate: globalSpacing,
     });
     const tileName = `${node.key}.sftile`;
     await writeAnalyticSurfelTile(tilesDir, tileName, {
@@ -129,6 +137,7 @@ export async function buildAnalyticSurfelsFromIndex(
     surfelType: ANALYTIC_SURFEL_TYPE,
     generator: { name: ANALYTIC_SURFEL_GENERATOR_NAME, version: ANALYTIC_SURFEL_BUILDER_VERSION },
     generatedAt: new Date().toISOString(),
+    surfelCellScale: input.surfelCellScale ?? 1,
     sourceAssetId: input.sourceAssetId,
     indexAssetId: input.indexAssetId,
     source: input.sourceFingerprint,
@@ -171,6 +180,9 @@ export async function buildAnalyticSurfelsFromPreview(
   const nodes: AnalyticSurfelManifestNode[] = [];
   let totalSurfels = 0;
   let spacingSum = 0;
+  const globalSpacing = deriveGlobalSpacing(input.dataset.bounds, input.dataset.pointCount);
+  const globalCellSize = Math.max(globalSpacing * 1.5 * (input.surfelCellScale ?? 1), 1e-4);
+  const gridOrigin: [number, number, number] = [input.dataset.bounds.minX, input.dataset.bounds.minY, input.dataset.bounds.minZ];
 
   for (let i = 0; i < previewNodes.length; i++) {
     if (shouldCancel()) throw new AnalyticSurfelBuildCancelled();
@@ -186,6 +198,9 @@ export async function buildAnalyticSurfelsFromPreview(
       colors: node.colors,
       pointCount: node.sampleCount,
       bounds: node.bounds,
+      cellSize: globalCellSize,
+      gridOrigin,
+      spacingEstimate: globalSpacing,
     });
     const tileName = `${previewKey(node.id)}.sftile`;
     await writeAnalyticSurfelTile(tilesDir, tileName, {
@@ -219,6 +234,7 @@ export async function buildAnalyticSurfelsFromPreview(
     surfelType: ANALYTIC_SURFEL_TYPE,
     generator: { name: ANALYTIC_SURFEL_GENERATOR_NAME, version: ANALYTIC_SURFEL_BUILDER_VERSION },
     generatedAt: new Date().toISOString(),
+    surfelCellScale: input.surfelCellScale ?? 1,
     sourceAssetId: input.sourceAssetId,
     indexAssetId: null,
     source: input.sourceFingerprint,
@@ -274,6 +290,20 @@ function flattenPreviewNodes(root: PointCloudOctreeNode): PointCloudOctreeNode[]
 
 function previewKey(id: number): string {
   return `preview-${id}`;
+}
+
+function deriveGlobalSpacing(
+  bounds: { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number },
+  pointCount: number,
+): number {
+  if (pointCount <= 1) return 0;
+  const area = Math.max((bounds.maxX - bounds.minX) * (bounds.maxY - bounds.minY), 1e-9);
+  return Math.sqrt(area / pointCount);
+}
+
+function normalizeRgbChannel(value: number, encoding: 'u16' | 'u8-in-u16' | null): number {
+  if (encoding === 'u8-in-u16') return value;
+  return value >> 8;
 }
 
 async function dirSize(dir: string): Promise<number> {

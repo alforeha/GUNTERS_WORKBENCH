@@ -287,6 +287,7 @@ export interface LasAttributeSummary {
   hasPointSourceId: boolean;
   hasGpsTime: boolean;
   hasRgb: boolean;
+  rgbEncoding: 'u16' | 'u8-in-u16' | null;
   intensityRange: [number, number] | null;
   rgbRange: [[number, number, number], [number, number, number]] | null;
   sampledPoints: number;

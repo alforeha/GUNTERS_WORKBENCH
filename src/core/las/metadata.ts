@@ -74,6 +74,7 @@ function defaultAttributes(pointFormat: number): LasAttributeSummary {
     hasPointSourceId: true,
     hasGpsTime: pointFormatHasGpsTime(pointFormat),
     hasRgb: pointFormatHasRgb(pointFormat),
+    rgbEncoding: null,
     intensityRange: null,
     rgbRange: null,
     sampledPoints: 0,
@@ -82,6 +83,14 @@ function defaultAttributes(pointFormat: number): LasAttributeSummary {
     numberOfReturnsCounts: emptyCounts(),
     userDataCounts: emptyCounts(),
   };
+}
+
+export function inferRgbEncoding(
+  rgbRange: [[number, number, number], [number, number, number]] | null,
+): 'u16' | 'u8-in-u16' | null {
+  if (!rgbRange) return null;
+  const maxChannel = Math.max(rgbRange[1][0], rgbRange[1][1], rgbRange[1][2]);
+  return maxChannel <= 255 ? 'u8-in-u16' : 'u16';
 }
 
 function readPointCount(view: DataView, versionMinor: number): number {
@@ -337,6 +346,9 @@ export function sampleAttributes(
   }
   out.sampledPoints = points;
   if (points > 0) out.intensityRange = [minIntensity, maxIntensity];
-  if (rgbSeen) out.rgbRange = [minRgb, maxRgb];
+  if (rgbSeen) {
+    out.rgbRange = [minRgb, maxRgb];
+    out.rgbEncoding = inferRgbEncoding(out.rgbRange);
+  }
   return out;
 }

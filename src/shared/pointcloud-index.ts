@@ -12,11 +12,11 @@ export const POINT_CLOUD_INDEX_ASSET_KIND = 'point-cloud-index';
 /** The only index type this build understands. */
 export const POINT_CLOUD_INDEX_TYPE = 'wpi-octree';
 /** On-disk/manifest index format version. Bump when the tile/hierarchy layout changes. */
-export const POINT_CLOUD_INDEX_VERSION = 1;
+export const POINT_CLOUD_INDEX_VERSION = 2;
 /** Generator identity recorded on every index so provenance is honest. */
 export const POINT_CLOUD_INDEX_GENERATOR_NAME = 'workbench';
 /** Semantic version of the WPI builder; stamped into generator.version on each index. */
-export const POINT_CLOUD_INDEX_BUILDER_VERSION = '1.0.0';
+export const POINT_CLOUD_INDEX_BUILDER_VERSION = '2.0.0';
 
 /** All friendly index warnings share this prefix so open-time checks can dedupe them. */
 export const POINT_CLOUD_INDEX_WARNING_PREFIX = 'Point-cloud index';
@@ -107,6 +107,12 @@ export function formatStaleIndexWarning(result: IndexStalenessResult): string | 
   if (!result.stale) return null;
   const detail = result.reasons.map((reason) => STALE_REASON_LABELS[reason]).join(', ');
   return `${POINT_CLOUD_INDEX_WARNING_PREFIX} may be out of date (${detail}). Regenerate the index to match the current source.`;
+}
+
+/** Friendly warning for indexes built with an older, still-streamable format. */
+export function formatOutdatedIndexWarning(indexVersion: number): string | null {
+  if (indexVersion >= POINT_CLOUD_INDEX_VERSION) return null;
+  return `${POINT_CLOUD_INDEX_WARNING_PREFIX} format is outdated (v${indexVersion}); regenerate for improved coarse-level display.`;
 }
 
 /** Whether a warning string is one this module produced (for idempotent open-time dedupe). */

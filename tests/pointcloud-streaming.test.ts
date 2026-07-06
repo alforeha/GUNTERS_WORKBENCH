@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   boxDistance,
+  deriveFinestVisibleLevels,
   formatIndexedFullDisclosure,
   isSettled,
   nodeGeometricError,
@@ -100,6 +101,40 @@ describe('planEviction', () => {
     ];
     expect(planEviction(loaded, new Set(['a', 'b']), 150)).toEqual([]); // can't evict selected → stays over, returns []
     expect(planEviction(loaded, new Set(), 500)).toEqual([]); // under budget
+  });
+
+  it('never evicts pinned base-layer nodes', () => {
+    const loaded = [
+      { key: 'root', pointCount: 100, lastUsedTick: 1 },
+      { key: 'child', pointCount: 100, lastUsedTick: 2 },
+      { key: 'leaf', pointCount: 100, lastUsedTick: 3 },
+    ];
+    expect(planEviction(loaded, new Set(), 150, new Set(['root', 'child']))).toEqual(['leaf']);
+  });
+});
+
+describe('deriveFinestVisibleLevels', () => {
+  it('propagates the deepest visible level up a refined branch', () => {
+    const levels = deriveFinestVisibleLevels(
+      chainHierarchy(),
+      new Set(['0-0-0-0', '1-0-0-0', '2-0-0-0']),
+    );
+    expect(levels.get('0-0-0-0')).toBe(2);
+    expect(levels.get('1-0-0-0')).toBe(2);
+    expect(levels.get('2-0-0-0')).toBe(2);
+  });
+
+  it('keeps unrelated branches at their own finest loaded level', () => {
+    const branched = new Map<string, StreamNode>([
+      ['0', { key: '0', level: 0, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 8, maxY: 8, maxZ: 8 }, pointCount: 100, childKeys: ['1a', '1b'] }],
+      ['1a', { key: '1a', level: 1, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 4, maxY: 4, maxZ: 4 }, pointCount: 100, childKeys: ['2a'] }],
+      ['2a', { key: '2a', level: 2, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 2, maxY: 2, maxZ: 2 }, pointCount: 100, childKeys: [] }],
+      ['1b', { key: '1b', level: 1, bounds: { minX: 4, minY: 4, minZ: 4, maxX: 8, maxY: 8, maxZ: 8 }, pointCount: 100, childKeys: [] }],
+    ]);
+    const levels = deriveFinestVisibleLevels(branched, new Set(['0', '1a', '2a', '1b']));
+    expect(levels.get('1a')).toBe(2);
+    expect(levels.get('1b')).toBe(1);
+    expect(levels.get('0')).toBe(2);
   });
 });
 

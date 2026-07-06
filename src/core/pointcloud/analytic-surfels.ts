@@ -18,12 +18,15 @@ export interface DeriveAnalyticSurfelsInput {
   pointCount: number;
   bounds: PointCloudBounds;
   cellSize?: number;
+  gridOrigin?: [number, number, number];
+  spacingEstimate?: number;
   minPointsPerSurfel?: number;
 }
 
 export interface SurfaceNormalEstimate {
   normal: [number, number, number];
-  confidence: number;
+  planarity: number;
+  linearity: number;
   eigenvalues: [number, number, number];
 }
 
@@ -49,24 +52,27 @@ export function estimatePointSpacing(bounds: PointCloudBounds, pointCount: numbe
   if (pointCount <= 1) return 0;
   const dx = Math.max(0, bounds.maxX - bounds.minX);
   const dy = Math.max(0, bounds.maxY - bounds.minY);
+  const area = dx * dy;
+  if (area > 1e-9) return Math.sqrt(area / pointCount);
   const dz = Math.max(0, bounds.maxZ - bounds.minZ);
   const volume = Math.max(dx * dy * dz, 1e-9);
   return Math.cbrt(volume / pointCount);
 }
 
 export function deriveAnalyticSurfels(input: DeriveAnalyticSurfelsInput): AnalyticSurfelBuffers {
-  const spacing = Math.max(estimatePointSpacing(input.bounds, input.pointCount), 1e-4);
-  const cellSize = Math.max(input.cellSize ?? spacing * 1.5, spacing * 0.75, 1e-4);
+  const spacing = Math.max(input.spacingEstimate ?? estimatePointSpacing(input.bounds, input.pointCount), 1e-4);
+  const cellSize = Math.max(input.cellSize ?? spacing * 1.5, 1e-4);
   const minPointsPerSurfel = Math.max(1, input.minPointsPerSurfel ?? 2);
+  const gridOrigin = input.gridOrigin ?? [input.bounds.minX, input.bounds.minY, input.bounds.minZ];
   const buckets = new Map<string, CellAccumulator>();
 
   for (let i = 0; i < input.pointCount; i++) {
     const x = input.positions[i * 3] ?? 0;
     const y = input.positions[i * 3 + 1] ?? 0;
     const z = input.positions[i * 3 + 2] ?? 0;
-    const ix = Math.floor((x - input.bounds.minX) / cellSize);
-    const iy = Math.floor((y - input.bounds.minY) / cellSize);
-    const iz = Math.floor((z - input.bounds.minZ) / cellSize);
+    const ix = Math.floor((x - gridOrigin[0]) / cellSize);
+    const iy = Math.floor((y - gridOrigin[1]) / cellSize);
+    const iz = Math.floor((z - gridOrigin[2]) / cellSize);
     const key = `${ix}|${iy}|${iz}`;
     let bucket = buckets.get(key);
     if (!bucket) {
@@ -127,7 +133,7 @@ export function deriveAnalyticSurfels(input: DeriveAnalyticSurfelsInput): Analyt
 
     const covariance = covarianceFromAccumulator(bucket);
     const normalEstimate = estimateSurfaceNormal(covariance);
-    confidence[i] = normalEstimate?.confidence ?? 0;
+    confidence[i] = normalEstimate?.planarity ?? 0;
     if (normalEstimate) {
       normals[i * 3] = normalEstimate.normal[0];
       normals[i * 3 + 1] = normalEstimate.normal[1];
@@ -139,11 +145,14 @@ export function deriveAnalyticSurfels(input: DeriveAnalyticSurfelsInput): Analyt
       flags[i] |= ANALYTIC_SURFEL_SCREEN_ALIGNED;
     }
 
+    const localSpacing = cellSize / Math.max(Math.sqrt(bucket.count), 1);
     const radiusFromVariance = normalEstimate
-      ? Math.sqrt(Math.max(normalEstimate.eigenvalues[1] + normalEstimate.eigenvalues[2], 0) * 0.5)
+      ? Math.sqrt(Math.max(normalEstimate.eigenvalues[1], 0) + Math.max(normalEstimate.eigenvalues[2], 0)) * 0.5
       : 0;
-    radii[i] = Math.max(spacing * 0.85, radiusFromVariance * 1.5, cellSize * 0.35);
-    if (!normalEstimate || normalEstimate.confidence < 0.35) flags[i] |= ANALYTIC_SURFEL_SCREEN_ALIGNED;
+    radii[i] = Math.max(localSpacing * 0.9, radiusFromVariance, cellSize * 0.22);
+    if (!normalEstimate || normalEstimate.planarity < 0.35 || normalEstimate.linearity > normalEstimate.planarity) {
+      flags[i] |= ANALYTIC_SURFEL_SCREEN_ALIGNED;
+    }
     expandBounds(outBounds, cx, cy, cz);
   }
 
@@ -176,13 +185,17 @@ export function estimateSurfaceNormal(covariance: [number, number, number, numbe
     vectors[1]![smallest]!,
     vectors[2]![smallest]!,
   ]);
-  const trace = Math.max(values[0]! + values[1]! + values[2]!, 1e-9);
-  const confidence = Math.max(0, Math.min(1, (values[largest]! - values[smallest]!) / trace));
+  const lambda1 = Math.max(values[smallest]!, 0);
+  const lambda2 = Math.max(values[middle]!, 0);
+  const lambda3 = Math.max(values[largest]!, 1e-9);
+  const planarity = Math.max(0, Math.min(1, (lambda2 - lambda1) / lambda3));
+  const linearity = Math.max(0, Math.min(1, (lambda3 - lambda2) / lambda3));
   if (!Number.isFinite(normal[0]) || !Number.isFinite(normal[1]) || !Number.isFinite(normal[2])) return null;
   return {
     normal,
-    confidence,
-    eigenvalues: [values[smallest]!, values[middle]!, values[largest]!],
+    planarity,
+    linearity,
+    eigenvalues: [lambda1, lambda2, lambda3],
   };
 }
 

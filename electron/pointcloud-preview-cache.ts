@@ -126,6 +126,7 @@ function cloneAttributes(attributes: LasAttributeSummary): LasAttributeSummary {
     hasPointSourceId: attributes.hasPointSourceId,
     hasGpsTime: attributes.hasGpsTime,
     hasRgb: attributes.hasRgb,
+    rgbEncoding: attributes.rgbEncoding,
     intensityRange: attributes.intensityRange ? [...attributes.intensityRange] as [number, number] : null,
     rgbRange: attributes.rgbRange
       ? [

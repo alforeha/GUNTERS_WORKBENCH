@@ -60,12 +60,14 @@ export interface PointCloudIndexMetadata {
   /** Points back to the immutable source point-cloud asset. */
   sourceAssetId: string;
   indexType: PointCloudIndexType;
-  indexVersion: 1;
+  indexVersion: 1 | 2;
+  ownership?: 'file-order' | 'strided';
   source: {
     headerSha256: string;
     fileSize: number;
     /** Nullable: reference imports may not expose a reliable mtime. */
     mtimeMs: number | null;
+    rgbEncoding?: 'u16' | 'u8-in-u16';
   };
   pointCount: number;
   bounds: PointCloudBoundsBox;
@@ -98,6 +100,7 @@ export interface PointCloudAssetMetadata {
   unitsLinear: 'usSurveyFoot' | 'foot' | 'meter' | 'unknown';
   unitsRaw: string;
   headerSha256: string;
+  rgbEncoding?: 'u16' | 'u8-in-u16';
 }
 
 export interface AnalyticSurfelMetadata {
@@ -105,6 +108,7 @@ export interface AnalyticSurfelMetadata {
   indexAssetId: string | null;
   surfelType: 'analytic-surfel-octree';
   surfelVersion: 1;
+  surfelCellScale?: number;
   source: {
     headerSha256: string;
     fileSize: number;
@@ -317,6 +321,7 @@ export interface LoadPointCloudIndexTilesInput {
 
 export interface GenerateAnalyticSurfelsInput {
   assetId: string;
+  surfelCellScale?: number;
 }
 
 export interface AnalyticSurfelProgress {

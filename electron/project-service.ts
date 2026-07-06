@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { projectManifestSchema } from '../src/shared/manifest-schema';
 import { createDefaultManifest } from '../src/shared/project-defaults';
 import type { PointCloudDataset, PointCloudNodePayload } from '../src/core/contract';
-import { parseLasMetadata } from '../src/core/las/metadata';
+import { inferRgbEncoding, parseLasMetadata } from '../src/core/las/metadata';
 import { computeStride, handleLasSourceRequest, type ChunkSource } from '../src/workers/las.worker';
 import type {
   AnalyticSurfelHierarchy,
@@ -44,6 +44,7 @@ import {
   POINT_CLOUD_INDEX_BUILDER_VERSION,
   POINT_CLOUD_INDEX_WARNING_PREFIX,
   detectIndexStaleness,
+  formatOutdatedIndexWarning,
   formatStaleIndexWarning,
   hasValidIndexForStreaming,
   isManagedIndexWarning,
@@ -172,11 +173,13 @@ export class ProjectService {
     }
 
     const preamble = await this.readLasPreamble(input.filePath);
+    const sample = await this.readLasPointSample(input.filePath);
     const dataset = parseLasMetadata({
       fileName: path.basename(input.filePath),
       fileSize: sourceStats.size,
       header: preamble.slice(0, Math.min(375, preamble.byteLength)),
       preamble,
+      sample,
     });
     const headerSha256 = createHash('sha256')
       .update(new Uint8Array(preamble))
@@ -225,6 +228,7 @@ export class ProjectService {
         unitsLinear: dataset.meta.units.linear,
         unitsRaw: dataset.meta.units.raw,
         headerSha256,
+        rgbEncoding: dataset.attributes.rgbEncoding ?? undefined,
       },
     });
 
@@ -399,6 +403,7 @@ export class ProjectService {
             scale: descriptor.dataset.scale,
             offset: descriptor.dataset.offset,
             offsetToPointData: descriptor.dataset.offsetToPointData,
+            rgbEncoding: asset.pointCloud.rgbEncoding ?? inferRgbEncoding(descriptor.dataset.attributes.rgbRange) ?? 'u16',
             octree: {
               origin: descriptor.dataset.octree.origin,
             },
@@ -491,8 +496,14 @@ export class ProjectService {
       pointCloudIndex: {
         sourceAssetId: sourceAsset.id,
         indexType: 'wpi-octree',
-        indexVersion: 1,
-        source: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
+        indexVersion: built.wpiIndexVersion,
+        ownership: built.ownership,
+        source: {
+          headerSha256,
+          fileSize: sourceStats.size,
+          mtimeMs: sourceStats.mtimeMs,
+          rgbEncoding: built.source.rgbEncoding,
+        },
         pointCount: built.source.pointCount,
         bounds: built.bounds,
         scale: built.scale,
@@ -573,6 +584,8 @@ export class ProjectService {
           outDir: stageDir,
           sourceAssetId: sourceAsset.id,
           indexAssetId: indexAsset.id,
+          rgbEncoding: sourceAsset.pointCloud.rgbEncoding ?? null,
+          surfelCellScale: input.surfelCellScale,
           sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
           indexDir,
           indexManifest,
@@ -585,6 +598,8 @@ export class ProjectService {
           outDir: stageDir,
           sourceAssetId: sourceAsset.id,
           indexAssetId: null,
+          rgbEncoding: sourceAsset.pointCloud.rgbEncoding ?? null,
+          surfelCellScale: input.surfelCellScale,
           sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
           dataset: preview.dataset,
           onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
@@ -622,6 +637,7 @@ export class ProjectService {
         indexAssetId: result.manifest.indexAssetId,
         surfelType: result.manifest.surfelType,
         surfelVersion: result.manifest.surfelVersion,
+        surfelCellScale: result.manifest.surfelCellScale,
         source: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
         surfelCount: result.manifest.totalSurfels,
         bounds: result.manifest.bounds,
@@ -689,12 +705,14 @@ export class ProjectService {
     const origin = this.indexOrigin(manifest.bounds);
     const [sx, sy, sz] = manifest.scale;
     const [ox, oy, oz] = manifest.offset;
+    const sourceAsset = (this.currentManifest as ProjectManifest).assets.find((a) => a.id === input.assetId && a.pointCloud);
     const tiles: { key: string; payload: PointCloudNodePayload }[] = [];
 
     for (const key of [...new Set(input.keys)]) {
       const node = nodeByKey.get(key);
       if (!node) continue;
       const decoded = await decodeWpiTileFile(indexDir, node.tile);
+      const rgbEncoding = manifest.source.rgbEncoding ?? sourceAsset?.pointCloud?.rgbEncoding ?? 'u16';
       const count = decoded.pointCount;
       const positions = new Float32Array(count * 3);
       const colors = new Uint8Array(count * 3);
@@ -708,9 +726,9 @@ export class ProjectService {
         positions[i * 3 + 1] = decoded.y[i]! * sy + oy - origin[1];
         positions[i * 3 + 2] = decoded.z[i]! * sz + oz - origin[2];
         if (decoded.hasRgb) {
-          colors[i * 3] = decoded.r![i]! >> 8;
-          colors[i * 3 + 1] = decoded.g![i]! >> 8;
-          colors[i * 3 + 2] = decoded.b![i]! >> 8;
+          colors[i * 3] = rgbEncoding === 'u8-in-u16' ? decoded.r![i]! : decoded.r![i]! >> 8;
+          colors[i * 3 + 1] = rgbEncoding === 'u8-in-u16' ? decoded.g![i]! : decoded.g![i]! >> 8;
+          colors[i * 3 + 2] = rgbEncoding === 'u8-in-u16' ? decoded.b![i]! : decoded.b![i]! >> 8;
         } else {
           colors[i * 3] = 255;
           colors[i * 3 + 1] = 255;
@@ -992,6 +1010,8 @@ export class ProjectService {
       } catch {
         asset.warnings.push(`${POINT_CLOUD_INDEX_WARNING_PREFIX} freshness could not be verified from the current source.`);
       }
+      const outdated = formatOutdatedIndexWarning(asset.pointCloudIndex.indexVersion);
+      if (outdated) asset.warnings.push(outdated);
     }
 
     for (const asset of next.assets) {
@@ -1099,6 +1119,28 @@ export class ProjectService {
       const preambleBuffer = Buffer.alloc(offsetToPointData);
       await handle.read(preambleBuffer, 0, preambleBuffer.length, 0);
       return preambleBuffer.buffer.slice(preambleBuffer.byteOffset, preambleBuffer.byteOffset + preambleBuffer.byteLength);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async readLasPointSample(filePath: string, maxPoints = 4096): Promise<ArrayBuffer | undefined> {
+    const handle = await open(filePath, 'r');
+    try {
+      const headerBuffer = Buffer.alloc(375);
+      await handle.read(headerBuffer, 0, headerBuffer.length, 0);
+      const header = headerBuffer.buffer.slice(headerBuffer.byteOffset, headerBuffer.byteOffset + headerBuffer.byteLength);
+      const view = new DataView(header);
+      const offsetToPointData = view.getUint32(96, true);
+      const pointRecordLength = view.getUint16(105, true);
+      const pointCount = Number(view.getBigUint64(247, true) || BigInt(view.getUint32(107, true)));
+      if (pointRecordLength <= 0 || pointCount <= 0) return undefined;
+      const samplePoints = Math.min(maxPoints, pointCount);
+      const sampleBytes = samplePoints * pointRecordLength;
+      const sampleBuffer = Buffer.alloc(sampleBytes);
+      const { bytesRead } = await handle.read(sampleBuffer, 0, sampleBuffer.length, offsetToPointData);
+      if (bytesRead <= 0) return undefined;
+      return sampleBuffer.buffer.slice(sampleBuffer.byteOffset, sampleBuffer.byteOffset + bytesRead);
     } finally {
       await handle.close();
     }
