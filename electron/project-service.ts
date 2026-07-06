@@ -8,10 +8,17 @@ import type { PointCloudDataset, PointCloudNodePayload } from '../src/core/contr
 import { parseLasMetadata } from '../src/core/las/metadata';
 import { computeStride, handleLasSourceRequest, type ChunkSource } from '../src/workers/las.worker';
 import type {
+  AnalyticSurfelHierarchy,
+  AnalyticSurfelMetricsSummary,
+  AnalyticSurfelProgress,
+  AnalyticSurfelTilePayload,
   AssetRecord,
   CreateProjectInput,
+  GenerateAnalyticSurfelsInput,
   GeneratePointCloudIndexInput,
   ImportPointCloudInput,
+  LoadAnalyticSurfelHierarchyInput,
+  LoadAnalyticSurfelTilesInput,
   LoadPointCloudDensifiedNodesInput,
   LoadPointCloudIndexHierarchyInput,
   LoadPointCloudIndexTilesInput,
@@ -28,15 +35,31 @@ import type {
 } from '../src/shared/workbench-types';
 import type { ProjectSession } from '../src/shared/ipc';
 import {
+  ANALYTIC_SURFEL_ASSET_KIND,
+  formatAnalyticSurfelWarning,
+  isManagedAnalyticSurfelWarning,
+} from '../src/shared/analytic-surfels';
+import {
   POINT_CLOUD_INDEX_ASSET_KIND,
   POINT_CLOUD_INDEX_BUILDER_VERSION,
   POINT_CLOUD_INDEX_WARNING_PREFIX,
   detectIndexStaleness,
   formatStaleIndexWarning,
+  hasValidIndexForStreaming,
   isManagedIndexWarning,
   type CurrentSourceFingerprint,
 } from '../src/shared/pointcloud-index';
 import { decodeReturnByte } from '../src/shared/wpi-tile';
+import {
+  buildAnalyticSurfelsFromIndex,
+  buildAnalyticSurfelsFromPreview,
+  isAnalyticSurfelComplete,
+  readAnalyticSurfelManifest,
+} from './analytic-surfel-builder';
+import {
+  ANALYTIC_SURFEL_TILES_DIR,
+  readAnalyticSurfelTile,
+} from '../src/shared/analytic-surfel-format';
 import {
   decodeWpiTileFile,
   isWpiIndexComplete,
@@ -62,6 +85,8 @@ const REQUIRED_DIRS = ['sources', 'derived', 'edited', 'exports', 'reports', 'hi
 const MISSING_SOURCE_WARNING = 'Referenced point cloud source is missing.';
 const MISSING_SOURCE_CACHE_WARNING = 'Source file is missing; showing cached preview that may be stale.';
 const UNIT_WARNING = 'Point-cloud units could not be confirmed from LAS VLRs.';
+const MISSING_DERIVED_SURFEL_WARNING =
+  'Derived analytic surfel artifact is missing. Regenerate the surfel layer to restore it.';
 const DENSIFIED_DISCLOSURE_SUFFIX = 'source densification fallback';
 
 interface SaveIntent {
@@ -75,6 +100,7 @@ export class ProjectService {
   private currentManifest: ProjectManifest | null = null;
   private readonly runIndexBuild: RunIndexBuild;
   private readonly indexBuilds = new Map<string, AbortController>();
+  private readonly surfelBuilds = new Map<string, AbortController>();
 
   constructor(options?: { runIndexBuild?: RunIndexBuild }) {
     this.runIndexBuild = options?.runIndexBuild ?? createWorkerIndexBuild();
@@ -205,6 +231,7 @@ export class ProjectService {
     manifest.simulationLayers.push({
       id: `layer-${assetId}`,
       simulationId: manifest.realitySimulation.id,
+      kind: 'point-cloud-preview',
       name: `${path.basename(input.filePath)} preview`,
       status: 'active',
       assetId,
@@ -478,6 +505,17 @@ export class ProjectService {
     // Replace any prior index for this source (regeneration), then register on success only.
     manifest.assets = manifest.assets.filter((a) => a.id !== indexAssetId);
     manifest.assets.push(record);
+    manifest.simulationLayers = manifest.simulationLayers.filter((layer) => layer.id !== `layer-${indexAssetId}`);
+    manifest.simulationLayers.push({
+      id: `layer-${indexAssetId}`,
+      simulationId: manifest.realitySimulation.id,
+      kind: 'point-cloud-index',
+      name: `${sourceAsset.name} index`,
+      status: 'active',
+      assetId: indexAssetId,
+      createdAt: now,
+      modifiedAt: now,
+    });
     const session = await this.saveProject(manifest);
 
     return {
@@ -497,6 +535,123 @@ export class ProjectService {
 
   cancelPointCloudIndex(input: GeneratePointCloudIndexInput): void {
     this.indexBuilds.get(input.assetId)?.abort();
+  }
+
+  async generateAnalyticSurfels(
+    input: GenerateAnalyticSurfelsInput,
+    onProgress?: (progress: AnalyticSurfelProgress) => void,
+  ): Promise<{ session: ProjectSession; surfelAssetId: string; metrics: AnalyticSurfelMetricsSummary }> {
+    this.requireOpenProject();
+    const folder = this.currentFolder as string;
+    const sourceAsset = (this.currentManifest as ProjectManifest).assets.find((a) => a.id === input.assetId);
+    if (!sourceAsset || sourceAsset.kind !== 'point-cloud' || !sourceAsset.pointCloud) {
+      throw new Error(`Point cloud asset ${input.assetId} not found.`);
+    }
+    const sourcePath = this.resolvePointCloudSourcePath(folder, sourceAsset);
+    if (!(await this.exists(sourcePath))) {
+      throw new Error(`${MISSING_SOURCE_WARNING} ${sourcePath}`);
+    }
+    const sourceStats = await stat(sourcePath);
+    const headerSha256 = await this.computeSourceHeaderSha256(sourcePath, sourceStats.size);
+    const surfelParent = path.join(folder, 'derived', sourceAsset.id);
+    const finalDir = path.join(surfelParent, 'surfels');
+    const stageDir = path.join(surfelParent, 'surfels.staging');
+    await mkdir(surfelParent, { recursive: true });
+    await rm(stageDir, { recursive: true, force: true });
+
+    const controller = new AbortController();
+    this.surfelBuilds.set(sourceAsset.id, controller);
+    const indexAsset = (this.currentManifest as ProjectManifest).assets.find(
+      (candidate) => candidate.pointCloudIndex?.sourceAssetId === sourceAsset.id && hasValidIndexForStreaming(candidate),
+    );
+    let result;
+    try {
+      if (indexAsset?.pointCloudIndex) {
+        const indexDir = path.join(folder, 'derived', sourceAsset.id, 'index');
+        const indexManifest = await readWpiIndexManifest(indexDir);
+        result = await buildAnalyticSurfelsFromIndex({
+          outDir: stageDir,
+          sourceAssetId: sourceAsset.id,
+          indexAssetId: indexAsset.id,
+          sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
+          indexDir,
+          indexManifest,
+          onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
+          shouldCancel: () => controller.signal.aborted,
+        });
+      } else {
+        const preview = await this.loadPointCloudPreview({ assetId: sourceAsset.id });
+        result = await buildAnalyticSurfelsFromPreview({
+          outDir: stageDir,
+          sourceAssetId: sourceAsset.id,
+          indexAssetId: null,
+          sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
+          dataset: preview.dataset,
+          onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
+          shouldCancel: () => controller.signal.aborted,
+        });
+      }
+      if (!(await isAnalyticSurfelComplete(stageDir))) {
+        throw new Error('Analytic surfel build finished without a completion marker.');
+      }
+      await rm(finalDir, { recursive: true, force: true });
+      await rename(stageDir, finalDir);
+    } catch (err) {
+      await rm(stageDir, { recursive: true, force: true });
+      throw err;
+    } finally {
+      this.surfelBuilds.delete(sourceAsset.id);
+    }
+
+    const manifest = structuredClone(this.currentManifest as ProjectManifest);
+    const surfelAssetId = `${sourceAsset.id}-analytic-surfel`;
+    const now = new Date().toISOString();
+    const record: AssetRecord = {
+      id: surfelAssetId,
+      name: `${sourceAsset.name} surfels`,
+      kind: ANALYTIC_SURFEL_ASSET_KIND,
+      truthStatus: 'derived',
+      importPolicy: 'copy',
+      sourcePath: null,
+      managedPath: path.relative(folder, path.join(finalDir, 'index.json')).replace(/\\/g, '/'),
+      units: sourceAsset.units,
+      warnings: [],
+      hashes: { importedAt: now, modifiedAt: now },
+      analyticSurfel: {
+        sourceAssetId: sourceAsset.id,
+        indexAssetId: result.manifest.indexAssetId,
+        surfelType: result.manifest.surfelType,
+        surfelVersion: result.manifest.surfelVersion,
+        source: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
+        surfelCount: result.manifest.totalSurfels,
+        bounds: result.manifest.bounds,
+        generatedAt: result.manifest.generatedAt,
+        generator: result.manifest.generator,
+      },
+    };
+    manifest.assets = manifest.assets.filter((a) => a.id !== surfelAssetId);
+    manifest.assets.push(record);
+    manifest.simulationLayers = manifest.simulationLayers.filter((layer) => layer.id !== `layer-${surfelAssetId}`);
+    manifest.simulationLayers.push({
+      id: `layer-${surfelAssetId}`,
+      simulationId: manifest.realitySimulation.id,
+      kind: 'derived-surfel',
+      name: `${sourceAsset.name} surfels`,
+      status: 'active',
+      assetId: surfelAssetId,
+      createdAt: now,
+      modifiedAt: now,
+    });
+    const session = await this.saveProject(manifest);
+    return {
+      session,
+      surfelAssetId,
+      metrics: result.metrics,
+    };
+  }
+
+  cancelAnalyticSurfels(input: GenerateAnalyticSurfelsInput): void {
+    this.surfelBuilds.get(input.assetId)?.abort();
   }
 
   async loadPointCloudIndexHierarchy(input: LoadPointCloudIndexHierarchyInput): Promise<PointCloudIndexHierarchy> {
@@ -570,6 +725,62 @@ export class ProjectService {
       tiles.push({ key, payload: { pointCount: count, positions, colors, intensities, classifications, returnNumbers, numberOfReturns } });
     }
     return { assetId: input.assetId, tiles };
+  }
+
+  async loadAnalyticSurfelHierarchy(input: LoadAnalyticSurfelHierarchyInput): Promise<AnalyticSurfelHierarchy> {
+    this.requireOpenProject();
+    const { asset, manifest } = await this.readAnalyticSurfelForAsset(input.assetId);
+    const origin = this.indexOrigin(manifest.bounds);
+    return {
+      assetId: asset.id,
+      sourceAssetId: manifest.sourceAssetId,
+      indexAssetId: manifest.indexAssetId,
+      root: manifest.root,
+      origin,
+      bounds: manifest.bounds,
+      totalSurfels: manifest.totalSurfels,
+      nodes: manifest.nodes.map((node) => ({
+        key: node.key,
+        level: node.level,
+        bounds: node.bounds,
+        surfelCount: node.surfelCount,
+        childKeys: node.childKeys,
+      })),
+    };
+  }
+
+  async loadAnalyticSurfelTiles(
+    input: LoadAnalyticSurfelTilesInput,
+  ): Promise<{ assetId: string; tiles: { key: string; payload: AnalyticSurfelTilePayload }[] }> {
+    this.requireOpenProject();
+    const { asset, surfelDir, manifest } = await this.readAnalyticSurfelForAsset(input.assetId);
+    const nodeByKey = new Map(manifest.nodes.map((node) => [node.key, node]));
+    const origin = this.indexOrigin(manifest.bounds);
+    const tiles: { key: string; payload: AnalyticSurfelTilePayload }[] = [];
+    for (const key of [...new Set(input.keys)]) {
+      const node = nodeByKey.get(key);
+      if (!node) continue;
+      const decoded = await readAnalyticSurfelTile(path.join(surfelDir, ANALYTIC_SURFEL_TILES_DIR), node.tile);
+      const positions = new Float32Array(decoded.positions.length);
+      for (let i = 0; i < decoded.surfelCount; i++) {
+        positions[i * 3] = decoded.positions[i * 3] - origin[0];
+        positions[i * 3 + 1] = decoded.positions[i * 3 + 1] - origin[1];
+        positions[i * 3 + 2] = decoded.positions[i * 3 + 2] - origin[2];
+      }
+      tiles.push({
+        key,
+        payload: {
+          surfelCount: decoded.surfelCount,
+          positions,
+          colors: decoded.colors,
+          radii: decoded.radii,
+          normals: decoded.normals,
+          confidence: decoded.confidence,
+          flags: decoded.flags,
+        },
+      });
+    }
+    return { assetId: asset.id, tiles };
   }
 
   private indexOrigin(bounds: { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number }): [number, number, number] {
@@ -677,6 +888,7 @@ export class ProjectService {
     manifest.simulationLayers.push({
       id: `layer-${artifactId}`,
       simulationId,
+      kind: 'derived-surface',
       name: `${surface.name} (derived)`,
       status: 'active',
       assetId: artifactId,
@@ -750,15 +962,20 @@ export class ProjectService {
     const next = structuredClone(manifest);
     for (const asset of next.assets) {
       if (asset.kind !== 'point-cloud') continue;
-      const layer = next.simulationLayers.find((candidate) => candidate.assetId === asset.id);
+      const previewLayers = next.simulationLayers.filter(
+        (candidate) =>
+          candidate.assetId === asset.id && (candidate.kind === 'point-cloud-preview' || candidate.kind === 'asset'),
+      );
       const sourcePath = this.resolvePointCloudSourcePath(projectFolder, asset);
       const exists = await this.exists(sourcePath);
       asset.warnings = asset.warnings.filter((warning) => warning !== MISSING_SOURCE_WARNING);
       if (!exists) {
         if (!asset.warnings.includes(MISSING_SOURCE_WARNING)) asset.warnings.push(MISSING_SOURCE_WARNING);
-        if (layer) layer.status = 'error';
-      } else if (layer && layer.status === 'error') {
-        layer.status = 'active';
+        for (const layer of previewLayers) layer.status = 'error';
+      } else {
+        for (const layer of previewLayers) {
+          if (layer.status === 'error') layer.status = 'active';
+        }
       }
     }
 
@@ -776,7 +993,50 @@ export class ProjectService {
         asset.warnings.push(`${POINT_CLOUD_INDEX_WARNING_PREFIX} freshness could not be verified from the current source.`);
       }
     }
+
+    for (const asset of next.assets) {
+      if (asset.kind !== ANALYTIC_SURFEL_ASSET_KIND || !asset.analyticSurfel) continue;
+      asset.warnings = asset.warnings.filter(
+        (warning) => warning !== MISSING_DERIVED_SURFEL_WARNING && !isManagedAnalyticSurfelWarning(warning),
+      );
+      const surfelPath = asset.managedPath ? this.resolveManagedPath(projectFolder, asset.managedPath) : null;
+      const layers = next.simulationLayers.filter(
+        (layer) => layer.assetId === asset.id && (layer.kind === 'derived-surfel' || layer.kind === 'asset'),
+      );
+      if (!surfelPath || !(await this.exists(surfelPath))) {
+        asset.warnings.push(MISSING_DERIVED_SURFEL_WARNING);
+        for (const layer of layers) layer.status = 'error';
+        continue;
+      }
+      const sourceAsset = next.assets.find((candidate) => candidate.id === asset.analyticSurfel!.sourceAssetId);
+      if (!sourceAsset) continue;
+      try {
+        const current = await this.computeCurrentSourceFingerprint(projectFolder, sourceAsset);
+        const warning = formatAnalyticSurfelWarning(detectIndexStaleness(asset.analyticSurfel.source, current));
+        if (warning) asset.warnings.push(warning);
+        for (const layer of layers) {
+          if (layer.status === 'error') layer.status = 'active';
+        }
+      } catch {
+        asset.warnings.push('Analytic surfel render freshness could not be verified from the current source.');
+      }
+    }
     return next;
+  }
+
+  private async readAnalyticSurfelForAsset(assetId: string): Promise<{
+    asset: AssetRecord;
+    surfelDir: string;
+    manifest: Awaited<ReturnType<typeof readAnalyticSurfelManifest>>;
+  }> {
+    const folder = this.currentFolder as string;
+    const asset = (this.currentManifest as ProjectManifest).assets.find((candidate) => candidate.id === assetId && candidate.analyticSurfel);
+    if (!asset || !asset.managedPath) {
+      throw new Error(`No analytic surfel asset is registered for asset ${assetId}.`);
+    }
+    const surfelDir = path.dirname(this.resolveManagedPath(folder, asset.managedPath));
+    const manifest = await readAnalyticSurfelManifest(surfelDir);
+    return { asset, surfelDir, manifest };
   }
 
   private async computeCurrentSourceFingerprint(

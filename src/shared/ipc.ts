@@ -1,7 +1,14 @@
 import type {
+  AnalyticSurfelHierarchy,
+  AnalyticSurfelMetricsSummary,
+  AnalyticSurfelProgress,
+  AnalyticSurfelTilePayload,
   CreateProjectInput,
+  GenerateAnalyticSurfelsInput,
   GeneratePointCloudIndexInput,
   ImportPointCloudInput,
+  LoadAnalyticSurfelHierarchyInput,
+  LoadAnalyticSurfelTilesInput,
   LoadPointCloudDensifiedNodesInput,
   LoadPointCloudIndexHierarchyInput,
   LoadPointCloudIndexTilesInput,
@@ -50,11 +57,22 @@ export interface WorkbenchIpc {
     indexAssetId: string;
     metrics: PointCloudIndexMetricsSummary;
   }>;
+  generateAnalyticSurfels(input: GenerateAnalyticSurfelsInput): Promise<{
+    session: ProjectSession;
+    surfelAssetId: string;
+    metrics: AnalyticSurfelMetricsSummary;
+  }>;
   cancelPointCloudIndex(input: GeneratePointCloudIndexInput): Promise<void>;
+  cancelAnalyticSurfels(input: GenerateAnalyticSurfelsInput): Promise<void>;
   loadPointCloudIndexHierarchy(input: LoadPointCloudIndexHierarchyInput): Promise<PointCloudIndexHierarchy>;
   loadPointCloudIndexTiles(input: LoadPointCloudIndexTilesInput): Promise<{
     assetId: string;
     tiles: { key: string; payload: PointCloudNodePayload }[];
+  }>;
+  loadAnalyticSurfelHierarchy(input: LoadAnalyticSurfelHierarchyInput): Promise<AnalyticSurfelHierarchy>;
+  loadAnalyticSurfelTiles(input: LoadAnalyticSurfelTilesInput): Promise<{
+    assetId: string;
+    tiles: { key: string; payload: AnalyticSurfelTilePayload }[];
   }>;
   readDerivedSurfaceArtifact(managedPath: string): Promise<SerializableSurfaceModel>;
   saveProject(manifest: ProjectManifest): Promise<ProjectSession>;
@@ -66,6 +84,7 @@ export interface WorkbenchIpc {
   }>;
   onPointCloudPreviewProgress(listener: (progress: PointCloudPreviewProgress) => void): () => void;
   onPointCloudIndexProgress(listener: (progress: PointCloudIndexProgress) => void): () => void;
+  onAnalyticSurfelProgress(listener: (progress: AnalyticSurfelProgress) => void): () => void;
 }
 
 export function isOpenProjectError(error: unknown): error is OpenProjectError {

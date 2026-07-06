@@ -102,8 +102,21 @@ export function registerWorkbenchIpc(): void {
   );
 
   ipcMain.handle(
+    'workbench:generateAnalyticSurfels',
+    async (event, input: Parameters<WorkbenchIpc['generateAnalyticSurfels']>[0]) =>
+      service.generateAnalyticSurfels(input, (progress) => {
+        event.sender.send('workbench:analyticSurfelProgress', progress);
+      }),
+  );
+
+  ipcMain.handle(
     'workbench:cancelPointCloudIndex',
     (_event, input: Parameters<WorkbenchIpc['cancelPointCloudIndex']>[0]) => service.cancelPointCloudIndex(input),
+  );
+
+  ipcMain.handle(
+    'workbench:cancelAnalyticSurfels',
+    (_event, input: Parameters<WorkbenchIpc['cancelAnalyticSurfels']>[0]) => service.cancelAnalyticSurfels(input),
   );
 
   ipcMain.handle(
@@ -115,6 +128,17 @@ export function registerWorkbenchIpc(): void {
   ipcMain.handle(
     'workbench:loadPointCloudIndexTiles',
     (_event, input: Parameters<WorkbenchIpc['loadPointCloudIndexTiles']>[0]) => service.loadPointCloudIndexTiles(input),
+  );
+
+  ipcMain.handle(
+    'workbench:loadAnalyticSurfelHierarchy',
+    (_event, input: Parameters<WorkbenchIpc['loadAnalyticSurfelHierarchy']>[0]) =>
+      service.loadAnalyticSurfelHierarchy(input),
+  );
+
+  ipcMain.handle(
+    'workbench:loadAnalyticSurfelTiles',
+    (_event, input: Parameters<WorkbenchIpc['loadAnalyticSurfelTiles']>[0]) => service.loadAnalyticSurfelTiles(input),
   );
 
   ipcMain.handle(

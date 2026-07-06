@@ -12,6 +12,7 @@ import { RenderGeotiff } from './RenderGeotiff';
 import { RenderPdf, type PdfRenderableSheet } from './RenderPdf';
 import { RenderPointCloud } from './RenderPointCloud';
 import { StreamingPointCloud, type StreamingHierarchy, type TileFetcher } from './StreamingPointCloud';
+import { StreamingSurfels, type SurfelHierarchy, type SurfelTileFetcher } from './StreamingSurfels';
 import type { FilterState, PointDisplayMode } from './pointCloudLod';
 import { buildNorthGizmo, projectGizmoNorth, GIZMO_SIZE, GIZMO_MARGIN } from './gizmo';
 
@@ -82,6 +83,7 @@ export class ViewerEngine {
   private pdfFootprints = new Map<string, string>();
   private pointClouds = new Map<string, RenderPointCloud>();
   private pointCloudIndexes = new Map<string, StreamingPointCloud>();
+  private analyticSurfels = new Map<string, StreamingSurfels>();
   private handleCounter = 0;
   private activeHandle: string | null = null;
 
@@ -325,6 +327,8 @@ uniform float edlOrtho;
     this.pointClouds.clear();
     for (const p of this.pointCloudIndexes.values()) p.dispose();
     this.pointCloudIndexes.clear();
+    for (const s of this.analyticSurfels.values()) s.dispose();
+    this.analyticSurfels.clear();
     this.postQuad.geometry.dispose();
     this.postQuad.material.dispose();
     this.sceneTarget.dispose();
@@ -352,6 +356,8 @@ uniform float edlOrtho;
     this.pointClouds.clear();
     for (const streaming of this.pointCloudIndexes.values()) streaming.dispose();
     this.pointCloudIndexes.clear();
+    for (const surfels of this.analyticSurfels.values()) surfels.dispose();
+    this.analyticSurfels.clear();
     this.sceneOrigin = null;
     this.sceneRadius = 0;
     this.activeHandle = null;
@@ -490,7 +496,7 @@ uniform float edlOrtho;
     surface.dispose();
     this.surfaces.delete(handle);
     if (this.activeHandle === handle) this.activeHandle = null;
-    if (this.surfaces.size === 0 && this.dxfs.size === 0 && this.geotiffs.size === 0 && this.pdfs.size === 0 && this.pointClouds.size === 0) {
+    if (this.surfaces.size === 0 && this.dxfs.size === 0 && this.geotiffs.size === 0 && this.pdfs.size === 0 && this.pointClouds.size === 0 && this.pointCloudIndexes.size === 0 && this.analyticSurfels.size === 0) {
       this.sceneOrigin = null; // next dataset re-anchors the SceneOrigin (R1)
       this.sceneRadius = 0;
     } else {
@@ -832,6 +838,41 @@ uniform float edlOrtho;
   setPointCloudIndexFilter(handle: string, filter: FilterState): void {
     this.pointCloudIndexes.get(handle)?.setFilter(filter);
     this.requestRender();
+  }
+
+  addAnalyticSurfels(hierarchy: SurfelHierarchy, fetchTiles: SurfelTileFetcher): string {
+    if (this.disposed) throw new Error('ViewerEngine: addAnalyticSurfels after dispose');
+    const wasNull = !this.sceneOrigin;
+    if (!this.sceneOrigin) this.sceneOrigin = hierarchy.origin;
+    if (wasNull) {
+      for (const pdf of this.pdfs.values()) pdf.setOrigin(this.sceneOrigin);
+    }
+    const handle = `sf${++this.handleCounter}`;
+    const surfels = new StreamingSurfels(handle, hierarchy, this.sceneOrigin, fetchTiles, () => this.requestRender());
+    this.analyticSurfels.set(handle, surfels);
+    this.contentGroup.add(surfels.group);
+    this.updateSceneMetrics();
+    this.resetView();
+    this.requestRender();
+    return handle;
+  }
+
+  removeAnalyticSurfels(handle: string): void {
+    const surfels = this.analyticSurfels.get(handle);
+    if (!surfels) return;
+    surfels.dispose();
+    this.analyticSurfels.delete(handle);
+    this.updateSceneMetrics();
+    this.requestRender();
+  }
+
+  setAnalyticSurfelsDisplay(handle: string, visible: boolean, size: number): void {
+    this.analyticSurfels.get(handle)?.setDisplay(visible, size);
+    this.requestRender();
+  }
+
+  getAnalyticSurfelsDisclosure(handle: string): string | null {
+    return this.analyticSurfels.get(handle)?.getDisclosure() ?? null;
   }
 
   getPointCloudIndexDisclosure(handle: string): string | null {
@@ -1446,6 +1487,12 @@ uniform float edlOrtho;
     for (const p of this.pointClouds.values()) {
       if (p.group.visible) bounds.union(p.bounds);
     }
+    for (const p of this.pointCloudIndexes.values()) {
+      if (p.group.visible) bounds.union(p.bounds);
+    }
+    for (const s of this.analyticSurfels.values()) {
+      if (s.group.visible) bounds.union(s.bounds);
+    }
     if (bounds.isEmpty()) return null;
     // contentGroup carries the exaggeration matrix — scale Z for framing math.
     bounds.min.z *= this.exaggeration;
@@ -1732,6 +1779,18 @@ uniform float edlOrtho;
         this.activeCamera instanceof THREE.PerspectiveCamera
           ? THREE.MathUtils.degToRad(this.activeCamera.fov)
           : Math.PI / 3;
+          if (this.analyticSurfels.size > 0) {
+            const viewportHeightPx = this.renderer.domElement.clientHeight || this.renderer.domElement.height || 1;
+            const fovY =
+              this.activeCamera instanceof THREE.PerspectiveCamera
+                ? THREE.MathUtils.degToRad(this.activeCamera.fov)
+                : Math.PI / 3;
+            let surfelChanged = false;
+            for (const surfels of this.analyticSurfels.values()) {
+              if (surfels.update(this.activeCamera, viewportHeightPx, fovY)) surfelChanged = true;
+            }
+            if (surfelChanged) this.renderRequested = true;
+          }
       let indexChanged = false;
       for (const streaming of this.pointCloudIndexes.values()) {
         if (streaming.update(this.activeCamera, viewportHeightPx, fovY)) indexChanged = true;

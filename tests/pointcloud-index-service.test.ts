@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ProjectService } from '../electron/project-service';
@@ -194,5 +194,56 @@ describe('ProjectService.generatePointCloudIndex', () => {
 
     const after = (await svc.openProject({ projectFolder })).manifest;
     expect(after.assets.some((a) => a.kind === 'point-cloud-index')).toBe(false);
+  });
+
+  it('builds analytic surfels from the preview fallback when no index exists', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    const generated = await svc.generateAnalyticSurfels({ assetId });
+
+    const surfelAsset = generated.session.manifest.assets.find((a) => a.id === generated.surfelAssetId)!;
+    expect(surfelAsset.kind).toBe('analytic-surfel-render');
+    expect(surfelAsset.truthStatus).toBe('derived');
+    expect(surfelAsset.analyticSurfel?.sourceAssetId).toBe(assetId);
+    expect(surfelAsset.analyticSurfel?.indexAssetId).toBeNull();
+    expect(generated.metrics.surfelCount).toBeGreaterThan(0);
+    expect(existsSync(path.join(projectFolder, 'derived', assetId, 'surfels', 'index.json'))).toBe(true);
+
+    const hierarchy = await svc.loadAnalyticSurfelHierarchy({ assetId: generated.surfelAssetId });
+    expect(hierarchy.sourceAssetId).toBe(assetId);
+    expect(hierarchy.totalSurfels).toBeGreaterThan(0);
+
+    const { tiles } = await svc.loadAnalyticSurfelTiles({ assetId: generated.surfelAssetId, keys: [hierarchy.root] });
+    expect(tiles).toHaveLength(1);
+    expect(tiles[0]!.payload.surfelCount).toBeGreaterThan(0);
+    expect(tiles[0]!.payload.radii.length).toBe(tiles[0]!.payload.surfelCount);
+  });
+
+  it('builds analytic surfels from an index and survives reopen', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    const index = await svc.generatePointCloudIndex({ assetId });
+    const surfels = await svc.generateAnalyticSurfels({ assetId });
+
+    const surfelAsset = surfels.session.manifest.assets.find((a) => a.id === surfels.surfelAssetId)!;
+    expect(surfelAsset.analyticSurfel?.indexAssetId).toBe(index.indexAssetId);
+
+    await svc.closeProject();
+    const reopened = await svc.openProject({ projectFolder });
+    const reopenedAsset = reopened.manifest.assets.find((a) => a.id === surfels.surfelAssetId);
+    expect(reopenedAsset?.truthStatus).toBe('derived');
+    expect(reopenedAsset?.warnings ?? []).toEqual([]);
+  });
+
+  it('marks a missing analytic surfel artifact as error on reopen without crashing', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    const surfels = await svc.generateAnalyticSurfels({ assetId });
+
+    await rm(path.join(projectFolder, 'derived', assetId, 'surfels'), { recursive: true, force: true });
+    await svc.closeProject();
+
+    const reopened = await svc.openProject({ projectFolder });
+    const surfelAsset = reopened.manifest.assets.find((a) => a.id === surfels.surfelAssetId);
+    const surfelLayer = reopened.manifest.simulationLayers.find((layer) => layer.assetId === surfels.surfelAssetId);
+    expect(surfelAsset?.warnings.some((warning) => warning.includes('Regenerate'))).toBe(true);
+    expect(surfelLayer?.status).toBe('error');
   });
 });

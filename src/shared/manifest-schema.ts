@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { POINT_CLOUD_INDEX_ASSET_KIND } from './pointcloud-index';
+import { ANALYTIC_SURFEL_ASSET_KIND } from './analytic-surfels';
 
 export const truthStatusSchema = z.enum([
   'source',
@@ -13,6 +14,13 @@ export const truthStatusSchema = z.enum([
 ]);
 
 export const simulationLayerStatusSchema = z.enum(['active', 'hidden', 'error']);
+export const simulationLayerKindSchema = z.enum([
+  'asset',
+  'point-cloud-preview',
+  'point-cloud-index',
+  'derived-surface',
+  'derived-surfel',
+]);
 
 const boundsSchema = z.object({
   minX: z.number(),
@@ -41,6 +49,25 @@ const pointCloudIndexSchema = z.object({
   scale: xyzTupleSchema,
   offset: xyzTupleSchema,
   units: z.string().min(1),
+  generatedAt: z.string().min(1),
+  generator: z.object({
+    name: z.literal('workbench'),
+    version: z.string().min(1),
+  }),
+});
+
+const analyticSurfelSchema = z.object({
+  sourceAssetId: z.string().min(1),
+  indexAssetId: z.string().nullable(),
+  surfelType: z.literal('analytic-surfel-octree'),
+  surfelVersion: z.literal(1),
+  source: z.object({
+    headerSha256: z.string().min(1),
+    fileSize: z.number().nonnegative(),
+    mtimeMs: z.number().nullable(),
+  }),
+  surfelCount: z.number().nonnegative(),
+  bounds: boundsSchema,
   generatedAt: z.string().min(1),
   generator: z.object({
     name: z.literal('workbench'),
@@ -82,11 +109,13 @@ const assetRecordSchema = z.object({
     })
     .optional(),
   pointCloudIndex: pointCloudIndexSchema.optional(),
+  analyticSurfel: analyticSurfelSchema.optional(),
 });
 
 const simulationLayerSchema = z.object({
   id: z.string().min(1),
   simulationId: z.string().min(1),
+  kind: simulationLayerKindSchema.default('asset'),
   name: z.string().min(1),
   status: simulationLayerStatusSchema,
   assetId: z.string().nullable(),
@@ -190,6 +219,25 @@ export const projectManifestSchema = z
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `point-cloud index asset ${asset.id} references unknown sourceAssetId ${asset.pointCloudIndex.sourceAssetId}`,
+        });
+      }
+      const isAnalyticSurfelAsset = asset.kind === ANALYTIC_SURFEL_ASSET_KIND && asset.truthStatus === 'derived';
+      if ((asset.analyticSurfel !== undefined) !== isAnalyticSurfelAsset) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `asset ${asset.id}: analyticSurfel metadata must be present exactly when kind is '${ANALYTIC_SURFEL_ASSET_KIND}' and truthStatus is 'derived'`,
+        });
+      }
+      if (asset.analyticSurfel && !assetIds.has(asset.analyticSurfel.sourceAssetId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `analytic surfel asset ${asset.id} references unknown sourceAssetId ${asset.analyticSurfel.sourceAssetId}`,
+        });
+      }
+      if (asset.analyticSurfel?.indexAssetId && !assetIds.has(asset.analyticSurfel.indexAssetId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `analytic surfel asset ${asset.id} references unknown indexAssetId ${asset.analyticSurfel.indexAssetId}`,
         });
       }
     }

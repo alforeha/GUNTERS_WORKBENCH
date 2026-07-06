@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = '1.2.0';
+export const SCHEMA_VERSION = '1.3.0';
 
 export type TruthStatus =
   | 'source'
@@ -12,6 +12,12 @@ export type TruthStatus =
 
 export type FeatureType = 'marker' | 'polyline' | 'measurement';
 export type SimulationLayerStatus = 'active' | 'hidden' | 'error';
+export type SimulationLayerKind =
+  | 'asset'
+  | 'point-cloud-preview'
+  | 'point-cloud-index'
+  | 'derived-surface'
+  | 'derived-surfel';
 
 export interface AssetRecord {
   id: string;
@@ -30,6 +36,7 @@ export interface AssetRecord {
   };
   pointCloud?: PointCloudAssetMetadata;
   pointCloudIndex?: PointCloudIndexMetadata;
+  analyticSurfel?: AnalyticSurfelMetadata;
 }
 
 export interface PointCloudBoundsBox {
@@ -93,6 +100,22 @@ export interface PointCloudAssetMetadata {
   headerSha256: string;
 }
 
+export interface AnalyticSurfelMetadata {
+  sourceAssetId: string;
+  indexAssetId: string | null;
+  surfelType: 'analytic-surfel-octree';
+  surfelVersion: 1;
+  source: {
+    headerSha256: string;
+    fileSize: number;
+    mtimeMs: number | null;
+  };
+  surfelCount: number;
+  bounds: PointCloudBoundsBox;
+  generatedAt: string;
+  generator: { name: 'workbench'; version: string };
+}
+
 export interface RealitySimulation {
   id: string;
   name: string;
@@ -108,6 +131,7 @@ export interface RealitySimulation {
 export interface SimulationLayer {
   id: string;
   simulationId: string;
+  kind: SimulationLayerKind;
   name: string;
   status: SimulationLayerStatus;
   assetId: string | null;
@@ -287,6 +311,61 @@ export interface LoadPointCloudIndexHierarchyInput {
 }
 
 export interface LoadPointCloudIndexTilesInput {
+  assetId: string;
+  keys: string[];
+}
+
+export interface GenerateAnalyticSurfelsInput {
+  assetId: string;
+}
+
+export interface AnalyticSurfelProgress {
+  assetId: string;
+  label: string;
+  pct: number | null;
+}
+
+export interface AnalyticSurfelMetricsSummary {
+  surfelCount: number;
+  nodeCount: number;
+  outputSizeBytes: number;
+  wallTimeMs: number;
+}
+
+export interface AnalyticSurfelHierarchyNode {
+  key: string;
+  level: number;
+  bounds: PointCloudBoundsBox;
+  surfelCount: number;
+  childKeys: string[];
+}
+
+export interface AnalyticSurfelHierarchy {
+  assetId: string;
+  sourceAssetId: string;
+  indexAssetId: string | null;
+  root: string;
+  origin: [number, number, number];
+  bounds: PointCloudBoundsBox;
+  totalSurfels: number;
+  nodes: AnalyticSurfelHierarchyNode[];
+}
+
+export interface AnalyticSurfelTilePayload {
+  surfelCount: number;
+  positions: Float32Array;
+  colors: Uint8Array;
+  radii: Float32Array;
+  normals: Float32Array;
+  confidence: Float32Array;
+  flags: Uint8Array;
+}
+
+export interface LoadAnalyticSurfelHierarchyInput {
+  assetId: string;
+}
+
+export interface LoadAnalyticSurfelTilesInput {
   assetId: string;
   keys: string[];
 }
