@@ -53,7 +53,7 @@ export interface PointCloudIndexMetadata {
   /** Points back to the immutable source point-cloud asset. */
   sourceAssetId: string;
   indexType: PointCloudIndexType;
-  indexVersion: 1;
+  indexVersion: 1 | 1.1;
   source: {
     headerSha256: string;
     fileSize: number;
@@ -255,6 +255,11 @@ export interface PointCloudIndexMetricsSummary {
   maxDepthUsed: number;
   wallTimeMs: number;
   peakBufferedBytes: number;
+  peakVoxelBytes: number;
+  nodeCount: number;
+  maxChainDepth: number;
+  largestNodePoints: number;
+  largestBufferBytes: number;
 }
 
 export interface PointCloudIndexHierarchyNode {

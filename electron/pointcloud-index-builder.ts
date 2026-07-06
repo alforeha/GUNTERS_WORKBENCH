@@ -8,7 +8,9 @@
 // is NOT COPC. No external tooling. The source file is read but never written.
 
 import { appendFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { gunzipSync, gzipSync } from 'node:zlib';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { createGzip, gunzipSync } from 'node:zlib';
+import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import type { PointCloudBounds } from '../src/core/contract';
 import { parseLasMetadata } from '../src/core/las/metadata';
@@ -34,11 +36,23 @@ const MIN_NODE_EXTENT = 1e-3;
 const READ_CHUNK_POINTS = 1_000_000;
 /** Flush spooled tile records to disk once buffered bytes cross this ceiling. */
 const FLUSH_BYTES = 128 * 1024 * 1024;
+/** Per-node buffer ceiling — any single node flushes to disk when it crosses this. */
+const PER_NODE_BUFFER_CAP = 64 * 1024 * 1024;
 const LAS_HEADER_BYTES = 375;
 
 export const WPI_INDEX_MANIFEST_FILE = 'index.json';
 export const WPI_INDEX_COMPLETE_MARKER = 'COMPLETE';
 export const WPI_INDEX_TILES_DIR = 'tiles';
+
+/** Per-dimension voxel cells for the claim grid at each node — one sample per cell. */
+export function voxelCellsPerDim(nodeCapacity: number): number {
+  return Math.max(8, Math.ceil(Math.cbrt(nodeCapacity)));
+}
+
+/** Total claim cells per node (cubed). */
+export function voxelCellsTotal(cellsPerDim: number): number {
+  return cellsPerDim * cellsPerDim * cellsPerDim;
+}
 
 // ── on-disk index.json shape ────────────────────────────────────────────────────
 export interface WpiIndexNode {
@@ -54,7 +68,7 @@ export interface WpiIndexNode {
 }
 
 export interface WpiIndexManifest {
-  wpiIndexVersion: 1;
+  wpiIndexVersion: 1.1;
   indexType: 'wpi-octree';
   generator: { name: 'workbench'; version: string };
   generatedAt: string;
@@ -74,6 +88,7 @@ export interface WpiIndexManifest {
   hasRgb: boolean;
   tileByteLayout: ReturnType<typeof wpiTileByteLayout>;
   nodeCapacity: number;
+  voxelGridDim: number;
   maxDepth: number;
   tileCount: number;
   storedPointCount: number;
@@ -104,6 +119,11 @@ export interface BuildPointCloudIndexMetrics {
   maxDepthUsed: number;
   wallTimeMs: number;
   peakBufferedBytes: number;
+  peakVoxelBytes: number;
+  nodeCount: number;
+  maxChainDepth: number;
+  largestNodePoints: number;
+  largestBufferBytes: number;
 }
 
 export interface BuildPointCloudIndexResult {
@@ -154,9 +174,10 @@ function childBounds(bounds: PointCloudBounds, idx: number): PointCloudBounds {
 
 class BuildNode {
   ownCount = 0;
-  seen = 0;
   written = 0;
   children: (BuildNode | null)[] | null = null;
+  /** Lazily-allocated voxel-claim bitset (1 bit per cell, tracked for peak-memory reporting). */
+  voxelBits: Uint8Array | null = null;
 
   constructor(
     readonly level: number,
@@ -169,6 +190,16 @@ class BuildNode {
   get key(): string {
     return `${this.level}-${this.x}-${this.y}-${this.z}`;
   }
+
+  /** Allocate the voxel-claim bitset for this node (cellsPerDim^3 cells, 1 bit each). */
+  ensureVoxelBits(cellsPerDim: number): void {
+    if (this.voxelBits) return;
+    const total = voxelCellsTotal(cellsPerDim);
+    this.voxelBits = new Uint8Array(Math.ceil(total / 8));
+  }
+
+  /** Return the peak bytes occupied by voxel-claim bitsets across the tree. */
+  static peakVoxelBytes = 0;
 }
 
 function canSplit(node: BuildNode, maxDepth: number): boolean {
@@ -186,45 +217,111 @@ function childNode(parent: BuildNode, idx: number): BuildNode {
   );
 }
 
-/** Pass 1: place a point, splitting a node once it exceeds capacity (owner partition). */
-function insertPoint(root: BuildNode, wx: number, wy: number, wz: number, capacity: number, maxDepth: number): void {
+// ── voxel-claim helpers ────────────────────────────────────────────────────────
+function voxelCellIndex(bounds: PointCloudBounds, wx: number, wy: number, wz: number, cellsPerDim: number): number {
+  const extent = bounds.maxX - bounds.minX;
+  const cellSize = extent / cellsPerDim;
+  const cx = Math.min(cellsPerDim - 1, Math.max(0, Math.floor((wx - bounds.minX) / cellSize)));
+  const cy = Math.min(cellsPerDim - 1, Math.max(0, Math.floor((wy - bounds.minY) / cellSize)));
+  const cz = Math.min(cellsPerDim - 1, Math.max(0, Math.floor((wz - bounds.minZ) / cellSize)));
+  return cx + cy * cellsPerDim + cz * cellsPerDim * cellsPerDim;
+}
+
+function isVoxelClaimed(node: BuildNode, cellIdx: number): boolean {
+  if (!node.voxelBits) return false;
+  const byteIdx = cellIdx >>> 3;
+  const bit = 1 << (cellIdx & 7);
+  return (node.voxelBits[byteIdx]! & bit) !== 0;
+}
+
+function claimVoxel(node: BuildNode, cellsPerDim: number, cellIdx: number): void {
+  node.ensureVoxelBits(cellsPerDim);
+  const byteIdx = cellIdx >>> 3;
+  const bit = 1 << (cellIdx & 7);
+  node.voxelBits![byteIdx]! |= bit;
+}
+
+function trackPeakVoxelBytes(nodes: BuildNode[]): void {
+  let total = 0;
+  for (const node of nodes) {
+    if (node.voxelBits) total += node.voxelBits.byteLength;
+  }
+  if (total > BuildNode.peakVoxelBytes) BuildNode.peakVoxelBytes = total;
+}
+
+/** Clear voxel claims between passes so pass-2 replay starts with a fresh slate. */
+function clearVoxelClaims(nodes: BuildNode[]): void {
+  for (const node of nodes) {
+    if (node.voxelBits) {
+      node.voxelBits.fill(0);
+    }
+  }
+}
+
+/** Pass 1: place a point via voxel-claim decimation.  A point is owned at the shallowest
+ *  node where its voxel cell is unclaimed.  If the cell was already claimed by an earlier
+ *  point (same file-order pass), the point drops to the child, same as the original
+ *  owner-partition but with spatial uniformity instead of first-N-in-order.
+ *
+ *  minOwnedForSplit prevents early splitting when only a few cells are filled — the node
+ *  must own at least this many points before it can create children.  This bounds node
+ *  count in clustered data without changing the lossless-union invariant.  Leaves own
+ *  whatever reaches them regardless. */
+function insertPoint(
+  root: BuildNode,
+  wx: number,
+  wy: number,
+  wz: number,
+  cellsPerDim: number,
+  maxDepth: number,
+  minOwnedForSplit: number,
+): void {
   let cur = root;
   for (;;) {
-    if (cur.children) {
-      const idx = childIndex(cur.bounds, wx, wy, wz);
-      let child = cur.children[idx];
-      if (!child) {
-        child = childNode(cur, idx);
-        cur.children[idx] = child;
-      }
-      cur = child;
-      continue;
-    }
-    if (cur.ownCount < capacity || !canSplit(cur, maxDepth)) {
+    const cellIdx = voxelCellIndex(cur.bounds, wx, wy, wz, cellsPerDim);
+    if (!isVoxelClaimed(cur, cellIdx)) {
+      claimVoxel(cur, cellsPerDim, cellIdx);
       cur.ownCount++;
       return;
     }
-    // At capacity and splittable: keep the owned points, route this one down.
-    cur.children = new Array<BuildNode | null>(8).fill(null);
-    const idx = childIndex(cur.bounds, wx, wy, wz);
-    const child = childNode(cur, idx);
-    cur.children[idx] = child;
+    // Voxel already claimed — only split when the node has filled enough cells.
+    if (cur.ownCount < minOwnedForSplit || !canSplit(cur, maxDepth)) {
+      cur.ownCount++;
+      return;
+    }
+    if (!cur.children) {
+      cur.children = new Array<BuildNode | null>(8).fill(null);
+    }
+    const childIdx = childIndex(cur.bounds, wx, wy, wz);
+    let child = cur.children[childIdx];
+    if (!child) {
+      child = childNode(cur, childIdx);
+      cur.children[childIdx] = child;
+    }
     cur = child;
   }
 }
 
-/** Pass 2: re-derive the owner of a point in the same file order as pass 1. */
-function routePoint(root: BuildNode, wx: number, wy: number, wz: number): BuildNode {
+/** Pass 2: re-derive the owner of a point, replaying voxel claims in the same file order
+ *  as pass 1 so ownership is deterministic. */
+function routePoint(
+  root: BuildNode,
+  wx: number,
+  wy: number,
+  wz: number,
+  cellsPerDim: number,
+): BuildNode {
   let cur = root;
   for (;;) {
-    if (!cur.children) return cur; // leaf owns everything routed to it
-    if (cur.seen < cur.ownCount) {
-      cur.seen++;
-      return cur; // among the first `ownCount` arrivals — owned here, as in pass 1
+    const cellIdx = voxelCellIndex(cur.bounds, wx, wy, wz, cellsPerDim);
+    if (!isVoxelClaimed(cur, cellIdx)) {
+      claimVoxel(cur, cellsPerDim, cellIdx);
+      return cur;
     }
-    const idx = childIndex(cur.bounds, wx, wy, wz);
-    const child = cur.children[idx];
-    if (!child) return cur; // defensive: never seen in practice; keeps the point in a real tile
+    if (!cur.children) return cur;
+    const childIdx = childIndex(cur.bounds, wx, wy, wz);
+    const child = cur.children[childIdx];
+    if (!child) return cur;
     cur = child;
   }
 }
@@ -291,12 +388,17 @@ interface SpoolEntry {
   buf: Buffer;
   view: DataView;
   len: number;
+  bytesOnDisk: number;
 }
 
 class TileSpooler {
   private readonly entries = new Map<BuildNode, SpoolEntry>();
+  private readonly hotNodes = new Set<BuildNode>();
   private globalBytes = 0;
   peakBytes = 0;
+  largestNodePoints = 0;
+  largestNodeBufferBytes = 0;
+  readonly nodeCount = 0; // set by build after collectNodes
   private readonly initialBytes: number;
 
   constructor(
@@ -304,19 +406,19 @@ class TileSpooler {
     private readonly hasRgb: boolean,
     private readonly stride: number,
   ) {
-    this.initialBytes = stride * 256;
+    this.initialBytes = Math.min(stride * 256, PER_NODE_BUFFER_CAP);
   }
 
   private makeEntry(): SpoolEntry {
     const buf = Buffer.allocUnsafe(this.initialBytes);
-    return { buf, view: new DataView(buf.buffer, buf.byteOffset, buf.length), len: 0 };
+    return { buf, view: new DataView(buf.buffer, buf.byteOffset, buf.length), len: 0, bytesOnDisk: 0 };
   }
 
   private rawPath(node: BuildNode): string {
     return path.join(this.tilesDir, `${node.key}.raw`);
   }
 
-  /** Synchronous: fills an in-memory bucket only. IO happens later in flushAll(). */
+  /** Synchronous: fills an in-memory bucket only. IO happens via flushNode / flushAll. */
   write(node: BuildNode, rec: Parameters<typeof writeWpiRecord>[2]): void {
     let entry = this.entries.get(node);
     if (!entry) {
@@ -334,24 +436,55 @@ class TileSpooler {
     node.written++;
     this.globalBytes += this.stride;
     if (this.globalBytes > this.peakBytes) this.peakBytes = this.globalBytes;
+    if (entry.len >= PER_NODE_BUFFER_CAP && !this.hotNodes.has(node)) {
+      this.hotNodes.add(node);
+    }
   }
 
-  /** Whether buffered bytes have crossed the flush ceiling since the last flush. */
+  /** Flush a single hot node to disk and reset its buffer. */
+  async flushNode(node: BuildNode): Promise<void> {
+    const entry = this.entries.get(node);
+    if (!entry || entry.len === 0) return;
+    this.globalBytes -= entry.len;
+    if (entry.len > this.largestNodeBufferBytes) this.largestNodeBufferBytes = entry.len;
+    await appendFile(this.rawPath(node), entry.buf.subarray(0, entry.len));
+    entry.bytesOnDisk += entry.len;
+    entry.len = 0;
+    this.hotNodes.delete(node);
+    if (entry.buf.length > this.initialBytes) {
+      entry.buf = Buffer.allocUnsafe(this.initialBytes);
+      entry.view = new DataView(entry.buf.buffer, entry.buf.byteOffset, entry.buf.length);
+    }
+  }
+
+  /** Post-pass-2: record per-node point count max for reporting. */
+  recordLargestNode(node: BuildNode): void {
+    if (node.written > this.largestNodePoints) this.largestNodePoints = node.written;
+  }
+
+  /** Whether global buffered bytes have crossed the flush ceiling. */
   shouldFlush(): boolean {
     return this.globalBytes >= FLUSH_BYTES;
   }
 
+  async flushHotNodes(): Promise<void> {
+    const nodes = [...this.hotNodes];
+    for (const node of nodes) await this.flushNode(node);
+  }
+
   async flushAll(): Promise<void> {
-    // Appends are sequential and awaited, so a bucket's buffer is never mutated mid-write.
     for (const [node, entry] of this.entries) {
       if (entry.len === 0) continue;
+      if (entry.len > this.largestNodeBufferBytes) this.largestNodeBufferBytes = entry.len;
       await appendFile(this.rawPath(node), entry.buf.subarray(0, entry.len));
+      entry.bytesOnDisk += entry.len;
       entry.len = 0;
       if (entry.buf.length > this.initialBytes) {
         entry.buf = Buffer.allocUnsafe(this.initialBytes);
         entry.view = new DataView(entry.buf.buffer, entry.buf.byteOffset, entry.buf.length);
       }
     }
+    this.hotNodes.clear();
     this.globalBytes = 0;
   }
 }
@@ -370,11 +503,14 @@ function collectNodes(root: BuildNode): BuildNode[] {
 
 export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Promise<BuildPointCloudIndexResult> {
   const started = Date.now();
+  BuildNode.peakVoxelBytes = 0;
   const shouldCancel = input.shouldCancel ?? (() => false);
   const yieldTick = input.yieldTick ?? (() => new Promise<void>((resolve) => setImmediate(resolve)));
   const onProgress = input.onProgress ?? (() => {});
   const nodeCapacity = input.nodeCapacity ?? WPI_NODE_CAPACITY;
   const maxDepth = input.maxDepth ?? WPI_MAX_DEPTH;
+  const cellsPerDim = voxelCellsPerDim(nodeCapacity);
+  const minOwnedForSplit = Math.max(1, Math.floor(voxelCellsTotal(cellsPerDim) / 4));
 
   const tilesDir = path.join(input.outDir, WPI_INDEX_TILES_DIR);
   await rm(input.outDir, { recursive: true, force: true });
@@ -412,7 +548,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
       const wx = view.getInt32(o, true) * sx + ox;
       const wy = view.getInt32(o + 4, true) * sy + oy;
       const wz = view.getInt32(o + 8, true) * sz + oz;
-      insertPoint(root, wx, wy, wz, nodeCapacity, maxDepth);
+      insertPoint(root, wx, wy, wz, cellsPerDim, maxDepth, minOwnedForSplit);
     },
     async (processed) => {
       onProgress(
@@ -425,6 +561,8 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
   );
 
   const nodes = collectNodes(root);
+  trackPeakVoxelBytes(nodes);
+  clearVoxelClaims(nodes);
   const stride = wpiRecordStride(hasRgb);
   const spooler = new TileSpooler(tilesDir, hasRgb, stride);
 
@@ -439,7 +577,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
       const wx = ix * sx + ox;
       const wy = iy * sy + oy;
       const wz = iz * sz + oz;
-      const node = routePoint(root, wx, wy, wz);
+      const node = routePoint(root, wx, wy, wz, cellsPerDim);
       spooler.write(node, {
         x: ix,
         y: iy,
@@ -454,6 +592,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
     },
     async (processed) => {
       if (spooler.shouldFlush()) await spooler.flushAll();
+      else await spooler.flushHotNodes();
       onProgress(
         `writing index tiles (${processed.toLocaleString()} / ${meta.pointCount.toLocaleString()})...`,
         Math.min(89, 50 + Math.round((processed / Math.max(meta.pointCount, 1)) * 39)),
@@ -464,7 +603,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
   );
   await spooler.flushAll();
 
-  // Finalize — gzip each node's raw records into a tile.
+  // Finalize — stream-gzip each node's raw records into a tile.
   const manifestNodes: WpiIndexNode[] = [];
   let tileCount = 0;
   let storedPointCount = 0;
@@ -472,23 +611,57 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
   let maxDepthUsed = 0;
   const headerBuf = Buffer.alloc(WPI_TILE_HEADER_BYTES);
   const headerView = new DataView(headerBuf.buffer, headerBuf.byteOffset, headerBuf.length);
+  let maxChainDepth = 0;
+
+  // Instrumentation: chain depth
+  {
+    const depthByKey = new Map<string, number>();
+    depthByKey.set(root.key, 0);
+    for (const node of nodes) {
+      if (node.level > maxDepthUsed) maxDepthUsed = node.level;
+      if (node.children) {
+        const pd = depthByKey.get(node.key) ?? 0;
+        let childCount = 0;
+        for (const child of node.children) {
+          if (!child) continue;
+          childCount++;
+          depthByKey.set(child.key, pd + 1);
+        }
+        if (childCount === 1) {
+          const chainDepth = pd + 1;
+          if (chainDepth > maxChainDepth) maxChainDepth = chainDepth;
+        }
+      }
+    }
+  }
 
   for (let n = 0; n < nodes.length; n++) {
     if (shouldCancel()) throw new PointCloudIndexCancelled();
     const node = nodes[n]!;
     if (node.written === 0) continue;
+    spooler.recordLargestNode(node);
+
     const rawPath = path.join(tilesDir, `${node.key}.raw`);
-    const raw = await readFile(rawPath);
-    const count = Math.floor(raw.length / stride);
+    const rawStats = await stat(rawPath);
+    const count = Math.floor(rawStats.size / stride);
     writeWpiTileHeader(headerView, 0, count, hasRgb);
-    const gz = gzipSync(Buffer.concat([headerBuf, raw]));
+
     const tileRel = `${WPI_INDEX_TILES_DIR}/${node.key}.bin.gz`;
-    await writeFile(path.join(input.outDir, tileRel), gz);
+    const tilePath = path.join(input.outDir, tileRel);
+    try {
+      const gzip = createGzip();
+      gzip.write(headerBuf.subarray(0, WPI_TILE_HEADER_BYTES));
+      await pipeline(createReadStream(rawPath), gzip, createWriteStream(tilePath));
+    } catch (err) {
+      const rawSize = rawStats.size;
+      const msg = `WPI tile finalize failed for node ${node.key} (${count.toLocaleString()} pts, raw ${(rawSize / 1e6).toFixed(1)} MB): ${err instanceof Error ? err.message : String(err)}`;
+      throw new Error(msg);
+    }
     await rm(rawPath, { force: true });
 
     tileCount++;
     storedPointCount += count;
-    indexSizeBytes += gz.length;
+    indexSizeBytes += (await stat(tilePath)).size;
     if (node.level > maxDepthUsed) maxDepthUsed = node.level;
     manifestNodes.push({
       key: node.key,
@@ -517,7 +690,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
   }
 
   const manifest: WpiIndexManifest = {
-    wpiIndexVersion: 1,
+    wpiIndexVersion: 1.1,
     indexType: 'wpi-octree',
     generator: { name: 'workbench', version: input.generatorVersion },
     generatedAt: new Date().toISOString(),
@@ -537,6 +710,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
     hasRgb,
     tileByteLayout: wpiTileByteLayout(hasRgb),
     nodeCapacity,
+    voxelGridDim: cellsPerDim,
     maxDepth,
     tileCount,
     storedPointCount,
@@ -571,6 +745,11 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
       maxDepthUsed,
       wallTimeMs: Date.now() - started,
       peakBufferedBytes: spooler.peakBytes,
+      peakVoxelBytes: BuildNode.peakVoxelBytes,
+      nodeCount: nodes.length,
+      maxChainDepth,
+      largestNodePoints: spooler.largestNodePoints,
+      largestBufferBytes: spooler.largestNodeBufferBytes,
     },
   };
 }

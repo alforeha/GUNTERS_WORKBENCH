@@ -16,7 +16,7 @@ export const POINT_CLOUD_INDEX_VERSION = 1;
 /** Generator identity recorded on every index so provenance is honest. */
 export const POINT_CLOUD_INDEX_GENERATOR_NAME = 'workbench';
 /** Semantic version of the WPI builder; stamped into generator.version on each index. */
-export const POINT_CLOUD_INDEX_BUILDER_VERSION = '1.0.0';
+export const POINT_CLOUD_INDEX_BUILDER_VERSION = '1.1.0';
 
 /** All friendly index warnings share this prefix so open-time checks can dedupe them. */
 export const POINT_CLOUD_INDEX_WARNING_PREFIX = 'Point-cloud index';
@@ -112,6 +112,19 @@ export function formatStaleIndexWarning(result: IndexStalenessResult): string | 
 /** Whether a warning string is one this module produced (for idempotent open-time dedupe). */
 export function isManagedIndexWarning(warning: string): boolean {
   return warning.startsWith(POINT_CLOUD_INDEX_WARNING_PREFIX);
+}
+
+/**
+ * Detect when an index was built with an older WPI format version than the current builder.
+ * Returns a friendly upgrade warning string, or null if the index is already at the current
+ * version.  This is separate from source-staleness — the index is still structurally valid
+ * but the user should rebuild to get the improved voxel-decimated overview tiles.
+ */
+export function formatIndexVersionWarning(storedVersion: number): string | null {
+  if (storedVersion < 1.1) {
+    return `${POINT_CLOUD_INDEX_WARNING_PREFIX} format has been updated (v${storedVersion} → v1.1). Rebuild index for improved overview coverage.`;
+  }
+  return null;
 }
 
 /**

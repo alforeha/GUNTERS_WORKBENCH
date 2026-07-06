@@ -84,9 +84,10 @@ sampled or derived display presented as measured source truth.
 
 ## 6. Scope classification
 
-- **NOW:** WPI v1 index model + generation; SSE tile streaming; densification
-  demotion; indexed-full truth path; analytic surfel derived layer (model +
-  minimal render); points⇄surfels toggle; disclosure; persistence; metrics.
+- **NOW:** WPI v1.1 index model (voxel-decimated overview tiles for uniform coarse
+  coverage) + generation; SSE tile streaming; densification demotion; indexed-full
+  truth path; analytic surfel derived layer (model + minimal render); points⇄surfels
+  toggle; disclosure; persistence; metrics.
 - **NEXT:** source-snapped markers/polylines/measurements; region-based
   full-detail extraction; walk-mode prototype; continuous radius density.
 - **RESERVED:** classification controls; transformation controls;

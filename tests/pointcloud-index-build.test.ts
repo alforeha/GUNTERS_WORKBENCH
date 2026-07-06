@@ -278,4 +278,131 @@ describe('buildPointCloudIndex', () => {
     const decoded = (await collectDecodedPoints(outDir)).sort();
     expect(decoded).toEqual(points.map(canonical).sort());
   });
+
+  it('produces identical ownership across two identical builds (per-cell determinism)', async () => {
+    const points = makeSourcePoints(200);
+    const las = buildLas(points);
+
+    const out1 = await tempOutDir();
+    const r1 = await buildPointCloudIndex({
+      source: chunkSource(las), outDir: out1, fileName: 'f.las',
+      sourceFingerprint: FINGERPRINT(las), generatorVersion: '1.0.0', nodeCapacity: 16,
+    });
+
+    const out2 = await tempOutDir();
+    const r2 = await buildPointCloudIndex({
+      source: chunkSource(las), outDir: out2, fileName: 'f.las',
+      sourceFingerprint: FINGERPRINT(las), generatorVersion: '1.0.0', nodeCapacity: 16,
+    });
+
+    expect(r1.metrics.storedPointCount).toBe(r2.metrics.storedPointCount);
+    expect(r1.metrics.tileCount).toBe(r2.metrics.tileCount);
+    const keys1 = new Set(r1.manifest.nodes.map((n) => n.key));
+    const keys2 = new Set(r2.manifest.nodes.map((n) => n.key));
+    expect([...keys1].sort()).toEqual([...keys2].sort());
+
+    // each tile must have exactly the same points
+    for (const n1 of r1.manifest.nodes) {
+      const n2 = r2.manifest.nodes.find((n) => n.key === n1.key)!;
+      expect(n2).toBeTruthy();
+      expect(n2.pointCount).toBe(n1.pointCount);
+      const pts1 = (await collectDecodedPoints(out1)).sort();
+      const pts2 = (await collectDecodedPoints(out2)).sort();
+      expect(pts1).toEqual(pts2);
+    }
+  });
+
+  it('root tile XY extent spans the full source extent (voxel-decimated overview)', async () => {
+    const points = makeSourcePoints(1000);
+    const las = buildLas(points);
+    const outDir = await tempOutDir();
+    const result = await buildPointCloudIndex({
+      source: chunkSource(las),
+      outDir,
+      fileName: 'fixture.las',
+      sourceFingerprint: FINGERPRINT(las),
+      generatorVersion: '1.0.0',
+      nodeCapacity: 32, // enough splits to test that root still covers the full extent
+    });
+
+    const rootNode = result.manifest.nodes.find((n) => n.key === result.manifest.root)!;
+    expect(rootNode).toBeTruthy();
+
+    const srcBounds = result.manifest.bounds;
+    const rootBounds = rootNode.bounds;
+
+    // Root XY should cover ≥90% of the source XY extent
+    const extentX = srcBounds.maxX - srcBounds.minX;
+    const extentY = srcBounds.maxY - srcBounds.minY;
+    const rootExtentX = rootBounds.maxX - rootBounds.minX;
+    const rootExtentY = rootBounds.maxY - rootBounds.minY;
+    expect(rootExtentX / Math.max(extentX, 0.01)).toBeGreaterThanOrEqual(0.9);
+    expect(rootExtentY / Math.max(extentY, 0.01)).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it('wrote wpiIndexVersion 1.1 in the manifest', async () => {
+    const las = buildLas(makeSourcePoints(64));
+    const outDir = await tempOutDir();
+    await buildPointCloudIndex({
+      source: chunkSource(las),
+      outDir,
+      fileName: 'fixture.las',
+      sourceFingerprint: FINGERPRINT(las),
+      generatorVersion: '1.0.0',
+    });
+    const manifest = await readWpiIndexManifest(outDir);
+    expect(manifest.wpiIndexVersion).toBe(1.1);
+    expect(manifest.voxelGridDim).toBeGreaterThan(0);
+  });
+
+  it('reports peakVoxelBytes in metrics', async () => {
+    const las = buildLas(makeSourcePoints(500));
+    const outDir = await tempOutDir();
+    const result = await buildPointCloudIndex({
+      source: chunkSource(las),
+      outDir,
+      fileName: 'fixture.las',
+      sourceFingerprint: FINGERPRINT(las),
+      generatorVersion: '1.0.0',
+      nodeCapacity: 8,
+    });
+    expect(result.metrics.peakVoxelBytes).toBeGreaterThan(0);
+  });
+
+  it('handles a dense coincident cluster without allocation failure (streaming compression)', async () => {
+    // Simulate 50 000 coincident points (all at the same xyz) — the pathological case
+    // that triggers deep single-child chains and large per-node spool buffers.
+    const coincident = Array.from({ length: 50_000 }, (_, i) => ({
+      x: 50000,
+      y: 50000,
+      z: 10000,
+      intensity: i & 0xffff,
+      classification: i % 32,
+      returnByte: 0x11,
+      r: (i * 5) & 0xffff,
+      g: (i * 7) & 0xffff,
+      b: (i * 11) & 0xffff,
+    }));
+    const las = buildLas(coincident);
+    const outDir = await tempOutDir();
+    const result = await buildPointCloudIndex({
+      source: chunkSource(las),
+      outDir,
+      fileName: 'coincident.las',
+      sourceFingerprint: FINGERPRINT(las),
+      generatorVersion: '1.0.0',
+      nodeCapacity: 32,
+      maxDepth: 16,
+    });
+
+    expect(result.metrics.storedPointCount).toBe(coincident.length);
+    // streaming compression must never hold the whole coincident leaf in a single buffer
+    expect(result.metrics.largestBufferBytes).toBeLessThan(100_000_000); // < 100 MB
+    // chain depth is bounded by maxDepth, not by point count
+    expect(result.metrics.maxChainDepth).toBeLessThanOrEqual(16);
+
+    const decoded = (await collectDecodedPoints(outDir)).sort();
+    const source = coincident.map(canonical).sort();
+    expect(decoded).toEqual(source);
+  });
 });

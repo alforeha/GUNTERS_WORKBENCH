@@ -7,6 +7,7 @@ import { projectManifestSchema } from '../src/shared/manifest-schema';
 import {
   POINT_CLOUD_INDEX_ASSET_KIND,
   detectIndexStaleness,
+  formatIndexVersionWarning,
   formatStaleIndexWarning,
   hasValidIndexForStreaming,
   isStaleIndexWarning,
@@ -71,7 +72,7 @@ async function writeSyntheticLasFile(folder: string, fileName: string, pointCoun
   return filePath;
 }
 
-function indexAssetFor(sourceAsset: AssetRecord, fingerprint: PointCloudIndexSourceFingerprint): AssetRecord {
+function indexAssetFor(sourceAsset: AssetRecord, fingerprint: PointCloudIndexSourceFingerprint, version: 1 | 1.1 = 1.1): AssetRecord {
   const pc = sourceAsset.pointCloud!;
   const now = new Date().toISOString();
   return {
@@ -88,7 +89,7 @@ function indexAssetFor(sourceAsset: AssetRecord, fingerprint: PointCloudIndexSou
     pointCloudIndex: {
       sourceAssetId: sourceAsset.id,
       indexType: 'wpi-octree',
-      indexVersion: 1,
+      indexVersion: version,
       source: fingerprint,
       pointCount: pc.pointCount,
       bounds: pc.bounds,
@@ -101,7 +102,7 @@ function indexAssetFor(sourceAsset: AssetRecord, fingerprint: PointCloudIndexSou
   };
 }
 
-async function importedProjectWithIndex(): Promise<{
+async function importedProjectWithIndex(version: 1 | 1.1 = 1.1): Promise<{
   svc: ProjectService;
   projectFolder: string;
   sourceFile: string;
@@ -122,7 +123,7 @@ async function importedProjectWithIndex(): Promise<{
     headerSha256: sourceAsset.pointCloud!.headerSha256,
     fileSize: sourceAsset.pointCloud!.fileSize,
     mtimeMs: stats.mtimeMs,
-  });
+  }, version);
   manifest.assets.push(indexAsset);
   const saved = await svc.saveProject(manifest);
   return { svc, projectFolder: saved.projectFolder, sourceFile, sourceAsset, indexId: indexAsset.id };
@@ -214,7 +215,7 @@ describe('point-cloud index manifest record', () => {
       crs: {},
       settings: {},
       standards: {},
-      assets: [sourceAsset, indexAssetFor(sourceAsset, { headerSha256: 'deadbeef', fileSize: 1234, mtimeMs: 42 })],
+      assets: [sourceAsset, indexAssetFor(sourceAsset, { headerSha256: 'deadbeef', fileSize: 1234, mtimeMs: 42 }, 1.1)],
       groups: [],
       realitySimulation: {
         id: 'sim-primary',
@@ -331,6 +332,29 @@ describe('index staleness on reopen', () => {
     const warnings = indexWarnings(reopened.manifest, indexId);
     expect(warnings.some((w) => /missing/i.test(w))).toBe(true);
     expect(warnings.some((w) => /out of date/i.test(w))).toBe(false);
+  });
+
+  it('detects a v1 index on reopen and issues a version upgrade warning', async () => {
+    const { svc, projectFolder, indexId } = await importedProjectWithIndex(1);
+    await svc.closeProject();
+    const reopened = await svc.openProject({ projectFolder });
+    const warnings = indexWarnings(reopened.manifest, indexId);
+    expect(warnings.some((w) => /format has been updated/i.test(w))).toBe(true);
+    expect(warnings.some((w) => /v1 → v1\.1/i.test(w))).toBe(true);
+  });
+});
+
+// ── Phase 4.5: index version upgrade detection ─────────────────────────
+describe('formatIndexVersionWarning', () => {
+  it('returns a friendly upgrade warning for v1', () => {
+    const warning = formatIndexVersionWarning(1);
+    expect(warning).toMatch(/format has been updated/);
+    expect(warning).toMatch(/v1 → v1\.1/);
+    expect(warning).toMatch(/[Rr]ebuild/);
+  });
+
+  it('returns null for v1.1 (current)', () => {
+    expect(formatIndexVersionWarning(1.1)).toBeNull();
   });
 });
 

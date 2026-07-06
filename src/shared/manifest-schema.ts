@@ -30,7 +30,7 @@ export const pointCloudIndexTypeSchema = z.literal('wpi-octree');
 const pointCloudIndexSchema = z.object({
   sourceAssetId: z.string().min(1),
   indexType: pointCloudIndexTypeSchema,
-  indexVersion: z.literal(1),
+  indexVersion: z.union([z.literal(1), z.literal(1.1)]),
   source: z.object({
     headerSha256: z.string().min(1),
     fileSize: z.number().nonnegative(),

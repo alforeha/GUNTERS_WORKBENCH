@@ -32,6 +32,7 @@ import {
   POINT_CLOUD_INDEX_BUILDER_VERSION,
   POINT_CLOUD_INDEX_WARNING_PREFIX,
   detectIndexStaleness,
+  formatIndexVersionWarning,
   formatStaleIndexWarning,
   isManagedIndexWarning,
   type CurrentSourceFingerprint,
@@ -464,7 +465,7 @@ export class ProjectService {
       pointCloudIndex: {
         sourceAssetId: sourceAsset.id,
         indexType: 'wpi-octree',
-        indexVersion: 1,
+        indexVersion: 1.1,
         source: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
         pointCount: built.source.pointCount,
         bounds: built.bounds,
@@ -491,6 +492,11 @@ export class ProjectService {
         maxDepthUsed: result.metrics.maxDepthUsed,
         wallTimeMs: result.metrics.wallTimeMs,
         peakBufferedBytes: result.metrics.peakBufferedBytes,
+        peakVoxelBytes: result.metrics.peakVoxelBytes,
+        nodeCount: result.metrics.nodeCount,
+        maxChainDepth: result.metrics.maxChainDepth,
+        largestNodePoints: result.metrics.largestNodePoints,
+        largestBufferBytes: result.metrics.largestBufferBytes,
       },
     };
   }
@@ -770,8 +776,10 @@ export class ProjectService {
       if (!sourceAsset) continue; // dangling refs are rejected by the schema; defensive only
       try {
         const current = await this.computeCurrentSourceFingerprint(projectFolder, sourceAsset);
-        const warning = formatStaleIndexWarning(detectIndexStaleness(asset.pointCloudIndex.source, current));
-        if (warning) asset.warnings.push(warning);
+        const staleWarning = formatStaleIndexWarning(detectIndexStaleness(asset.pointCloudIndex.source, current));
+        if (staleWarning) asset.warnings.push(staleWarning);
+        const versionWarning = formatIndexVersionWarning(asset.pointCloudIndex.indexVersion);
+        if (versionWarning) asset.warnings.push(versionWarning);
       } catch {
         asset.warnings.push(`${POINT_CLOUD_INDEX_WARNING_PREFIX} freshness could not be verified from the current source.`);
       }
