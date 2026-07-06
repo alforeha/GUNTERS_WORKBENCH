@@ -107,6 +107,17 @@ export function registerWorkbenchIpc(): void {
   );
 
   ipcMain.handle(
+    'workbench:loadPointCloudIndexHierarchy',
+    (_event, input: Parameters<WorkbenchIpc['loadPointCloudIndexHierarchy']>[0]) =>
+      service.loadPointCloudIndexHierarchy(input),
+  );
+
+  ipcMain.handle(
+    'workbench:loadPointCloudIndexTiles',
+    (_event, input: Parameters<WorkbenchIpc['loadPointCloudIndexTiles']>[0]) => service.loadPointCloudIndexTiles(input),
+  );
+
+  ipcMain.handle(
     'workbench:readDerivedSurfaceArtifact',
     (_event, managedPath: Parameters<WorkbenchIpc['readDerivedSurfaceArtifact']>[0]) =>
       service.readDerivedSurfaceArtifact(managedPath),

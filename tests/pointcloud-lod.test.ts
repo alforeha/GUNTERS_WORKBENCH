@@ -11,7 +11,14 @@ import {
   terrainColor,
   type NodeScore,
 } from '../src/viewer/pointCloudLod';
-import { appendMergedSourceRange, computeStride, handleLasRequest } from '../src/workers/las.worker';
+import { appendMergedSourceRange, computeStride, handleLasRequest, readReturns } from '../src/workers/las.worker';
+
+function returnByteView(byte: number): DataView {
+  const buf = new ArrayBuffer(16);
+  const view = new DataView(buf);
+  view.setUint8(14, byte);
+  return view;
+}
 
 describe('point-cloud LOD selection', () => {
   it('gives the nearest nodes full density (stride 1)', () => {
@@ -105,6 +112,31 @@ describe('point-cloud filtering', () => {
   });
 });
 
+describe('readReturns nibble decoding', () => {
+  it('splits byte 14 into 3-bit fields for legacy formats (PDRF < 6)', () => {
+    // return number 2 (bits 0-2), number of returns 5 (bits 3-5)
+    const byte = (2 & 0x07) | ((5 & 0x07) << 3);
+    expect(readReturns(returnByteView(byte), 0, 1)).toEqual({ returnNumber: 2, numberOfReturns: 5 });
+    expect(readReturns(returnByteView(0x09), 0, 3)).toEqual({ returnNumber: 1, numberOfReturns: 1 });
+  });
+
+  it('splits byte 14 into 4-bit fields for PDRF >= 6 (both nibbles in byte 14, not byte 15)', () => {
+    // return number 3 (bits 0-3), number of returns 5 (bits 4-7)
+    const byte = (3 & 0x0f) | ((5 & 0x0f) << 4);
+    expect(readReturns(returnByteView(byte), 0, 7)).toEqual({ returnNumber: 3, numberOfReturns: 5 });
+    expect(readReturns(returnByteView(0x11), 0, 6)).toEqual({ returnNumber: 1, numberOfReturns: 1 });
+    expect(readReturns(returnByteView(0xf7), 0, 8)).toEqual({ returnNumber: 7, numberOfReturns: 15 });
+  });
+
+  it('ignores byte 15 for PDRF >= 6', () => {
+    const buf = new ArrayBuffer(16);
+    const view = new DataView(buf);
+    view.setUint8(14, 0x21); // rn 1, nr 2
+    view.setUint8(15, 0xff); // classification flags — must not leak into returns
+    expect(readReturns(view, 0, 7)).toEqual({ returnNumber: 1, numberOfReturns: 2 });
+  });
+});
+
 describe('LAS classification labels', () => {
   it('uses spec names for known classes and falls back otherwise', () => {
     expect(classLabel(1)).toBe('Unclassified');
@@ -188,8 +220,8 @@ function multiReturnPoints(n: number): ArrayBuffer {
     view.setUint16(o + 12, (i * 13) % 65535, true);
     const returnNumber = (i % 3) + 1;
     const numReturns = 3;
-    view.setUint8(o + 14, returnNumber & 0x0f);
-    view.setUint8(o + 15, numReturns & 0x0f);
+    // PDRF 7: return number in byte 14 bits 0-3, number of returns in bits 4-7.
+    view.setUint8(o + 14, (returnNumber & 0x0f) | ((numReturns & 0x0f) << 4));
     view.setUint8(o + 16, Math.floor(i / 4096) % 2 === 0 ? 1 : 2);
     view.setUint16(o + 30, 256, true);
     view.setUint16(o + 32, 512, true);
@@ -242,8 +274,8 @@ describe('LAS worker octree - multi-return / multi-class', () => {
       view.setInt32(o, i % 100, true);
       view.setInt32(o + 4, i % 100, true);
       view.setInt32(o + 8, i % 50, true);
-      view.setUint8(o + 14, 1);
-      view.setUint8(o + 15, 1);
+      // PDRF 7 single return: return number 1 (bits 0-3), number of returns 1 (bits 4-7).
+      view.setUint8(o + 14, 0x11);
       view.setUint8(o + 16, 2);
     }
     const payload = new Blob([header, buffer]);

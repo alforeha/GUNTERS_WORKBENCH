@@ -11,6 +11,7 @@ import { RenderDxf, type DxfDrapeResult, type DxfLayerDisplay } from './RenderDx
 import { RenderGeotiff } from './RenderGeotiff';
 import { RenderPdf, type PdfRenderableSheet } from './RenderPdf';
 import { RenderPointCloud } from './RenderPointCloud';
+import { StreamingPointCloud, type StreamingHierarchy, type TileFetcher } from './StreamingPointCloud';
 import type { FilterState, PointDisplayMode } from './pointCloudLod';
 import { buildNorthGizmo, projectGizmoNorth, GIZMO_SIZE, GIZMO_MARGIN } from './gizmo';
 
@@ -80,6 +81,7 @@ export class ViewerEngine {
    *  Used to guard resetView() in updatePdfSheet -- only fires when footprint actually changes. */
   private pdfFootprints = new Map<string, string>();
   private pointClouds = new Map<string, RenderPointCloud>();
+  private pointCloudIndexes = new Map<string, StreamingPointCloud>();
   private handleCounter = 0;
   private activeHandle: string | null = null;
 
@@ -321,6 +323,8 @@ uniform float edlOrtho;
     this.pdfs.clear();
     for (const p of this.pointClouds.values()) p.dispose();
     this.pointClouds.clear();
+    for (const p of this.pointCloudIndexes.values()) p.dispose();
+    this.pointCloudIndexes.clear();
     this.postQuad.geometry.dispose();
     this.postQuad.material.dispose();
     this.sceneTarget.dispose();
@@ -346,6 +350,8 @@ uniform float edlOrtho;
     this.pdfFootprints.clear();
     for (const pointCloud of this.pointClouds.values()) pointCloud.dispose();
     this.pointClouds.clear();
+    for (const streaming of this.pointCloudIndexes.values()) streaming.dispose();
+    this.pointCloudIndexes.clear();
     this.sceneOrigin = null;
     this.sceneRadius = 0;
     this.activeHandle = null;
@@ -784,6 +790,56 @@ uniform float edlOrtho;
 
   getPointCloudDensifiedPointCount(handle: string): number {
     return this.pointClouds.get(handle)?.getDensifiedPointCount() ?? 0;
+  }
+
+  /** Attach a streaming indexed-full point cloud (WPI index). fetchTiles is IPC-backed. */
+  addPointCloudIndex(hierarchy: StreamingHierarchy, fetchTiles: TileFetcher): string {
+    if (this.disposed) throw new Error('ViewerEngine: addPointCloudIndex after dispose');
+    const wasNull = !this.sceneOrigin;
+    if (!this.sceneOrigin) this.sceneOrigin = hierarchy.origin;
+    if (wasNull) {
+      for (const pdf of this.pdfs.values()) pdf.setOrigin(this.sceneOrigin);
+    }
+    const handle = `p${++this.handleCounter}`;
+    const streaming = new StreamingPointCloud(handle, hierarchy, this.sceneOrigin, fetchTiles, () => this.requestRender());
+    this.pointCloudIndexes.set(handle, streaming);
+    this.contentGroup.add(streaming.group);
+    this.updateSceneMetrics();
+    this.resetView();
+    this.requestRender();
+    return handle;
+  }
+
+  removePointCloudIndex(handle: string): void {
+    const streaming = this.pointCloudIndexes.get(handle);
+    if (!streaming) return;
+    streaming.dispose();
+    this.pointCloudIndexes.delete(handle);
+    this.updateSceneMetrics();
+    this.requestRender();
+  }
+
+  setPointCloudIndexDisplay(handle: string, visible: boolean, pointSize: number): void {
+    this.pointCloudIndexes.get(handle)?.setDisplay(visible, pointSize);
+    this.requestRender();
+  }
+
+  setPointCloudIndexDisplayMode(handle: string, mode: PointDisplayMode): void {
+    this.pointCloudIndexes.get(handle)?.setDisplayMode(mode);
+    this.requestRender();
+  }
+
+  setPointCloudIndexFilter(handle: string, filter: FilterState): void {
+    this.pointCloudIndexes.get(handle)?.setFilter(filter);
+    this.requestRender();
+  }
+
+  getPointCloudIndexDisclosure(handle: string): string | null {
+    return this.pointCloudIndexes.get(handle)?.getDisclosure() ?? null;
+  }
+
+  getPointCloudIndexLoadedPointCount(handle: string): number {
+    return this.pointCloudIndexes.get(handle)?.getLoadedPointCount() ?? 0;
   }
 
   setPointCloudDensity(handle: string, density: number): void {
@@ -1669,6 +1725,19 @@ uniform float edlOrtho;
       if (pointCloud.updateVisible(this.activeCamera, this.exaggeration, cameraSettled)) pointCloudChanged = true;
     }
     if (pointCloudChanged) this.renderRequested = true;
+
+    if (this.pointCloudIndexes.size > 0) {
+      const viewportHeightPx = this.renderer.domElement.clientHeight || this.renderer.domElement.height || 1;
+      const fovY =
+        this.activeCamera instanceof THREE.PerspectiveCamera
+          ? THREE.MathUtils.degToRad(this.activeCamera.fov)
+          : Math.PI / 3;
+      let indexChanged = false;
+      for (const streaming of this.pointCloudIndexes.values()) {
+        if (streaming.update(this.activeCamera, viewportHeightPx, fovY)) indexChanged = true;
+      }
+      if (indexChanged) this.renderRequested = true;
+    }
     if (cameraSettled && this.pointCloudSettleCb) {
       for (const [handle, pointCloud] of this.pointClouds) {
         const nodeIds = pointCloud.nearestLeafNodeIds(this.activeCamera, this.exaggeration, 2);

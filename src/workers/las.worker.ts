@@ -116,13 +116,14 @@ function addCount(counts: Record<string, number>, key: number): void {
   counts[String(key)] = (counts[String(key)] ?? 0) + 1;
 }
 
-function readReturns(view: DataView, recordOffset: number, format: number): { returnNumber: number; numberOfReturns: number } {
-  if (format >= 6) {
-    const b14 = view.getUint8(recordOffset + 14);
-    const b15 = view.getUint8(recordOffset + 15);
-    return { returnNumber: b14 & 0x0f, numberOfReturns: b15 & 0x0f };
-  }
+// LAS 1.4: for PDRF >= 6 both the return number (bits 0-3) and number of returns (bits 4-7)
+// live in byte 14; byte 15 holds classification flags, not returns. For PDRF < 6 both fields
+// pack into byte 14 as 3-bit fields. This matches StridedAttributeSampler's interpretation.
+export function readReturns(view: DataView, recordOffset: number, format: number): { returnNumber: number; numberOfReturns: number } {
   const b = view.getUint8(recordOffset + 14);
+  if (format >= 6) {
+    return { returnNumber: b & 0x0f, numberOfReturns: (b >> 4) & 0x0f };
+  }
   return { returnNumber: b & 0x07, numberOfReturns: (b >> 3) & 0x07 };
 }
 

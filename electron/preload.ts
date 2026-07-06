@@ -32,6 +32,12 @@ const api: WorkbenchIpc = {
   cancelPointCloudIndex(input) {
     return ipcRenderer.invoke('workbench:cancelPointCloudIndex', input)
   },
+  loadPointCloudIndexHierarchy(input) {
+    return ipcRenderer.invoke('workbench:loadPointCloudIndexHierarchy', input)
+  },
+  loadPointCloudIndexTiles(input) {
+    return ipcRenderer.invoke('workbench:loadPointCloudIndexTiles', input)
+  },
   readDerivedSurfaceArtifact(managedPath) {
     return ipcRenderer.invoke('workbench:readDerivedSurfaceArtifact', managedPath)
   },

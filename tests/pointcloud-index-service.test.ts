@@ -128,6 +128,47 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(existsSync(path.join(projectFolder, 'derived', assetId, 'index.staging'))).toBe(false);
   });
 
+  it('streams the index hierarchy and decoded, origin-rebased tiles', async () => {
+    const { svc, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    await svc.generatePointCloudIndex({ assetId });
+
+    const hierarchy = await svc.loadPointCloudIndexHierarchy({ assetId });
+    expect(hierarchy.root).toBe('0-0-0-0');
+    expect(hierarchy.totalPoints).toBe(8);
+    expect(hierarchy.nodes.length).toBeGreaterThanOrEqual(1);
+    expect(hierarchy.hasRgb).toBe(true);
+    expect(hierarchy.pointFormat).toBe(7);
+
+    const { tiles } = await svc.loadPointCloudIndexTiles({ assetId, keys: [hierarchy.root] });
+    expect(tiles).toHaveLength(1);
+    const payload = tiles[0]!.payload;
+    expect(payload.pointCount).toBe(8);
+
+    // Reconstruct world coords from origin-relative positions and match the synthetic source.
+    const round = (p: number[]) => p.map((v) => Math.round(v * 100) / 100).join(',');
+    const got: string[] = [];
+    for (let i = 0; i < payload.pointCount; i++) {
+      got.push(
+        round([
+          payload.positions[i * 3]! + hierarchy.origin[0],
+          payload.positions[i * 3 + 1]! + hierarchy.origin[1],
+          payload.positions[i * 3 + 2]! + hierarchy.origin[2],
+        ]),
+      );
+    }
+    const expected = Array.from({ length: 8 }, (_, i) => round([1000 + i, 2000 + 2 * i, 3000 + 0.5 * i]));
+    expect(got.sort()).toEqual(expected.sort());
+
+    // returnByte (0x11) decodes to return number 1 / number of returns 1 for PDRF 7.
+    expect(Array.from(payload.returnNumbers)).toEqual(Array(8).fill(1));
+    expect(Array.from(payload.numberOfReturns)).toEqual(Array(8).fill(1));
+  });
+
+  it('throws a friendly error when no index is registered for the asset', async () => {
+    const { svc, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    await expect(svc.loadPointCloudIndexHierarchy({ assetId })).rejects.toThrow(/No point-cloud index/i);
+  });
+
   it('cancels an in-flight build via cancelPointCloudIndex', async () => {
     let abortObserved = false;
     let started!: () => void;

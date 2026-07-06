@@ -257,6 +257,40 @@ export interface PointCloudIndexMetricsSummary {
   peakBufferedBytes: number;
 }
 
+export interface PointCloudIndexHierarchyNode {
+  key: string;
+  level: number;
+  bounds: PointCloudBoundsBox;
+  pointCount: number;
+  childKeys: string[];
+}
+
+/** Camera-agnostic description of a built WPI index, streamed to the renderer once on open. */
+export interface PointCloudIndexHierarchy {
+  assetId: string;
+  indexAssetId: string;
+  root: string;
+  /** Rebase origin (index bounds center); tile payload positions are relative to this. */
+  origin: [number, number, number];
+  bounds: PointCloudBoundsBox;
+  scale: [number, number, number];
+  offset: [number, number, number];
+  units: string;
+  pointFormat: number;
+  hasRgb: boolean;
+  totalPoints: number;
+  nodes: PointCloudIndexHierarchyNode[];
+}
+
+export interface LoadPointCloudIndexHierarchyInput {
+  assetId: string;
+}
+
+export interface LoadPointCloudIndexTilesInput {
+  assetId: string;
+  keys: string[];
+}
+
 export interface OpenProjectError {
   code: 'manifest-missing-or-corrupt';
   message: string;

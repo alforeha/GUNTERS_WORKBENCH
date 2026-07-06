@@ -155,6 +155,18 @@ export function encodeWpiTile(tile: DecodedWpiTile): Uint8Array {
   return bytes;
 }
 
+/**
+ * Split a stored returnByte (raw LAS byte 14) into return number + number of returns using the
+ * source point format recorded in index.json. PDRF >= 6 packs both as 4-bit nibbles in byte 14;
+ * PDRF < 6 packs them as 3-bit fields. Kept explicit so tile readers never guess.
+ */
+export function decodeReturnByte(returnByte: number, pointFormat: number): { returnNumber: number; numberOfReturns: number } {
+  if (pointFormat >= 6) {
+    return { returnNumber: returnByte & 0x0f, numberOfReturns: (returnByte >> 4) & 0x0f };
+  }
+  return { returnNumber: returnByte & 0x07, numberOfReturns: (returnByte >> 3) & 0x07 };
+}
+
 /** Machine-readable byte-layout descriptor embedded in index.json for forward readers. */
 export function wpiTileByteLayout(hasRgb: boolean): {
   endianness: 'little';

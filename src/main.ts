@@ -21,6 +21,8 @@ let activePointCloudPreview: {
 } | null = null
 let pendingDensifyKey = ''
 let pendingDensify = false
+let activePointCloudIndexHandle: string | null = null
+let streamingDisclosureTimer: number | null = null
 
 app.innerHTML = `
   <main class="shell">
@@ -30,6 +32,7 @@ app.innerHTML = `
       <button id="btn-save">Save</button>
       <button id="btn-close">Close</button>
       <button id="btn-import-pointcloud">Import Point Cloud</button>
+      <button id="btn-index-pointcloud">Build Index &amp; Stream</button>
       <button id="btn-warning">Record Unit Warning</button>
       <button id="btn-derived">Generate Derived Layer</button>
     </section>
@@ -205,8 +208,10 @@ function renderProjectClosed(message = 'No project loaded', recovery = ''): void
   activePointCloudHandle = null
   activePointCloudAssetId = null
   activePointCloudPreview = null
+  activePointCloudIndexHandle = null
   pendingDensify = false
   pendingDensifyKey = ''
+  stopStreamingDisclosure()
   safeProjectPathEl.textContent = message
   safeRecoveryEl.textContent = recovery
   safeAssetListEl.innerHTML = ''
@@ -257,12 +262,32 @@ async function saveCurrentManifest(): Promise<void> {
   renderSession(currentSession)
 }
 
+function stopStreamingDisclosure(): void {
+  if (streamingDisclosureTimer !== null) {
+    window.clearInterval(streamingDisclosureTimer)
+    streamingDisclosureTimer = null
+  }
+}
+
+function startStreamingDisclosure(): void {
+  stopStreamingDisclosure()
+  streamingDisclosureTimer = window.setInterval(() => {
+    if (!viewer || !activePointCloudIndexHandle) return
+    const text = viewer.getPointCloudIndexDisclosure(activePointCloudIndexHandle)
+    if (text) {
+      safePointCloudDisclosureEl.textContent = `${text} - truth indexed-full; source asset remains source`
+    }
+  }, 300)
+}
+
 function clearViewerScene(): void {
   activePointCloudHandle = null
   activePointCloudAssetId = null
   activePointCloudPreview = null
+  activePointCloudIndexHandle = null
   pendingDensify = false
   pendingDensifyKey = ''
+  stopStreamingDisclosure()
   viewer?.clearSceneContents()
 }
 
@@ -335,6 +360,41 @@ async function loadPointCloudLayers(session: ProjectSession): Promise<void> {
 window.workbench.onPointCloudPreviewProgress((progress) => {
   const pctText = progress.pct === null ? '' : ` ${progress.pct}%`
   safePointCloudProgressEl.textContent = `${progress.label}${pctText}`
+})
+
+window.workbench.onPointCloudIndexProgress((progress) => {
+  const pctText = progress.pct === null ? '' : ` ${progress.pct}%`
+  safePointCloudProgressEl.textContent = `Indexing: ${progress.label}${pctText}`
+})
+
+document.querySelector<HTMLButtonElement>('#btn-index-pointcloud')?.addEventListener('click', async () => {
+  if (!activePointCloudAssetId) return
+  const assetId = activePointCloudAssetId
+  try {
+    safePointCloudProgressEl.textContent = 'Building full index...'
+    const result = await window.workbench.generatePointCloudIndex({ assetId })
+    renderSession(result.session)
+    const hierarchy = await window.workbench.loadPointCloudIndexHierarchy({ assetId })
+    const engine = ensureViewer()
+    if (activePointCloudIndexHandle) engine.removePointCloudIndex(activePointCloudIndexHandle)
+    activePointCloudIndexHandle = engine.addPointCloudIndex(hierarchy, (keys) =>
+      window.workbench.loadPointCloudIndexTiles({ assetId, keys }).then((response) => response.tiles),
+    )
+    // Indexed-full streaming becomes the on-screen truth; hide the preview-sampled display.
+    if (activePointCloudHandle) {
+      engine.setPointCloudDisplay(activePointCloudHandle, false, Number(safePointCloudSizeEl.value))
+    }
+    engine.setPointCloudIndexDisplay(activePointCloudIndexHandle, true, Number(safePointCloudSizeEl.value))
+    engine.setPointCloudIndexDisplayMode(
+      activePointCloudIndexHandle,
+      safePointCloudModeEl.value as 'rgb' | 'elevation' | 'intensity',
+    )
+    startStreamingDisclosure()
+    safePointCloudProgressEl.textContent = `Index ready: ${result.metrics.tileCount.toLocaleString()} tiles, ${compactCount(result.metrics.pointCount)} points`
+  } catch (error) {
+    console.error(error)
+    safePointCloudProgressEl.textContent = 'Index build failed; preview remains available.'
+  }
 })
 
 document.querySelector<HTMLButtonElement>('#btn-new')?.addEventListener('click', async () => {
@@ -418,13 +478,17 @@ document.querySelector<HTMLButtonElement>('#btn-derived')?.addEventListener('cli
 })
 
 safePointCloudModeEl.addEventListener('change', () => {
-  if (!viewer || !activePointCloudHandle) return
-  viewer.setPointCloudDisplayMode(activePointCloudHandle, safePointCloudModeEl.value as 'rgb' | 'elevation' | 'intensity')
+  if (!viewer) return
+  const mode = safePointCloudModeEl.value as 'rgb' | 'elevation' | 'intensity'
+  if (activePointCloudHandle) viewer.setPointCloudDisplayMode(activePointCloudHandle, mode)
+  if (activePointCloudIndexHandle) viewer.setPointCloudIndexDisplayMode(activePointCloudIndexHandle, mode)
 })
 
 safePointCloudSizeEl.addEventListener('input', () => {
-  if (!viewer || !activePointCloudHandle) return
-  viewer.setPointCloudDisplay(activePointCloudHandle, true, Number(safePointCloudSizeEl.value))
+  if (!viewer) return
+  const size = Number(safePointCloudSizeEl.value)
+  if (activePointCloudHandle) viewer.setPointCloudDisplay(activePointCloudHandle, true, size)
+  if (activePointCloudIndexHandle) viewer.setPointCloudIndexDisplay(activePointCloudIndexHandle, true, size)
 })
 
 safePointCloudEdlEl.addEventListener('change', () => {

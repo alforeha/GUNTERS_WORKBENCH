@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   WPI_TILE_HEADER_BYTES,
+  decodeReturnByte,
   decodeWpiTile,
   encodeWpiTile,
   wpiRecordStride,
@@ -65,6 +66,12 @@ describe('wpi tile codec', () => {
   it('throws on a truncated payload', () => {
     const bytes = encodeWpiTile(sampleTile(true, 4));
     expect(() => decodeWpiTile(bytes.subarray(0, bytes.byteLength - 3))).toThrow(/truncated/i);
+  });
+
+  it('decodes returnByte per point format (nibbles for >=6, 3-bit for <6)', () => {
+    expect(decodeReturnByte((3 & 0x0f) | ((5 & 0x0f) << 4), 7)).toEqual({ returnNumber: 3, numberOfReturns: 5 });
+    expect(decodeReturnByte(0xf7, 8)).toEqual({ returnNumber: 7, numberOfReturns: 15 });
+    expect(decodeReturnByte((2 & 0x07) | ((4 & 0x07) << 3), 1)).toEqual({ returnNumber: 2, numberOfReturns: 4 });
   });
 
   it('documents a byte layout consistent with the record stride', () => {

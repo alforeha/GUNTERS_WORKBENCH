@@ -4,7 +4,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { projectManifestSchema } from '../src/shared/manifest-schema';
 import { createDefaultManifest } from '../src/shared/project-defaults';
-import type { PointCloudDataset } from '../src/core/contract';
+import type { PointCloudDataset, PointCloudNodePayload } from '../src/core/contract';
 import { parseLasMetadata } from '../src/core/las/metadata';
 import { computeStride, handleLasSourceRequest, type ChunkSource } from '../src/workers/las.worker';
 import type {
@@ -13,9 +13,12 @@ import type {
   GeneratePointCloudIndexInput,
   ImportPointCloudInput,
   LoadPointCloudDensifiedNodesInput,
+  LoadPointCloudIndexHierarchyInput,
+  LoadPointCloudIndexTilesInput,
   LoadPointCloudPreviewInput,
   OpenProjectError,
   OpenProjectInput,
+  PointCloudIndexHierarchy,
   PointCloudIndexMetricsSummary,
   PointCloudIndexProgress,
   PointCloudPreviewState,
@@ -33,7 +36,13 @@ import {
   isManagedIndexWarning,
   type CurrentSourceFingerprint,
 } from '../src/shared/pointcloud-index';
-import { isWpiIndexComplete, type BuildPointCloudIndexResult } from './pointcloud-index-builder';
+import { decodeReturnByte } from '../src/shared/wpi-tile';
+import {
+  decodeWpiTileFile,
+  isWpiIndexComplete,
+  readWpiIndexManifest,
+  type BuildPointCloudIndexResult,
+} from './pointcloud-index-builder';
 import { createWorkerIndexBuild, type RunIndexBuild } from './pointcloud-index-runner';
 import { generateTestMesh } from '../src/viewer/synthetic';
 import {
@@ -488,6 +497,95 @@ export class ProjectService {
 
   cancelPointCloudIndex(input: GeneratePointCloudIndexInput): void {
     this.indexBuilds.get(input.assetId)?.abort();
+  }
+
+  async loadPointCloudIndexHierarchy(input: LoadPointCloudIndexHierarchyInput): Promise<PointCloudIndexHierarchy> {
+    this.requireOpenProject();
+    const { manifest } = await this.readIndexForAsset(input.assetId);
+    const origin = this.indexOrigin(manifest.bounds);
+    return {
+      assetId: input.assetId,
+      indexAssetId: `${input.assetId}-index`,
+      root: manifest.root,
+      origin,
+      bounds: manifest.bounds,
+      scale: manifest.scale,
+      offset: manifest.offset,
+      units: manifest.units,
+      pointFormat: manifest.source.pointFormat,
+      hasRgb: manifest.hasRgb,
+      totalPoints: manifest.source.pointCount,
+      nodes: manifest.nodes.map((node) => ({
+        key: node.key,
+        level: node.level,
+        bounds: node.bounds,
+        pointCount: node.pointCount,
+        childKeys: node.childKeys,
+      })),
+    };
+  }
+
+  async loadPointCloudIndexTiles(
+    input: LoadPointCloudIndexTilesInput,
+  ): Promise<{ assetId: string; tiles: { key: string; payload: PointCloudNodePayload }[] }> {
+    this.requireOpenProject();
+    const { indexDir, manifest } = await this.readIndexForAsset(input.assetId);
+    const nodeByKey = new Map(manifest.nodes.map((node) => [node.key, node]));
+    const origin = this.indexOrigin(manifest.bounds);
+    const [sx, sy, sz] = manifest.scale;
+    const [ox, oy, oz] = manifest.offset;
+    const tiles: { key: string; payload: PointCloudNodePayload }[] = [];
+
+    for (const key of [...new Set(input.keys)]) {
+      const node = nodeByKey.get(key);
+      if (!node) continue;
+      const decoded = await decodeWpiTileFile(indexDir, node.tile);
+      const count = decoded.pointCount;
+      const positions = new Float32Array(count * 3);
+      const colors = new Uint8Array(count * 3);
+      const intensities = new Float32Array(count);
+      const classifications = new Uint8Array(count);
+      const returnNumbers = new Uint8Array(count);
+      const numberOfReturns = new Uint8Array(count);
+      for (let i = 0; i < count; i++) {
+        // int32 grid → world → origin-relative f32 (rebase done here, off the render thread).
+        positions[i * 3] = decoded.x[i]! * sx + ox - origin[0];
+        positions[i * 3 + 1] = decoded.y[i]! * sy + oy - origin[1];
+        positions[i * 3 + 2] = decoded.z[i]! * sz + oz - origin[2];
+        if (decoded.hasRgb) {
+          colors[i * 3] = decoded.r![i]! >> 8;
+          colors[i * 3 + 1] = decoded.g![i]! >> 8;
+          colors[i * 3 + 2] = decoded.b![i]! >> 8;
+        } else {
+          colors[i * 3] = 255;
+          colors[i * 3 + 1] = 255;
+          colors[i * 3 + 2] = 255;
+        }
+        intensities[i] = decoded.intensity[i]! / 65535;
+        classifications[i] = decoded.classification[i]!;
+        const { returnNumber, numberOfReturns: nr } = decodeReturnByte(decoded.returnByte[i]!, manifest.source.pointFormat);
+        returnNumbers[i] = returnNumber;
+        numberOfReturns[i] = nr;
+      }
+      tiles.push({ key, payload: { pointCount: count, positions, colors, intensities, classifications, returnNumbers, numberOfReturns } });
+    }
+    return { assetId: input.assetId, tiles };
+  }
+
+  private indexOrigin(bounds: { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number }): [number, number, number] {
+    return [(bounds.minX + bounds.maxX) / 2, (bounds.minY + bounds.maxY) / 2, (bounds.minZ + bounds.maxZ) / 2];
+  }
+
+  private async readIndexForAsset(assetId: string): Promise<{ indexDir: string; manifest: Awaited<ReturnType<typeof readWpiIndexManifest>> }> {
+    const folder = this.currentFolder as string;
+    const indexAssetId = `${assetId}-index`;
+    const indexAsset = (this.currentManifest as ProjectManifest).assets.find((a) => a.id === indexAssetId && a.pointCloudIndex);
+    if (!indexAsset) {
+      throw new Error(`No point-cloud index is registered for asset ${assetId}.`);
+    }
+    const indexDir = path.join(folder, 'derived', assetId, 'index');
+    const manifest = await readWpiIndexManifest(indexDir); // throws on missing marker / corrupt
+    return { indexDir, manifest };
   }
 
   async readDerivedSurfaceArtifact(managedPath: string): Promise<SerializableSurfaceModel> {

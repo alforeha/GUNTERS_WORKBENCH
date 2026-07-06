@@ -3,9 +3,12 @@ import type {
   GeneratePointCloudIndexInput,
   ImportPointCloudInput,
   LoadPointCloudDensifiedNodesInput,
+  LoadPointCloudIndexHierarchyInput,
+  LoadPointCloudIndexTilesInput,
   LoadPointCloudPreviewInput,
   OpenProjectError,
   OpenProjectInput,
+  PointCloudIndexHierarchy,
   PointCloudIndexMetricsSummary,
   PointCloudIndexProgress,
   PointCloudPreviewProgress,
@@ -48,6 +51,11 @@ export interface WorkbenchIpc {
     metrics: PointCloudIndexMetricsSummary;
   }>;
   cancelPointCloudIndex(input: GeneratePointCloudIndexInput): Promise<void>;
+  loadPointCloudIndexHierarchy(input: LoadPointCloudIndexHierarchyInput): Promise<PointCloudIndexHierarchy>;
+  loadPointCloudIndexTiles(input: LoadPointCloudIndexTilesInput): Promise<{
+    assetId: string;
+    tiles: { key: string; payload: PointCloudNodePayload }[];
+  }>;
   readDerivedSurfaceArtifact(managedPath: string): Promise<SerializableSurfaceModel>;
   saveProject(manifest: ProjectManifest): Promise<ProjectSession>;
   closeProject(): Promise<void>;
