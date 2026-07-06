@@ -59,12 +59,17 @@ architecture below).
 ## 4. Display-state disclosure model
 
 The viewer banner must at all times distinguish:
-- **Indexed-full streaming** — "Streaming full index — N of M points loaded,
-  refining" / "view settled".
-- **Preview-sampled** — existing disclosure, now also stating whether an index
-  exists, is stale, or was never generated.
-- **Densification fallback** — explicitly labeled as fallback, only where no
-  valid index exists.
+- **Indexed-full streaming** — "Indexed-full — streaming N of M points · refining" /
+  "settled".
+- **Preview-sampled** — "Preview — sampled N of M".  No index exists; no densification
+  active.
+- **Densification fallback** — "Preview — sampled N of M · source densification
+  fallback".  Only when no valid (complete, non-stale) WPI index exists for the asset.
+  Densification is gated at the call site: if a valid index asset is present in the
+  manifest with no managed-staleness warnings, the near-camera densification path does
+  not fire.  A stale index (source-missing, header-sha/size/mtime changed) is treated as
+  absent for this gate, so densification fallback remains available alongside the stale
+  warning of Phase 1.
 - **Derived render** — "Analytic surfel render (derived) — not measured
   points" whenever the derived layer is visible.
 

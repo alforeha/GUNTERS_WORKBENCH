@@ -8,6 +8,8 @@ import {
   POINT_CLOUD_INDEX_ASSET_KIND,
   detectIndexStaleness,
   formatStaleIndexWarning,
+  hasValidIndexForStreaming,
+  isStaleIndexWarning,
   type PointCloudIndexSourceFingerprint,
 } from '../src/shared/pointcloud-index';
 import type { AssetRecord, ProjectManifest } from '../src/shared/workbench-types';
@@ -329,5 +331,62 @@ describe('index staleness on reopen', () => {
     const warnings = indexWarnings(reopened.manifest, indexId);
     expect(warnings.some((w) => /missing/i.test(w))).toBe(true);
     expect(warnings.some((w) => /out of date/i.test(w))).toBe(false);
+  });
+});
+
+// ── Phase 4: densification→streaming gate helper ───────────────────────────
+describe('hasValidIndexForStreaming', () => {
+  it('returns true for a clean index asset (correct kind, no managed warnings)', () => {
+    expect(hasValidIndexForStreaming({ kind: POINT_CLOUD_INDEX_ASSET_KIND, warnings: [] })).toBe(true);
+  });
+
+  it('returns false when the asset is undefined (no index exists)', () => {
+    expect(hasValidIndexForStreaming(undefined)).toBe(false);
+  });
+
+  it('returns false when the kind is not point-cloud-index', () => {
+    expect(hasValidIndexForStreaming({ kind: 'point-cloud', warnings: [] })).toBe(false);
+    expect(hasValidIndexForStreaming({ kind: 'surface', warnings: [] })).toBe(false);
+  });
+
+  it('returns false when the index carries a managed staleness warning (stale → absent for gate)', () => {
+    expect(
+      hasValidIndexForStreaming({
+        kind: POINT_CLOUD_INDEX_ASSET_KIND,
+        warnings: ['Point-cloud index may be out of date (source file size changed). Regenerate the index to match the current source.'],
+      }),
+    ).toBe(false);
+  });
+
+  it('returns true when the source is missing (index is self-contained, still streamable)', () => {
+    expect(
+      hasValidIndexForStreaming({
+        kind: POINT_CLOUD_INDEX_ASSET_KIND,
+        warnings: ['Point-cloud index source is missing; the existing index is still usable but cannot be re-verified or regenerated until the source is available.'],
+      }),
+    ).toBe(true);
+  });
+
+  it('still returns true with non-index warnings present (unit warnings do not invalidate the index)', () => {
+    expect(
+      hasValidIndexForStreaming({
+        kind: POINT_CLOUD_INDEX_ASSET_KIND,
+        warnings: ['Point-cloud units could not be confirmed from LAS VLRs.'],
+      }),
+    ).toBe(true);
+  });
+});
+
+describe('isStaleIndexWarning', () => {
+  it('returns true for an "out of date" warning', () => {
+    expect(isStaleIndexWarning('Point-cloud index may be out of date (source file size changed). Regenerate the index to match the current source.')).toBe(true);
+  });
+
+  it('returns false for a missing-source warning', () => {
+    expect(isStaleIndexWarning('Point-cloud index source is missing; the existing index is still usable but cannot be re-verified or regenerated until the source is available.')).toBe(false);
+  });
+
+  it('returns false for a non-index warning', () => {
+    expect(isStaleIndexWarning('Some other warning about units.')).toBe(false);
   });
 });

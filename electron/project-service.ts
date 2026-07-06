@@ -62,7 +62,7 @@ const REQUIRED_DIRS = ['sources', 'derived', 'edited', 'exports', 'reports', 'hi
 const MISSING_SOURCE_WARNING = 'Referenced point cloud source is missing.';
 const MISSING_SOURCE_CACHE_WARNING = 'Source file is missing; showing cached preview that may be stale.';
 const UNIT_WARNING = 'Point-cloud units could not be confirmed from LAS VLRs.';
-const DENSIFIED_DISCLOSURE_SUFFIX = 'full density near camera';
+const DENSIFIED_DISCLOSURE_SUFFIX = 'source densification fallback';
 
 interface SaveIntent {
   id: string;

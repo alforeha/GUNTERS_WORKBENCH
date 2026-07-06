@@ -113,3 +113,34 @@ export function formatStaleIndexWarning(result: IndexStalenessResult): string | 
 export function isManagedIndexWarning(warning: string): boolean {
   return warning.startsWith(POINT_CLOUD_INDEX_WARNING_PREFIX);
 }
+
+/**
+ * Whether an index warning means the index is genuinely stale (source diverged).
+ *
+ * Deliberately excludes the missing-source warning — a missing source leaves the index
+ * self-contained and fully usable (Phase 1 semantics), and densification cannot run
+ * without the source anyway.  Only "out of date" warnings gate streaming.
+ */
+export function isStaleIndexWarning(warning: string): boolean {
+  return isManagedIndexWarning(warning) && warning.includes('out of date');
+}
+
+/**
+ * Gate for the densification→streaming demotion (Phase 4).
+ *
+ * An index asset is considered *valid for streaming* when it exists, has the correct kind,
+ * and carries NO stale-index warnings.  A missing-source warning does NOT disqualify the
+ * index — the index tiles are self-contained under derived/ and streaming remains the only
+ * viable refinement path (densification also needs the missing source).  Only genuinely
+ * stale indexes (source fingerprint diverged) are treated as absent for this gate, leaving
+ * densification fallback available.
+ */
+export function hasValidIndexForStreaming(
+  indexAsset: { kind: string; warnings: string[] } | undefined,
+): boolean {
+  return (
+    indexAsset !== undefined &&
+    indexAsset.kind === POINT_CLOUD_INDEX_ASSET_KIND &&
+    !indexAsset.warnings.some((w) => isStaleIndexWarning(w))
+  );
+}

@@ -3,6 +3,7 @@ import { isOpenProjectError, type ProjectSession } from './shared/ipc'
 import type { PointCloudDataset, SurfaceModel } from './core/contract'
 import type { ProjectManifest } from './shared/workbench-types'
 import { ViewerEngine } from './viewer'
+import { hasValidIndexForStreaming } from '../src/shared/pointcloud-index'
 
 const app = document.querySelector<HTMLDivElement>('#app')
 if (!app) {
@@ -136,7 +137,7 @@ function updatePointCloudDisclosure(): void {
   const mixed = densifiedCount > 0 && activePointCloudPreview.sourceAvailable
   const warningText = activePointCloudPreview.warnings.length > 0 ? ` WARNING: ${activePointCloudPreview.warnings.join(' | ')}` : ''
   const disclosure = mixed
-    ? `Preview - sampled ${compactCount(activePointCloudPreview.sampledPointCount)} of ${compactCount(activePointCloudPreview.totalPointCount)} points · full density near camera`
+    ? `Preview - sampled ${compactCount(activePointCloudPreview.sampledPointCount)} of ${compactCount(activePointCloudPreview.totalPointCount)} points · source densification fallback`
     : `Preview - sampled ${compactCount(activePointCloudPreview.sampledPointCount)} of ${compactCount(activePointCloudPreview.totalPointCount)} points`
   safePointCloudDisclosureEl.textContent =
     `${disclosure} - truth preview-sampled; source asset remains source${warningText}`
@@ -145,11 +146,22 @@ function updatePointCloudDisclosure(): void {
 async function requestNearCameraDensification(handle: string, nodeIds: number[]): Promise<void> {
   if (!viewer || !activePointCloudHandle || !activePointCloudAssetId) return
   if (handle !== activePointCloudHandle || nodeIds.length === 0) return
+
+  // Phase 4 gate: if a valid (non-stale) index exists, densification is suppressed —
+  // indexed-full streaming is the only refinement path.  Stale/missing index = absent
+  // for this gate → densification fallback remains available.
+  if (currentSession) {
+    const indexAsset = currentSession.manifest.assets.find(
+      (a) => a.pointCloudIndex?.sourceAssetId === activePointCloudAssetId,
+    )
+    if (hasValidIndexForStreaming(indexAsset)) return
+  }
+
   const requestKey = `${activePointCloudAssetId}:${nodeIds.join(',')}`
   if (pendingDensify && pendingDensifyKey === requestKey) return
   pendingDensify = true
   pendingDensifyKey = requestKey
-  safePointCloudProgressEl.textContent = 'Loading full density near camera...'
+  safePointCloudProgressEl.textContent = 'Loading near-camera densification (fallback)...'
   try {
     const result = await window.workbench.loadPointCloudDensifiedNodes({
       assetId: activePointCloudAssetId,

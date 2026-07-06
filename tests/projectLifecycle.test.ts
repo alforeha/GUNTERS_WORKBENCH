@@ -362,4 +362,40 @@ describe('ProjectService lifecycle', () => {
     expect(reopened.recoveryDetected).toBe(true);
     expect(reopened.manifest.recovery.uncleanShutdown).toBe(true);
   });
+
+  // ── Phase 4: preview disclosure format ──────────────────────────────────
+  it('produces a pure preview disclosure (no densification suffix) on initial load', async () => {
+    const parent = await mkdtemp(path.join(tmpdir(), 'wb-'));
+    const fixtureDir = await mkdtemp(path.join(tmpdir(), 'las-'));
+    const sourceFile = await writeSyntheticLasFile(fixtureDir, 'disclosure-fixture.las');
+    const svc = new ProjectService();
+    await svc.createProject({ parentDir: parent, projectName: 'DISC' });
+    const imported = await svc.importPointCloud({ filePath: sourceFile, importPolicy: 'reference' });
+    const asset = imported.manifest.assets.find((candidate) => candidate.kind === 'point-cloud')!;
+
+    const preview = await svc.loadPointCloudPreview({ assetId: asset.id });
+    expect(preview.preview.disclosure).toMatch(/^Preview - sampled .+ of .+ points$/);
+    expect(preview.preview.disclosure).not.toMatch(/fallback/);
+    expect(preview.preview.disclosure).not.toMatch(/densif/i);
+    expect(preview.preview.densifiedPointCount).toBe(0);
+  });
+
+  it('densification request succeeds when no index is registered', async () => {
+    const parent = await mkdtemp(path.join(tmpdir(), 'wb-'));
+    const fixtureDir = await mkdtemp(path.join(tmpdir(), 'las-'));
+    const sourceFile = await writeSyntheticLasFile(fixtureDir, 'fallback-fixture.las', 2);
+    const svc = new ProjectService();
+    await svc.createProject({ parentDir: parent, projectName: 'DENS' });
+    const imported = await svc.importPointCloud({ filePath: sourceFile, importPolicy: 'reference' });
+    const asset = imported.manifest.assets.find((candidate) => candidate.kind === 'point-cloud')!;
+
+    const preview = await svc.loadPointCloudPreview({ assetId: asset.id });
+    const nodeIds = [preview.dataset.octree?.root.id ?? -1].filter((id) => id >= 0);
+    if (nodeIds.length === 0) return; // no leaf with source ranges → nothing to request
+
+    const result = await svc.loadPointCloudDensifiedNodes({ assetId: asset.id, nodeIds });
+    // No index exists → densification is allowed (sourceAvailable true, no gate).
+    expect(result.sourceAvailable).toBe(true);
+    expect(result.warning).toBeNull();
+  });
 });
