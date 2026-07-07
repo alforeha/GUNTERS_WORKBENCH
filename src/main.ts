@@ -4,6 +4,7 @@ import type { PointCloudDataset, SurfaceModel } from './core/contract'
 import type { AssetRecord, ProjectManifest, SimulationLayer, SimulationLayerKind } from './shared/workbench-types'
 import { ViewerEngine } from './viewer'
 import { hasValidIndexForStreaming } from '../src/shared/pointcloud-index'
+import { DEFAULT_SURFEL_CELL_SCALE } from './shared/analytic-surfels'
 
 const app = document.querySelector<HTMLDivElement>('#app')
 if (!app) {
@@ -93,10 +94,9 @@ app.innerHTML = `
         <input id="pointcloud-size" type="range" min="1" max="5" value="2" />
       </label>
       <label class="viewer-control">
-        Surfel cell scale
-        <input id="surfel-cell-scale" type="number" min="0.25" max="4" step="0.05" value="1" />
+        Surfel size
+        <input id="surfel-size" type="range" min="1" max="5" value="2" />
       </label>
-      <div class="note">Lower surfel cell scale creates more, smaller derived surfels. Current default: 1.0.</div>
       <h2>Layers</h2>
       <ul id="layer-list"></ul>
       <h2>Assets</h2>
@@ -117,7 +117,7 @@ const pointCloudProgressEl = document.querySelector<HTMLDivElement>('#pointcloud
 const pointCloudDisclosureEl = document.querySelector<HTMLDivElement>('#pointcloud-disclosure')
 const pointCloudModeEl = document.querySelector<HTMLSelectElement>('#pointcloud-mode')
 const pointCloudSizeEl = document.querySelector<HTMLInputElement>('#pointcloud-size')
-const surfelCellScaleEl = document.querySelector<HTMLInputElement>('#surfel-cell-scale')
+const surfelSizeEl = document.querySelector<HTMLInputElement>('#surfel-size')
 const pointCloudEdlEl = document.querySelector<HTMLInputElement>('#pointcloud-edl')
 const pointCloudFogEl = document.querySelector<HTMLInputElement>('#pointcloud-fog')
 
@@ -131,7 +131,7 @@ if (
   !pointCloudDisclosureEl ||
   !pointCloudModeEl ||
   !pointCloudSizeEl ||
-  !surfelCellScaleEl ||
+  !surfelSizeEl ||
   !pointCloudEdlEl ||
   !pointCloudFogEl
 ) {
@@ -147,7 +147,7 @@ const safePointCloudProgressEl = pointCloudProgressEl
 const safePointCloudDisclosureEl = pointCloudDisclosureEl
 const safePointCloudModeEl = pointCloudModeEl
 const safePointCloudSizeEl = pointCloudSizeEl
-const safeSurfelCellScaleEl = surfelCellScaleEl
+const safeSurfelSizeEl = surfelSizeEl
 const safePointCloudEdlEl = pointCloudEdlEl
 const safePointCloudFogEl = pointCloudFogEl
 const OPEN_PROJECT_FAILURE_MESSAGE =
@@ -218,7 +218,7 @@ function applyLoadedLayerVisibility(layerId: string, visible: boolean): void {
   const surfaceEntry = derivedSurfaceLayers.get(layerId)
   if (surfaceEntry) viewer.setSurfaceVisible(surfaceEntry.handle, visible)
   const surfelEntry = derivedSurfelLayers.get(layerId)
-  if (surfelEntry) viewer.setAnalyticSurfelsDisplay(surfelEntry.handle, visible, size)
+  if (surfelEntry) viewer.setAnalyticSurfelsDisplay(surfelEntry.handle, visible, Number(safeSurfelSizeEl.value))
   updatePointCloudDisclosure()
 }
 
@@ -535,7 +535,7 @@ async function ensureDerivedSurfelLayerLoaded(layer: SimulationLayer, asset: Ass
     engine.removeAnalyticSurfels(existing.handle)
     derivedSurfelLayers.delete(layer.id)
   } else if (existing) {
-    engine.setAnalyticSurfelsDisplay(existing.handle, layer.status === 'active', Number(safePointCloudSizeEl.value))
+    engine.setAnalyticSurfelsDisplay(existing.handle, layer.status === 'active', Number(safeSurfelSizeEl.value))
     updatePointCloudDisclosure()
     return
   }
@@ -556,7 +556,7 @@ async function ensureDerivedSurfelLayerLoaded(layer: SimulationLayer, asset: Ass
     window.workbench.loadAnalyticSurfelTiles({ assetId: asset.id, keys }).then((response) => response.tiles),
   )
   derivedSurfelLayers.set(layer.id, { layerId: layer.id, assetId: asset.id, handle })
-  engine.setAnalyticSurfelsDisplay(handle, layer.status === 'active', Number(safePointCloudSizeEl.value))
+  engine.setAnalyticSurfelsDisplay(handle, layer.status === 'active', Number(safeSurfelSizeEl.value))
   syncDisclosureRefreshLoop()
   updatePointCloudDisclosure()
 }
@@ -748,12 +748,11 @@ document.querySelector<HTMLButtonElement>('#btn-derived')?.addEventListener('cli
     if (latestSurfaceLayer) await ensureLayerLoaded(latestSurfaceLayer.id)
     return
   }
-  const surfelCellScale = Number(safeSurfelCellScaleEl.value)
-  const result = await window.workbench.generateAnalyticSurfels({ assetId, surfelCellScale })
+  const result = await window.workbench.generateAnalyticSurfels({ assetId, surfelCellScale: DEFAULT_SURFEL_CELL_SCALE })
   renderSession(result.session)
   const surfelLayer = result.session.manifest.simulationLayers.find((layer) => layer.assetId === result.surfelAssetId)
   if (surfelLayer) await ensureLayerLoaded(surfelLayer.id, true)
-  safePointCloudProgressEl.textContent = `Surfels ready: ${compactCount(result.metrics.surfelCount)} surfels across ${result.metrics.nodeCount.toLocaleString()} nodes at cell scale ${surfelCellScale.toFixed(2)}`
+  safePointCloudProgressEl.textContent = `Surfels ready: ${compactCount(result.metrics.surfelCount)} surfels across ${result.metrics.nodeCount.toLocaleString()} nodes`
 })
 
 safePointCloudModeEl.addEventListener('change', () => {
@@ -774,6 +773,11 @@ safePointCloudSizeEl.addEventListener('input', () => {
     const layer = findLayer(entry.layerId)
     viewer.setPointCloudIndexDisplay(entry.handle, layer?.status === 'active', size)
   }
+})
+
+safeSurfelSizeEl.addEventListener('input', () => {
+  if (!viewer) return
+  const size = Number(safeSurfelSizeEl.value)
   for (const entry of derivedSurfelLayers.values()) {
     const layer = findLayer(entry.layerId)
     viewer.setAnalyticSurfelsDisplay(entry.handle, layer?.status === 'active', size)

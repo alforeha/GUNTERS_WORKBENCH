@@ -62,7 +62,7 @@ const analyticSurfelSchema = z.object({
   sourceAssetId: z.string().min(1),
   indexAssetId: z.string().nullable(),
   surfelType: z.literal('analytic-surfel-octree'),
-  surfelVersion: z.literal(1),
+  surfelVersion: z.union([z.literal(1), z.literal(2)]),
   surfelCellScale: z.number().positive().optional(),
   source: z.object({
     headerSha256: z.string().min(1),

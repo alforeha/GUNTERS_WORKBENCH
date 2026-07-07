@@ -3,10 +3,11 @@ import { detectIndexStaleness, formatStaleIndexWarning, isManagedIndexWarning } 
 
 export const ANALYTIC_SURFEL_ASSET_KIND = 'analytic-surfel-render';
 export const ANALYTIC_SURFEL_TYPE = 'analytic-surfel-octree';
-export const ANALYTIC_SURFEL_VERSION = 1;
+export const ANALYTIC_SURFEL_VERSION = 2;
 export const ANALYTIC_SURFEL_GENERATOR_NAME = 'workbench';
 export const ANALYTIC_SURFEL_BUILDER_VERSION = '1.0.0';
 export const ANALYTIC_SURFEL_WARNING_PREFIX = 'Analytic surfel render';
+export const DEFAULT_SURFEL_CELL_SCALE = 2;
 
 export type AnalyticSurfelSourceFingerprint = PointCloudIndexSourceFingerprint;
 export type AnalyticSurfelStalenessResult = IndexStalenessResult;

@@ -586,6 +586,8 @@ export class ProjectService {
           indexAssetId: indexAsset.id,
           rgbEncoding: sourceAsset.pointCloud.rgbEncoding ?? null,
           surfelCellScale: input.surfelCellScale,
+          bbox: input.bbox ?? null,
+          maxPoints: input.maxPoints ?? null,
           sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
           indexDir,
           indexManifest,
@@ -795,6 +797,7 @@ export class ProjectService {
           normals: decoded.normals,
           confidence: decoded.confidence,
           flags: decoded.flags,
+          eigenvalues: decoded.eigenvalues,
         },
       });
     }

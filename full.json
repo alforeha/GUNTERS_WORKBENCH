@@ -1,0 +1,45 @@
+{
+  "projectFolder": "C:\\Users\\Owner\\AppData\\Local\\Temp\\wb-surfel-diag-S2x9vR\\surfel-diag",
+  "sourceAssetId": "point-cloud-1783384561123",
+  "indexBuilt": true,
+  "surfelCellScale": 1,
+  "bbox": null,
+  "maxPoints": null,
+  "indexMetrics": {
+    "pointCount": 381812261,
+    "storedPointCount": 381812261,
+    "tileCount": 8614,
+    "indexSizeBytes": 5453531374,
+    "maxDepthUsed": 9,
+    "wallTimeMs": 404507,
+    "peakBufferedBytes": 154000000
+  },
+  "surfelAssetId": "point-cloud-1783384561123-analytic-surfel",
+  "surfelCount": 45017786,
+  "nodeCount": 8614,
+  "outputSizeBytes": 970488039,
+  "wallTimeMs": 672767,
+  "mergeLevelHistogram": [
+    16132502,
+    17208410,
+    9413142,
+    2762673,
+    763544,
+    197550,
+    52851,
+    17487,
+    6996,
+    3051,
+    1521,
+    410,
+    4893
+  ],
+  "screenAlignedPercent": "91.4%",
+  "singletonDropped": 1547244,
+  "rejectionReasons": {
+    "occupancy": 0,
+    "planarity": 11093996,
+    "residual": 1941433
+  },
+  "level0Fraction": "34.6%"
+}

@@ -1,0 +1,208 @@
+{
+  "projectFolder": "C:\\Users\\Owner\\AppData\\Local\\Temp\\wb-surfel-diag-S2x9vR\\surfel-diag",
+  "sourceAssetId": "point-cloud-1783384561123",
+  "indexBuilt": false,
+  "surfelCellScale": 2,
+  "bbox": {
+    "minX": 2894300,
+    "minY": 1658525,
+    "minZ": 10860,
+    "maxX": 2894360,
+    "maxY": 1658585,
+    "maxZ": 10890
+  },
+  "maxPoints": null,
+  "indexMetrics": null,
+  "surfelAssetId": "point-cloud-1783384561123-analytic-surfel",
+  "inputPointCount": 10198,
+  "surfelCount": 672,
+  "pointsPerSurfelMean": 15.175595238095237,
+  "nodeCount": 13,
+  "outputSizeBytes": 25262,
+  "wallTimeMs": 186,
+  "mergeLevelHistogram": [
+    404,
+    142,
+    126
+  ],
+  "screenAlignedPercent": "0.6%",
+  "screenAlignedCount": 4,
+  "emittedCount": 672,
+  "singletonDropped": 56,
+  "rejectionReasons": {
+    "occupancy": 246,
+    "planarity": 117,
+    "residual": 29
+  },
+  "radiusPercentiles": {
+    "p50": 0.22846491634845734,
+    "p90": 1.7936720848083496,
+    "p99": 5.6710405349731445,
+    "max": 17.35055160522461
+  },
+  "perLevelMaxRadius": [
+    5.6710405349731445,
+    1.7936720848083496,
+    17.35055160522461
+  ],
+  "topLargestSurfels": [
+    {
+      "radius": 17.35055160522461,
+      "center": [
+        2894331.6666666665,
+        1658562.1666666667,
+        10860.796223958334
+      ],
+      "level": 2,
+      "count": 3,
+      "nodeKey": "0-0-0-0"
+    },
+    {
+      "radius": 14.853300094604492,
+      "center": [
+        2894331.5,
+        1658561.7857142857,
+        10862.308035714286
+      ],
+      "level": 2,
+      "count": 7,
+      "nodeKey": "1-0-0-0"
+    },
+    {
+      "radius": 14.755257606506348,
+      "center": [
+        2894317.5714285714,
+        1658527.3035714286,
+        10869.932338169643
+      ],
+      "level": 2,
+      "count": 7,
+      "nodeKey": "2-0-0-0"
+    },
+    {
+      "radius": 10.05937671661377,
+      "center": [
+        2894317.7954545454,
+        1658527.2045454546,
+        10868.649680397728
+      ],
+      "level": 2,
+      "count": 11,
+      "nodeKey": "3-1-1-0"
+    },
+    {
+      "radius": 8.121868133544922,
+      "center": [
+        2894331.060810811,
+        1658562.1993243243,
+        10861.506809543918
+      ],
+      "level": 2,
+      "count": 37,
+      "nodeKey": "2-1-0-0"
+    },
+    {
+      "radius": 5.6710405349731445,
+      "center": [
+        2894331.0722891567,
+        1658562.3478915663,
+        10861.542651073041
+      ],
+      "level": 0,
+      "count": 83,
+      "nodeKey": "3-2-1-0"
+    },
+    {
+      "radius": 5.6710405349731445,
+      "center": [
+        2894333.0833333335,
+        1658558.2916666667,
+        10865.798177083334
+      ],
+      "level": 0,
+      "count": 3,
+      "nodeKey": "3-2-1-0"
+    },
+    {
+      "radius": 5.6710405349731445,
+      "center": [
+        2894331.0722891567,
+        1658562.3478915663,
+        10861.542651073041
+      ],
+      "level": 0,
+      "count": 83,
+      "nodeKey": "3-2-1-0"
+    },
+    {
+      "radius": 5.6710405349731445,
+      "center": [
+        2894333.0833333335,
+        1658558.2916666667,
+        10865.798177083334
+      ],
+      "level": 0,
+      "count": 3,
+      "nodeKey": "3-2-1-0"
+    },
+    {
+      "radius": 5.549213409423828,
+      "center": [
+        2894316.484375,
+        1658528.9296875,
+        10862.385559082031
+      ],
+      "level": 0,
+      "count": 16,
+      "nodeKey": "4-3-3-0"
+    }
+  ],
+  "topLargestSurfelsUniqueByAncestry": [
+    {
+      "radius": 17.35055160522461,
+      "center": [
+        2894331.6666666665,
+        1658562.1666666667,
+        10860.796223958334
+      ],
+      "level": 2,
+      "count": 3,
+      "nodeKey": "0-0-0-0"
+    },
+    {
+      "radius": 14.755257606506348,
+      "center": [
+        2894317.5714285714,
+        1658527.3035714286,
+        10869.932338169643
+      ],
+      "level": 2,
+      "count": 7,
+      "nodeKey": "2-0-0-0"
+    },
+    {
+      "radius": 5.6710405349731445,
+      "center": [
+        2894333.0833333335,
+        1658558.2916666667,
+        10865.798177083334
+      ],
+      "level": 0,
+      "count": 3,
+      "nodeKey": "3-2-1-0"
+    },
+    {
+      "radius": 5.549213409423828,
+      "center": [
+        2894316.484375,
+        1658528.9296875,
+        10862.385559082031
+      ],
+      "level": 0,
+      "count": 16,
+      "nodeKey": "4-3-3-0"
+    }
+  ],
+  "clampedRadiusCount": 0,
+  "level0Fraction": "60.1%"
+}

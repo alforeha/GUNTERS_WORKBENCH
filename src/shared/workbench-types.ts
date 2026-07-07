@@ -107,7 +107,7 @@ export interface AnalyticSurfelMetadata {
   sourceAssetId: string;
   indexAssetId: string | null;
   surfelType: 'analytic-surfel-octree';
-  surfelVersion: 1;
+  surfelVersion: 1 | 2;
   surfelCellScale?: number;
   source: {
     headerSha256: string;
@@ -322,6 +322,8 @@ export interface LoadPointCloudIndexTilesInput {
 export interface GenerateAnalyticSurfelsInput {
   assetId: string;
   surfelCellScale?: number;
+  bbox?: PointCloudBoundsBox;
+  maxPoints?: number;
 }
 
 export interface AnalyticSurfelProgress {
@@ -333,8 +335,10 @@ export interface AnalyticSurfelProgress {
 export interface AnalyticSurfelMetricsSummary {
   surfelCount: number;
   nodeCount: number;
+  inputPointCount: number;
   outputSizeBytes: number;
   wallTimeMs: number;
+  mergeMetrics?: import('../core/pointcloud/analytic-surfels').MergeMetrics;
 }
 
 export interface AnalyticSurfelHierarchyNode {
@@ -364,6 +368,7 @@ export interface AnalyticSurfelTilePayload {
   normals: Float32Array;
   confidence: Float32Array;
   flags: Uint8Array;
+  eigenvalues: Float32Array;
 }
 
 export interface LoadAnalyticSurfelHierarchyInput {

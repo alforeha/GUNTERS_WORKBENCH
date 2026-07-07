@@ -866,8 +866,8 @@ uniform float edlOrtho;
     this.requestRender();
   }
 
-  setAnalyticSurfelsDisplay(handle: string, visible: boolean, size: number): void {
-    this.analyticSurfels.get(handle)?.setDisplay(visible, size);
+  setAnalyticSurfelsDisplay(handle: string, visible: boolean, sizeScale: number): void {
+    this.analyticSurfels.get(handle)?.setDisplay(visible, sizeScale);
     this.requestRender();
   }
 

@@ -1,0 +1,180 @@
+{
+  "projectFolder": "C:\\Users\\Owner\\AppData\\Local\\Temp\\wb-surfel-diag-S2x9vR\\surfel-diag",
+  "sourceAssetId": "point-cloud-1783384561123",
+  "indexBuilt": false,
+  "surfelCellScale": 1,
+  "bbox": {
+    "minX": 2895512,
+    "minY": 1658637.25,
+    "minZ": 10867.380859375,
+    "maxX": 2895522,
+    "maxY": 1658647.25,
+    "maxZ": 10877.380859375
+  },
+  "maxPoints": null,
+  "indexMetrics": null,
+  "surfelAssetId": "point-cloud-1783384561123-analytic-surfel",
+  "surfelCount": 63,
+  "nodeCount": 4,
+  "outputSizeBytes": 4822,
+  "wallTimeMs": 112,
+  "mergeLevelHistogram": [
+    56,
+    2,
+    0,
+    4,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1
+  ],
+  "screenAlignedPercent": "79.4%",
+  "screenAlignedCount": 50,
+  "emittedCount": 63,
+  "singletonDropped": 0,
+  "rejectionReasons": {
+    "occupancy": 18,
+    "planarity": 9,
+    "residual": 5
+  },
+  "radiusPercentiles": {
+    "p50": 0.5034719705581665,
+    "p90": 2.2341930866241455,
+    "p99": 3.4545505046844482,
+    "max": 19.158374786376953
+  },
+  "perLevelMaxRadius": [
+    3.4545505046844482,
+    0.7540664076805115,
+    0,
+    0.6650240421295166,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    19.158374786376953
+  ],
+  "topLargestSurfels": [
+    {
+      "radius": 19.158374786376953,
+      "center": [
+        2895516.25,
+        1658644.375,
+        10873.1494140625
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "2-3-0-0"
+    },
+    {
+      "radius": 3.4545505046844482,
+      "center": [
+        2895521.25,
+        1658646.75,
+        10873.390625
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    },
+    {
+      "radius": 3.4545505046844482,
+      "center": [
+        2895521.25,
+        1658646.75,
+        10873.390625
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    },
+    {
+      "radius": 2.7557778358459473,
+      "center": [
+        2895520.75,
+        1658643.375,
+        10873.5966796875
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    },
+    {
+      "radius": 2.7557778358459473,
+      "center": [
+        2895520.75,
+        1658643.375,
+        10873.5966796875
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    },
+    {
+      "radius": 2.4427359104156494,
+      "center": [
+        2895521.25,
+        1658640.75,
+        10874.3876953125
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    },
+    {
+      "radius": 2.4427359104156494,
+      "center": [
+        2895521.25,
+        1658640.75,
+        10874.3876953125
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    },
+    {
+      "radius": 2.2341930866241455,
+      "center": [
+        2895515.75,
+        1658646.625,
+        10872.8876953125
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    },
+    {
+      "radius": 2.2341930866241455,
+      "center": [
+        2895514.75,
+        1658639.5,
+        10874.169921875
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    },
+    {
+      "radius": 2.2341930866241455,
+      "center": [
+        2895516.25,
+        1658643.5,
+        10872.96484375
+      ],
+      "level": -1,
+      "count": 0,
+      "nodeKey": "3-6-1-0"
+    }
+  ],
+  "clampedRadiusCount": 0,
+  "level0Fraction": "88.9%"
+}
