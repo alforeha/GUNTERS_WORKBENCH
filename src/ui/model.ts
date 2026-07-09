@@ -1,0 +1,580 @@
+// src/ui/model.ts - pure view-model builders and manifest transforms for the UI shell.
+// No DOM, no three.js, no electron imports: everything here runs in a plain node
+// environment so the UI tests can exercise it without a browser runtime.
+//
+// The manifest spine stays flat (assets + simulationLayers keyed by simulationId).
+// This module is the single place that regroups those flat records into the
+// asset-centered presentation the panels render. Truth lives on assets; layer
+// lifecycle (active | hidden | error) is separate and never conflated here.
+
+import type {
+  AssetRecord,
+  ProjectManifest,
+  SimulationLayer,
+  SimulationLayerKind,
+  SimulationLayerStatus,
+} from '../shared/workbench-types'
+import { isStaleIndexWarning } from '../shared/pointcloud-index'
+
+// ---------------------------------------------------------------------------
+// Shared helpers (moved from main.ts so panels and tests share one copy)
+// ---------------------------------------------------------------------------
+
+export function resolveLayerKind(layer: SimulationLayer, asset: AssetRecord | null): SimulationLayerKind {
+  if (layer.kind !== 'asset') return layer.kind
+  if (asset?.kind === 'point-cloud-index') return 'point-cloud-index'
+  if (asset?.kind === 'point-cloud') return 'point-cloud-preview'
+  if (asset?.kind === 'analytic-surfel-render' && asset.truthStatus === 'derived') return 'derived-surfel'
+  if (asset?.kind === 'surface' && asset.truthStatus === 'derived') return 'derived-surface'
+  return 'asset'
+}
+
+export function findLayer(manifest: ProjectManifest, layerId: string): SimulationLayer | null {
+  return manifest.simulationLayers.find((candidate) => candidate.id === layerId) ?? null
+}
+
+export function findLayerAsset(layer: SimulationLayer, manifest: ProjectManifest): AssetRecord | null {
+  return layer.assetId ? manifest.assets.find((asset) => asset.id === layer.assetId) ?? null : null
+}
+
+export function isDerivedArtifactPath(managedPath: string | null): managedPath is string {
+  return managedPath !== null && managedPath.replace(/\\/g, '/').startsWith('derived/')
+}
+
+export function compactCount(value: number): string {
+  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
+}
+
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '--'
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unit = 'B'
+  for (const next of units) {
+    if (value < 1024) break
+    value = value / 1024
+    unit = next
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${unit}`
+}
+
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+export function unitsShortLabel(unitsLinear: string | null | undefined): string {
+  if (unitsLinear === 'usSurveyFoot') return 'usft'
+  if (unitsLinear === 'foot') return 'ft'
+  if (unitsLinear === 'meter') return 'm'
+  return '--'
+}
+
+/** Units label for the footer readout: first point-cloud asset wins, else '--'. */
+export function projectUnitsLabel(manifest: ProjectManifest | null): string {
+  if (!manifest) return '--'
+  const withCloud = manifest.assets.find((asset) => asset.pointCloud !== undefined)
+  if (withCloud?.pointCloud) return unitsShortLabel(withCloud.pointCloud.unitsLinear)
+  return '--'
+}
+
+export function projectDisplayName(projectFolder: string, manifest: ProjectManifest): string {
+  const infoName = manifest.info && typeof manifest.info['name'] === 'string' ? (manifest.info['name'] as string) : ''
+  if (infoName.trim().length > 0) return infoName.trim()
+  const parts = projectFolder.replace(/\\/g, '/').split('/').filter((part) => part.length > 0)
+  return parts[parts.length - 1] ?? projectFolder
+}
+
+export function headerTitle(projectName: string | null): string {
+  return projectName ? `${projectName} Workbench` : "Gunter's Workbench"
+}
+
+/** Project/recovery status lines shown at the bottom of the Display Manager. */
+export interface ProjectStatusLines {
+  projectLine: string
+  recoveryLine: string
+}
+
+// ---------------------------------------------------------------------------
+// Disclosure line builders (the four-state disclosure moved to the banner)
+// ---------------------------------------------------------------------------
+
+export interface PreviewDisclosureInput {
+  sampledPointCount: number
+  totalPointCount: number
+  warnings: string[]
+  sourceAvailable: boolean
+}
+
+/** Preview layer disclosure. densifiedCount > 0 with a live source = mixed display. */
+export function buildPreviewDisclosureLine(preview: PreviewDisclosureInput, densifiedCount: number): string {
+  const mixed = densifiedCount > 0 && preview.sourceAvailable
+  const warningText = preview.warnings.length > 0 ? ` WARNING: ${preview.warnings.join(' | ')}` : ''
+  const disclosure = mixed
+    ? `Preview - sampled ${compactCount(preview.sampledPointCount)} of ${compactCount(preview.totalPointCount)} points - source densification fallback`
+    : `Preview - sampled ${compactCount(preview.sampledPointCount)} of ${compactCount(preview.totalPointCount)} points`
+  return `${disclosure} - truth preview-sampled; source asset remains source${warningText}`
+}
+
+/** Index layer disclosure wraps the engine's streaming text with the truth statement. */
+export function buildIndexDisclosureLine(engineText: string): string {
+  return `${engineText} - truth indexed-full; source asset remains source`
+}
+
+// ---------------------------------------------------------------------------
+// Manifest transforms (pure; callers persist via the existing saveProject path)
+// ---------------------------------------------------------------------------
+
+export interface LayerVisibilityUpdate {
+  layerId: string
+  visible: boolean
+}
+
+/**
+ * The ONLY manifest mutation the display UI performs: layer status writes.
+ * Returns a clone; everything except status/modifiedAt on the targeted layers
+ * is untouched (asserted by the no-manifest-drift test).
+ */
+export function applyLayerStatusUpdates(manifest: ProjectManifest, updates: LayerVisibilityUpdate[]): ProjectManifest {
+  const next = structuredClone(manifest)
+  const stamp = new Date().toISOString()
+  for (const update of updates) {
+    const layer = next.simulationLayers.find((candidate) => candidate.id === update.layerId)
+    if (!layer) continue
+    layer.status = update.visible ? 'active' : 'hidden'
+    layer.modifiedAt = stamp
+  }
+  return next
+}
+
+/** Marks a single layer as errored (load failure); same write surface as status updates. */
+export function applyLayerErrorStatus(manifest: ProjectManifest, layerId: string): ProjectManifest {
+  const next = structuredClone(manifest)
+  const layer = next.simulationLayers.find((candidate) => candidate.id === layerId)
+  if (layer) {
+    layer.status = 'error'
+    layer.modifiedAt = new Date().toISOString()
+  }
+  return next
+}
+
+/** Source asset id + all derived assets that point back to it (index / surfels). */
+export function collectAssetGroupIds(manifest: ProjectManifest, sourceAssetId: string): string[] {
+  const ids = [sourceAssetId]
+  for (const asset of manifest.assets) {
+    if (asset.pointCloudIndex?.sourceAssetId === sourceAssetId) ids.push(asset.id)
+    else if (asset.analyticSurfel?.sourceAssetId === sourceAssetId) ids.push(asset.id)
+  }
+  return ids
+}
+
+export interface RemoveAssetResult {
+  manifest: ProjectManifest
+  removedAssetIds: string[]
+  removedLayerIds: string[]
+}
+
+/**
+ * Removes an asset, its derived assets (index / surfel via sourceAssetId), and all
+ * simulation layers referencing them. Files on disk are NOT touched - the confirm
+ * dialog discloses that. No other manifest fields change.
+ */
+export function removeAssetFromManifest(manifest: ProjectManifest, assetId: string): RemoveAssetResult {
+  const next = structuredClone(manifest)
+  const removedAssetIds = collectAssetGroupIds(next, assetId)
+  const removedSet = new Set(removedAssetIds)
+  const removedLayerIds = next.simulationLayers
+    .filter((layer) => layer.assetId !== null && removedSet.has(layer.assetId))
+    .map((layer) => layer.id)
+  next.assets = next.assets.filter((asset) => !removedSet.has(asset.id))
+  next.simulationLayers = next.simulationLayers.filter(
+    (layer) => layer.assetId === null || !removedSet.has(layer.assetId),
+  )
+  return { manifest: next, removedAssetIds, removedLayerIds }
+}
+
+// ---------------------------------------------------------------------------
+// Left panel: asset-centered card view-models
+// ---------------------------------------------------------------------------
+
+export type ColorMode = 'rgb' | 'elevation' | 'intensity'
+
+/** Session-only per-layer appearance (persistence decision: NOT written to the manifest). */
+export interface LayerAppearance {
+  colorMode: ColorMode
+  pointSize: number
+  surfelScale: number
+}
+
+export const DEFAULT_LAYER_APPEARANCE: LayerAppearance = { colorMode: 'rgb', pointSize: 2, surfelScale: 2 }
+
+export type AssetViewKind = 'preview' | 'index' | 'surfel'
+
+export interface AssetViewModel {
+  layerId: string
+  viewKind: AssetViewKind
+  label: string
+  truthLabel: string
+  status: SimulationLayerStatus
+  active: boolean
+  warnings: string[]
+  supportsColorMode: boolean
+  supportsPointSize: boolean
+  supportsSurfelScale: boolean
+}
+
+export interface MissingViewModel {
+  viewKind: 'index' | 'surfel'
+  label: string
+  hint: string
+}
+
+export interface PointCloudCardModel {
+  assetId: string
+  name: string
+  extLabel: string
+  truthStatus: string
+  detail: string
+  warnings: string[]
+  views: AssetViewModel[]
+  missingViews: MissingViewModel[]
+  masterOn: boolean
+  groupAssetIds: string[]
+  /** No asset metadata carries classification data today; kept for honest display. */
+  hasClassification: boolean
+}
+
+function extLabelForAsset(asset: AssetRecord): string {
+  const ext = asset.pointCloud?.extension ?? ''
+  const cleaned = ext.replace(/^\./, '').toUpperCase()
+  if (cleaned.length > 0) return cleaned
+  const match = asset.name.match(/\.([A-Za-z0-9]+)$/)
+  return match ? match[1].toUpperCase() : asset.kind.toUpperCase()
+}
+
+function pointCloudDetail(asset: AssetRecord): string {
+  const meta = asset.pointCloud
+  if (!meta) return asset.kind
+  return `${compactCount(meta.pointCount)} pts - LAS ${meta.lasVersion} PDRF ${meta.pointFormat}`
+}
+
+function viewForLayer(layer: SimulationLayer, owningAsset: AssetRecord, kind: SimulationLayerKind): AssetViewModel | null {
+  if (kind === 'point-cloud-preview') {
+    return {
+      layerId: layer.id,
+      viewKind: 'preview',
+      label: 'Preview points',
+      truthLabel: 'preview-sampled',
+      status: layer.status,
+      active: layer.status === 'active',
+      warnings: owningAsset.warnings,
+      supportsColorMode: true,
+      supportsPointSize: true,
+      supportsSurfelScale: false,
+    }
+  }
+  if (kind === 'point-cloud-index') {
+    return {
+      layerId: layer.id,
+      viewKind: 'index',
+      label: 'Indexed points (full)',
+      truthLabel: 'indexed-full',
+      status: layer.status,
+      active: layer.status === 'active',
+      warnings: owningAsset.warnings,
+      supportsColorMode: true,
+      supportsPointSize: true,
+      supportsSurfelScale: false,
+    }
+  }
+  if (kind === 'derived-surfel') {
+    return {
+      layerId: layer.id,
+      viewKind: 'surfel',
+      label: 'Surfels (derived)',
+      truthLabel: 'derived',
+      status: layer.status,
+      active: layer.status === 'active',
+      warnings: owningAsset.warnings,
+      supportsColorMode: false,
+      supportsPointSize: false,
+      supportsSurfelScale: true,
+    }
+  }
+  return null
+}
+
+/**
+ * Groups the flat manifest into asset-centered point-cloud cards: the source asset
+ * plus its derived index / surfel assets, with each asset-hosted view as one row.
+ * Presentation-only regrouping - the manifest itself stays flat.
+ */
+export function buildPointCloudCards(manifest: ProjectManifest): PointCloudCardModel[] {
+  const cards: PointCloudCardModel[] = []
+  for (const source of manifest.assets) {
+    if (source.kind !== 'point-cloud') continue
+    const groupAssetIds = collectAssetGroupIds(manifest, source.id)
+    const groupSet = new Set(groupAssetIds)
+    const views: AssetViewModel[] = []
+    for (const layer of manifest.simulationLayers) {
+      if (layer.assetId === null || !groupSet.has(layer.assetId)) continue
+      const owningAsset = manifest.assets.find((asset) => asset.id === layer.assetId) ?? null
+      if (!owningAsset) continue
+      const kind = resolveLayerKind(layer, owningAsset)
+      const view = viewForLayer(layer, owningAsset, kind)
+      if (view) views.push(view)
+    }
+
+    const order: Record<AssetViewKind, number> = { preview: 0, index: 1, surfel: 2 }
+    views.sort((a, b) => order[a.viewKind] - order[b.viewKind])
+
+    const missingViews: MissingViewModel[] = []
+    if (!views.some((view) => view.viewKind === 'index')) {
+      missingViews.push({
+        viewKind: 'index',
+        label: 'Indexed points - not built',
+        hint: 'Open this asset to build the index',
+      })
+    }
+    if (!views.some((view) => view.viewKind === 'surfel')) {
+      missingViews.push({
+        viewKind: 'surfel',
+        label: 'Surfels - not generated',
+        hint: 'Open this asset to generate surfels',
+      })
+    }
+
+    cards.push({
+      assetId: source.id,
+      name: source.name,
+      extLabel: extLabelForAsset(source),
+      truthStatus: source.truthStatus,
+      detail: pointCloudDetail(source),
+      warnings: source.warnings,
+      views,
+      missingViews,
+      masterOn: views.some((view) => view.active),
+      groupAssetIds,
+      hasClassification: false,
+    })
+  }
+  return cards
+}
+
+/** Minimal surface cards so existing derived-surface layers keep their visibility toggle. */
+export interface SurfaceCardModel {
+  assetId: string
+  name: string
+  truthStatus: string
+  layerId: string | null
+  active: boolean
+}
+
+export function buildSurfaceCards(manifest: ProjectManifest): SurfaceCardModel[] {
+  const cards: SurfaceCardModel[] = []
+  for (const asset of manifest.assets) {
+    if (asset.kind !== 'surface') continue
+    const layer = manifest.simulationLayers.find((candidate) => candidate.assetId === asset.id) ?? null
+    cards.push({
+      assetId: asset.id,
+      name: asset.name,
+      truthStatus: asset.truthStatus,
+      layerId: layer?.id ?? null,
+      active: layer?.status === 'active',
+    })
+  }
+  return cards
+}
+
+// ---------------------------------------------------------------------------
+// Master pill: whole-asset display override that preserves per-layer sub-state
+// ---------------------------------------------------------------------------
+
+export interface MasterToggleResult {
+  updates: LayerVisibilityUpdate[]
+  /** Remembered per-layer visibility to hold in UI memory (null clears the memory). */
+  remember: Map<string, boolean> | null
+}
+
+/**
+ * Master pill semantics: turning the asset OFF remembers each view's current
+ * visibility and hides the active ones; turning it back ON restores exactly the
+ * remembered per-layer state (default: all non-error views on). The override is
+ * held in UI memory - per-layer state in the manifest is only written through
+ * the same status-update path every other toggle uses.
+ */
+export function computeMasterToggleUpdates(
+  views: AssetViewModel[],
+  remembered: Map<string, boolean> | null,
+  targetOn: boolean,
+): MasterToggleResult {
+  if (!targetOn) {
+    const remember = new Map<string, boolean>()
+    const updates: LayerVisibilityUpdate[] = []
+    for (const view of views) {
+      remember.set(view.layerId, view.active)
+      if (view.active) updates.push({ layerId: view.layerId, visible: false })
+    }
+    return { updates, remember }
+  }
+
+  const updates: LayerVisibilityUpdate[] = []
+  for (const view of views) {
+    const desired = remembered?.has(view.layerId) ? remembered.get(view.layerId) === true : view.status !== 'error'
+    if (desired !== view.active) updates.push({ layerId: view.layerId, visible: desired })
+  }
+  return { updates, remember: null }
+}
+
+// ---------------------------------------------------------------------------
+// Right panel: Sim shell view-model
+// ---------------------------------------------------------------------------
+
+export interface SimTabModel {
+  id: string
+  label: string
+  count: number
+  addLabel: string
+}
+
+export interface SimPanelModel {
+  featureCount: number
+  groundLabel: string
+  tabs: SimTabModel[]
+}
+
+/**
+ * The Sim panel is a shell this phase: the feature schema still only knows
+ * marker | polyline | measurement, so the taxonomy tabs report zero counts and
+ * the legacy types map onto their nearest future group. No schema types added.
+ */
+export function buildSimPanelModel(manifest: ProjectManifest | null): SimPanelModel {
+  const features = manifest?.features ?? []
+  const count = (type: string): number => features.filter((feature) => feature.type === type).length
+  return {
+    featureCount: features.length,
+    groundLabel: 'Ground: not set',
+    tabs: [
+      { id: 'regions', label: 'Regions', count: 0, addLabel: '+ Add region' },
+      { id: 'objects', label: 'Objects', count: 0, addLabel: '+ Add object' },
+      { id: 'buildings', label: 'Buildings', count: 0, addLabel: '+ Add building' },
+      { id: 'utilities', label: 'Utilities', count: 0, addLabel: '+ Add utility' },
+      { id: 'lines', label: 'Lines/Breaklines', count: count('polyline'), addLabel: '+ Add line' },
+      { id: 'notes', label: 'Notes/Flags', count: count('marker'), addLabel: '+ Add note' },
+      { id: 'measurements', label: 'Measurements', count: count('measurement'), addLabel: '+ Add measurement' },
+    ],
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Right panel: opened-asset work surface view-model
+// ---------------------------------------------------------------------------
+
+export interface DerivedStatusModel {
+  present: boolean
+  summary: string
+  generatedAt: string | null
+  stale: boolean
+  staleNote: string | null
+  actionLabel: string
+}
+
+export interface WorkSurfaceModel {
+  assetId: string
+  name: string
+  kindLabel: string
+  truthStatus: string
+  importPolicy: 'copy' | 'reference'
+  sourcePath: string | null
+  managedPath: string | null
+  unitsLabel: string
+  pointSummary: string | null
+  boundsSummary: string | null
+  warnings: string[]
+  index: DerivedStatusModel
+  surfels: DerivedStatusModel
+}
+
+function boundsSummary(asset: AssetRecord): string | null {
+  const bounds = asset.pointCloud?.bounds
+  if (!bounds) return null
+  const f = (v: number): string => v.toFixed(2)
+  return `E ${f(bounds.minX)} to ${f(bounds.maxX)} | N ${f(bounds.minY)} to ${f(bounds.maxY)} | Z ${f(bounds.minZ)} to ${f(bounds.maxZ)}`
+}
+
+export function buildWorkSurfaceModel(manifest: ProjectManifest, assetId: string): WorkSurfaceModel | null {
+  const asset = manifest.assets.find((candidate) => candidate.id === assetId)
+  if (!asset || asset.kind !== 'point-cloud') return null
+
+  const indexAsset = manifest.assets.find((candidate) => candidate.pointCloudIndex?.sourceAssetId === assetId)
+  const surfelAsset = manifest.assets.find((candidate) => candidate.analyticSurfel?.sourceAssetId === assetId)
+
+  const indexStale = indexAsset !== undefined && indexAsset.warnings.some((warning) => isStaleIndexWarning(warning))
+  const index: DerivedStatusModel = indexAsset?.pointCloudIndex
+    ? {
+        present: true,
+        summary: `${compactCount(indexAsset.pointCloudIndex.pointCount)} points indexed (WPI v${indexAsset.pointCloudIndex.indexVersion})`,
+        generatedAt: indexAsset.pointCloudIndex.generatedAt,
+        stale: indexStale,
+        staleNote: indexStale
+          ? 'The source file changed after this index was built. Rebuild to match the current source.'
+          : null,
+        actionLabel: 'Rebuild index',
+      }
+    : {
+        present: false,
+        summary: 'No index yet. Build one for reliable full-detail streaming.',
+        generatedAt: null,
+        stale: false,
+        staleNote: null,
+        actionLabel: 'Build index',
+      }
+
+  const surfelStale =
+    surfelAsset?.analyticSurfel !== undefined &&
+    asset.pointCloud !== undefined &&
+    surfelAsset.analyticSurfel.source.headerSha256 !== asset.pointCloud.headerSha256
+  const surfels: DerivedStatusModel = surfelAsset?.analyticSurfel
+    ? {
+        present: true,
+        summary: `${compactCount(surfelAsset.analyticSurfel.surfelCount)} surfels (v${surfelAsset.analyticSurfel.surfelVersion})`,
+        generatedAt: surfelAsset.analyticSurfel.generatedAt,
+        stale: surfelStale,
+        staleNote: surfelStale
+          ? 'The source file changed after these surfels were generated. Regenerate to match the current source.'
+          : null,
+        actionLabel: 'Regenerate surfels',
+      }
+    : {
+        present: false,
+        summary: 'No surfel layer yet. Generate one for a surface-like impression of the cloud.',
+        generatedAt: null,
+        stale: false,
+        staleNote: null,
+        actionLabel: 'Generate surfels',
+      }
+
+  const meta = asset.pointCloud
+  return {
+    assetId: asset.id,
+    name: asset.name,
+    kindLabel: 'Point cloud',
+    truthStatus: asset.truthStatus,
+    importPolicy: asset.importPolicy,
+    sourcePath: asset.sourcePath,
+    managedPath: asset.managedPath,
+    unitsLabel: meta ? unitsShortLabel(meta.unitsLinear) : unitsShortLabel(asset.units),
+    pointSummary: meta
+      ? `${meta.pointCount.toLocaleString('en-US')} points - LAS ${meta.lasVersion} PDRF ${meta.pointFormat} - ${formatBytes(meta.fileSize)}`
+      : null,
+    boundsSummary: boundsSummary(asset),
+    warnings: asset.warnings,
+    index,
+    surfels,
+  }
+}

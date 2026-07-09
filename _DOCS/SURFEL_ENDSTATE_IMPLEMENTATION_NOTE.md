@@ -200,23 +200,34 @@ npm exec tsx scripts/build-surfel-diag.mts -- --project-folder="C:\Users\Owner\A
 
 ## Owner-run TODOs
 
-### TODO: Full-scale directional diff
+### Full-scale directional diff (filled)
 
-- output placeholder: `_DOCS/SURFEL_ENDSTATE_AFTER_FULL.json`
+- source after: `_DOCS/SURFEL_ENDSTATE_AFTER_FULL.json`
+- source restored baseline: `_DOCS/SURFEL_RESTORE_AFTER_FULL.json`
+- both are full-scale, `surfelCellScale = 2`, `indexBuilt = false`, same 381,812,261 input points
 
-Fill in:
+Results (restored baseline -> end-state after):
 
-- `clampedRadiusCount` after vs. restored full baseline (`3521 -> ?`)
-- max radius after vs. restored full baseline (`1006 ft -> ?`)
-- surfel count after vs. restored full baseline (`29.0M -> ?`)
-- merge histogram after vs. restored full baseline
-- top largest surfels raw and ancestry-deduped after full run
+- `clampedRadiusCount`: `3521 -> 0`
+- max radius: `1006.28 ft -> 15.72 ft`
+- surfel count: `29,020,295 -> 32,007,819` (+2,987,524, +10.3%)
+- output size: `732.9 MB -> 796.4 MB`
+- `p50 / p90 / p99`: `0.2285 / 0.4616 / 1.9653` -> `0.2285 / 0.4878 / 0.9871` (p99 tail cut roughly in half)
+- merge histogram (baseline): `[14258109, 9497905, 3706800, 1126604, 292583, 91700, 26404, 9145, 3692, 1634, 615, 390, 4714]`
+- merge histogram (after): `[14258109, 9497905, 8251805]`
+- `perLevelMaxRadius` (after): `[5.55, 7.86, 15.72]` ft — no level above 2 survives
 
-Expected direction:
+Top largest surfels — raw and ancestry-deduped agree:
 
-- `clampedRadiusCount` collapses toward `0`
-- max radius falls from `1006 ft` into the tens-of-feet regime
-- surfel count rises above `29.0M` because Option B decomposes deep merges
+- all ten entries are `radius = 15.72 ft`, `level = 2`, real `count` values (14-29 points), `nodeKey = 0-0-0-0`
+- the baseline's `level -1 / count 0` mega-discs (1006 ft, 522 ft) are gone; P3 diagnostics now report real levels/counts
+
+Direction confirmed against expectation:
+
+- `clampedRadiusCount` collapsed to exactly `0`
+- max radius fell from `1006 ft` into the tens-of-feet regime (15.72 ft)
+- surfel count rose above `29.0M` (to `32.0M`) as Option B decomposes deep merges into levels `0-2`
+- levels `3-12` (which held the entire hundreds-of-feet tail) are fully eliminated
 
 ### TODO: In-app visual check
 

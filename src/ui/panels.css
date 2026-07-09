@@ -1,0 +1,439 @@
+/* src/ui/panels.css - left Display Manager + right Sim panel / work surface. */
+
+/* Panels overlay the viewer: the canvas never resizes or reflows - panels
+   just show or don't. Width is one third of the window (min 320px). */
+.side-panel {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 40;
+  width: var(--panel-width);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: rgba(12, 20, 31, 0.94);
+}
+
+.left-panel {
+  left: 0;
+  border-right: 1px solid #2d425d;
+}
+
+.right-panel {
+  right: 0;
+  border-left: 1px solid #2d425d;
+}
+
+.side-panel.panel-closed {
+  display: none;
+}
+
+.panel-detach {
+  margin-left: auto;
+  flex: none;
+  padding: 3px 9px;
+  font-size: 11px;
+  border-radius: 999px;
+}
+
+.panel-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  border-bottom: 1px solid #2d425d;
+}
+
+.panel-tabs {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #2d425d;
+}
+
+.panel-tab {
+  padding: 4px 8px;
+  font-size: 11px;
+  border-radius: 999px;
+  border-color: transparent;
+  background: transparent;
+  color: #a9c7e7;
+}
+
+.panel-tab.tab-active {
+  background: #24486f;
+  color: #d6dfeb;
+  border-color: #33608e;
+}
+
+.panel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.panel-status {
+  flex: none;
+  padding: 6px 10px;
+  border-top: 1px solid #2d425d;
+  font-size: 11px;
+  color: #7d97b6;
+}
+
+.panel-status-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-placeholder {
+  padding: 14px 10px;
+  font-size: 12px;
+  color: #7d97b6;
+  border: 1px dashed #2d425d;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.tab-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.tab-note {
+  font-size: 11px;
+  color: #a9c7e7;
+}
+
+/* ---------------------------------------------------------------------------
+   Asset cards (Display Manager)
+--------------------------------------------------------------------------- */
+
+.asset-card {
+  background: #122130;
+  border: 1px solid #2b425c;
+  border-radius: 8px;
+}
+
+.asset-card-off {
+  opacity: 0.55;
+}
+
+.asset-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  cursor: pointer;
+}
+
+.asset-card-simple .asset-card-header {
+  cursor: default;
+}
+
+.asset-card-expanded {
+  border-color: #33608e;
+}
+
+.ext-pill {
+  flex: none;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  background: #24486f;
+  border-color: #33608e;
+}
+
+.ext-pill-off {
+  background: transparent;
+  border-color: #33506e;
+  color: #7d97b6;
+  text-decoration: line-through;
+}
+
+.asset-card-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.asset-card-name {
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.asset-card-detail {
+  font-size: 11px;
+  color: #7d97b6;
+}
+
+.asset-card-body {
+  border-top: 1px solid #2b425c;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.view-row {
+  border: 1px solid #22364c;
+  border-radius: 7px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.view-row-disabled {
+  opacity: 0.5;
+  border-style: dashed;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.view-row-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.view-row-label {
+  flex: 1;
+}
+
+.view-hint {
+  font-size: 11px;
+  color: #7d97b6;
+}
+
+.layer-error-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: #6f2430;
+}
+
+.view-row-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 22px;
+}
+
+.view-control {
+  display: grid;
+  grid-template-columns: 76px 1fr;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: #a9c7e7;
+}
+
+.view-control input[type='range'] {
+  width: 100%;
+}
+
+.view-control select {
+  width: 100%;
+}
+
+.card-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.asset-card-footer {
+  display: flex;
+  gap: 6px;
+}
+
+.remove-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid #8d3a16;
+  border-radius: 7px;
+  background: rgba(120, 50, 15, 0.22);
+  color: #ffcfa5;
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------------------
+   Right panel: Sim shell
+--------------------------------------------------------------------------- */
+
+.sim-controls {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #2d425d;
+  position: relative;
+}
+
+.sim-master {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  flex: 1;
+  min-width: 0;
+}
+
+.sim-feature-count {
+  font-size: 11px;
+  color: #7d97b6;
+  white-space: nowrap;
+}
+
+.sim-display-switch {
+  display: flex;
+  border: 1px solid #33506e;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.switch-option {
+  border: none;
+  border-radius: 0;
+  padding: 3px 10px;
+  font-size: 11px;
+  background: transparent;
+}
+
+.switch-option.switch-active {
+  background: #24486f;
+}
+
+.sim-menu-button {
+  padding: 3px 8px;
+}
+
+.sim-menu-dropdown {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 8px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  min-width: 240px;
+  background: #16232f;
+  border: 1px solid #33506e;
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.ground-strip {
+  flex: none;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: #a9c7e7;
+  background: rgba(36, 72, 111, 0.25);
+  border-bottom: 1px solid #2d425d;
+}
+
+.sim-add-button {
+  align-self: flex-start;
+}
+
+/* ---------------------------------------------------------------------------
+   Right panel: opened-asset work surface
+--------------------------------------------------------------------------- */
+
+.ws-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ws-name {
+  font-size: 14px;
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ws-meta-row {
+  display: grid;
+  grid-template-columns: 74px 1fr;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.ws-meta-label {
+  color: #7d97b6;
+}
+
+.ws-meta-value {
+  word-break: break-all;
+}
+
+.ws-section {
+  border: 1px solid #22364c;
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ws-section-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ws-detail {
+  font-size: 12px;
+  color: #a9c7e7;
+}
+
+.ws-stale {
+  font-size: 12px;
+  color: #ffd6a2;
+}
+
+.ws-stale-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  text-transform: uppercase;
+  background: #6f5124;
+}
+
+.ws-section button {
+  align-self: flex-start;
+}
+
+.ws-later {
+  border-style: dashed;
+}
