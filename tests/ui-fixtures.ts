@@ -199,6 +199,7 @@ export function makeManifest(options: ManifestFixtureOptions = {}): ProjectManif
     },
     simulationLayers,
     features,
+    exclusionZones: [],
     reviewFlags: [],
     comparisonRefs: [],
     analysisResults: [],

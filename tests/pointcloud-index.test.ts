@@ -236,6 +236,7 @@ describe('point-cloud index manifest record', () => {
       },
       simulationLayers: [],
       features: [],
+      exclusionZones: [],
       reviewFlags: [],
       comparisonRefs: [],
       analysisResults: [],

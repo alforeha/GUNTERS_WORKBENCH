@@ -34,6 +34,7 @@ export function createDefaultManifest(projectName: string): ProjectManifest {
     },
     simulationLayers: [],
     features: [],
+    exclusionZones: [],
     reviewFlags: [],
     comparisonRefs: [],
     analysisResults: [],

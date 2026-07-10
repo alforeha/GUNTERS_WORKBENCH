@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = '1.3.0';
+export const SCHEMA_VERSION = '1.4.0';
 
 export type TruthStatus =
   | 'source'
@@ -52,7 +52,7 @@ export type PointCloudIndexType = 'wpi-octree';
 
 /**
  * Metadata for a WPI v1 point-cloud index asset (kind `point-cloud-index`, truthStatus
- * `indexed-full`). The index is a workbench-internal, COPC-shaped octree — never real
+ * `indexed-full`). The index is a workbench-internal, COPC-shaped octree - never real
  * COPC. `source` fingerprints the LAS the index was built from so staleness is detectable
  * independently of the disposable preview cache. See src/shared/pointcloud-index.ts.
  */
@@ -143,12 +143,91 @@ export interface SimulationLayer {
   modifiedAt: string;
 }
 
+export type FeatureFamily =
+  | 'region'
+  | 'object'
+  | 'building'
+  | 'utility'
+  | 'line'
+  | 'marker'
+  | 'measurement';
+export type FeatureAuthorship = 'authored' | 'assisted' | 'derived' | 'edited' | 'imported';
+export type FeatureConfidence = 'low' | 'medium' | 'high';
+export type FeatureLifecycleStatus = 'draft' | 'authored' | 'reviewed' | 'flagged';
+
+export type EvidenceRefKind =
+  | 'picked-coordinate'
+  | 'asset-point'
+  | 'asset-vertex'
+  | 'asset-edge'
+  | 'surface-hit'
+  | 'manual-note';
+
+/**
+ * Provenance for one authored coordinate. assetId stays optional so removing an
+ * asset later leaves historical refs dangling-but-valid; surfel assets are never
+ * a legal evidence source (schema-enforced).
+ */
+export interface EvidenceRef {
+  kind: EvidenceRefKind;
+  coordinate: [number, number, number];
+  assetId?: string;
+  assetLayerId?: string;
+  /** Owning feature when the snap source was another authored feature (vertex/edge). */
+  featureId?: string;
+  sourceClass?: number;
+  sourceRGB?: [number, number, number];
+  /** manual-note refs only. */
+  note?: string;
+}
+
+export interface FeatureRepresentations {
+  reality?: Record<string, unknown>;
+  cad?: Record<string, unknown>;
+  report?: Record<string, unknown>;
+  export?: Record<string, unknown>;
+}
+
+export interface FeatureDisplay {
+  visible: boolean;
+}
+
+/**
+ * Widened additively for Create Sim: `family` is the primary axis going forward,
+ * `type` remains the legacy axis every record still carries. evidenceRefs /
+ * parameters / metadata are optional here but defaulted by the schema on parse.
+ * Features never carry truthStatus (asset property only).
+ */
 export interface FeatureRecord {
   id: string;
   simulationId: string;
   type: FeatureType;
   name: string;
   geometry: Record<string, unknown>;
+  createdAt: string;
+  modifiedAt: string;
+  family?: FeatureFamily;
+  templateId?: string | null;
+  subtype?: string;
+  authorship?: FeatureAuthorship;
+  confidence?: FeatureConfidence;
+  lifecycleStatus?: FeatureLifecycleStatus;
+  evidenceRefs?: EvidenceRef[];
+  parameters?: Record<string, unknown>;
+  representations?: FeatureRepresentations;
+  display?: FeatureDisplay;
+  /** Reserved for v2 feature-generates-features; unused by v1 flows. */
+  parentFeatureId?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+/** Ground-behavior exclusion owned by a feature (e.g. a building footprint). */
+export interface ExclusionZoneRecord {
+  id: string;
+  simulationId: string;
+  featureId: string;
+  name?: string;
+  polygon: [number, number, number][];
   createdAt: string;
   modifiedAt: string;
 }
@@ -199,6 +278,7 @@ export interface ProjectManifest {
   realitySimulation: RealitySimulation;
   simulationLayers: SimulationLayer[];
   features: FeatureRecord[];
+  exclusionZones: ExclusionZoneRecord[];
   reviewFlags: ReviewFlag[];
   comparisonRefs: ComparisonRef[];
   analysisResults: AnalysisResult[];

@@ -16,6 +16,7 @@ import { mountFooter, DEFAULT_WALK_EYE_HEIGHT, DEFAULT_WALK_SPEED } from './ui/f
 import { mountLeftPanel, type LeftPanelApi } from './ui/leftPanel'
 import { mountRightPanel, type RightPanelApi } from './ui/rightPanel'
 import { LayerController } from './ui/layers'
+import { FeatureController } from './ui/features'
 import { projectDisplayName, projectUnitsLabel } from './ui/model'
 
 const app = document.querySelector<HTMLDivElement>('#app')
@@ -54,6 +55,7 @@ function renderAll(session: ProjectSession | null): void {
 
 const controller = new LayerController(frame.viewerHost, {
   onSessionChanged(session) {
+    featureController?.refreshDisplays()
     renderAll(session)
   },
   onTask(label, pct) {
@@ -64,6 +66,17 @@ const controller = new LayerController(frame.viewerHost, {
   },
   onViewerCreated(viewer) {
     wireViewerCallbacks(viewer)
+    featureController?.refreshDisplays()
+  },
+})
+
+const featureController: FeatureController = new FeatureController({
+  getSession: () => controller.getSession(),
+  getViewer: () => controller.getViewer(),
+  ensureViewer: () => controller.ensureViewer(),
+  persistManifest: (manifest) => controller.persistManifest(manifest),
+  onAuthoringChanged() {
+    rightPanel?.render()
   },
 })
 
@@ -126,10 +139,16 @@ frame.viewerHost.addEventListener('pointerdown', (event) => {
   pointerDownPos = { x: event.clientX, y: event.clientY }
 })
 frame.viewerHost.addEventListener('pointerup', (event) => {
-  if (!walkArmed || !pointerDownPos) return
+  if (!pointerDownPos) return
   const moved = Math.hypot(event.clientX - pointerDownPos.x, event.clientY - pointerDownPos.y)
   pointerDownPos = null
   if (moved > 5) return
+  // Feature authoring owns viewer clicks while a draw is active.
+  if (featureController.isAuthoring()) {
+    featureController.handleViewerClick()
+    return
+  }
+  if (!walkArmed) return
   const viewer = controller.getViewer()
   if (!viewer) return
   const eyeHeight = footerApi?.getWalkEyeHeight() ?? DEFAULT_WALK_EYE_HEIGHT
@@ -219,6 +238,34 @@ rightPanel = mountRightPanel(frame.rightPanelMount, {
   getSession: () => controller.getSession(),
   buildIndex: (assetId) => controller.buildIndex(assetId),
   generateSurfels: (assetId) => controller.generateSurfels(assetId),
+  features: {
+    regionTemplates: () => featureController.regionTemplates(),
+    buildingTemplates: () => featureController.buildingTemplates(),
+    objectTemplates: () => featureController.objectTemplates(),
+    lineTemplates: () => featureController.lineTemplates(),
+    markerTemplates: () => featureController.markerTemplates(),
+    getAuthoring: () => featureController.getAuthoring(),
+    getBuildingAuthoring: () => featureController.getBuildingAuthoring(),
+    getSimpleAuthoring: () => featureController.getSimpleAuthoring(),
+    startRegion: (templateId) => featureController.startRegion(templateId),
+    startBuilding: (templateId) => featureController.startBuilding(templateId),
+    startObject: (templateId) => featureController.startObject(templateId),
+    startLine: (templateId) => featureController.startLine(templateId),
+    startMarker: (templateId) => featureController.startMarker(templateId),
+    closeBorder: () => featureController.closeBorder(),
+    closeBuildingFootprint: () => featureController.closeBuildingFootprint(),
+    reviewSimpleFeature: () => featureController.reviewSimpleFeature(),
+    startBreakline: () => featureController.startBreakline(),
+    finishBreakline: () => featureController.finishBreakline(),
+    finishRegion: () => featureController.finishRegion(),
+    finishBuilding: () => featureController.finishBuilding(),
+    finishSimpleFeature: () => featureController.finishSimpleFeature(),
+    cancel: () => featureController.cancel(),
+    rename: (featureId, name) => featureController.renameFeature(featureId, name),
+    updateParam: (featureId, paramName, value) => featureController.updateFeatureParameter(featureId, paramName, value),
+    remove: (featureId) => featureController.deleteFeature(featureId),
+    setSimVisible: (visible) => featureController.setSimVisible(visible),
+  },
 })
 
 leftPanel = mountLeftPanel(frame.leftPanelMount, {

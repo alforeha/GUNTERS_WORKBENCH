@@ -13,6 +13,7 @@ import {
   buildWorkSurfaceModel,
   removeAssetFromManifest,
 } from '../src/ui/model'
+import { projectManifestSchema } from '../src/shared/manifest-schema'
 import {
   INDEX_ASSET_ID,
   INDEX_LAYER_ID,
@@ -21,6 +22,7 @@ import {
   SURFEL_ASSET_ID,
   SURFEL_LAYER_ID,
   deepFreeze,
+  makeFeature,
   makeManifest,
 } from './ui-fixtures'
 import type { ProjectManifest } from '../src/shared/workbench-types'
@@ -95,6 +97,7 @@ describe('removeAssetFromManifest', () => {
     // Everything outside assets/simulationLayers is untouched.
     expect(result.manifest.realitySimulation).toEqual(original.realitySimulation)
     expect(result.manifest.features).toEqual(original.features)
+    expect(result.manifest.exclusionZones).toEqual(original.exclusionZones)
     expect(result.manifest.recovery).toEqual(original.recovery)
     expect(result.manifest.schemaVersion).toBe(original.schemaVersion)
   })
@@ -103,6 +106,27 @@ describe('removeAssetFromManifest', () => {
     const original = deepFreeze(makeManifest())
     expect(() => removeAssetFromManifest(original, SOURCE_ASSET_ID)).not.toThrow()
     expect(original.assets).toHaveLength(3)
+  })
+})
+
+describe('schema widening does not drift the manifest shape', () => {
+  it('a pre-widening (1.3.0-shaped) manifest still validates and gains only defaults', () => {
+    const legacy = JSON.parse(JSON.stringify(makeManifest({ features: [makeFeature('feat-legacy', 'marker')] }))) as Record<
+      string,
+      unknown
+    >
+    delete legacy.exclusionZones
+
+    const parsed = projectManifestSchema.safeParse(legacy)
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+
+    expect(parsed.data.exclusionZones).toEqual([])
+    const feature = parsed.data.features[0]!
+    expect(feature.type).toBe('marker')
+    expect(feature.evidenceRefs).toEqual([])
+    expect(feature.parameters).toEqual({})
+    expect(feature.metadata).toEqual({})
   })
 })
 

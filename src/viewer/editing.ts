@@ -1,5 +1,5 @@
 // Pure edit helpers: vertex adjacency, incremental normal updates, and screen-space picking math.
-// No Three.js imports here â€” these stay Node-testable.
+// No Three.js imports here these stay Node-testable.
 import type { Vec3 } from './geometry';
 
 export interface CameraPickFrame {

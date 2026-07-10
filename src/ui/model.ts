@@ -15,6 +15,7 @@ import type {
   SimulationLayerStatus,
 } from '../shared/workbench-types'
 import { isStaleIndexWarning } from '../shared/pointcloud-index'
+import { getTemplate, type TemplateParamSpec } from '../shared/template-catalog'
 
 // ---------------------------------------------------------------------------
 // Shared helpers (moved from main.ts so panels and tests share one copy)
@@ -449,26 +450,262 @@ export interface SimPanelModel {
 }
 
 /**
- * The Sim panel is a shell this phase: the feature schema still only knows
- * marker | polyline | measurement, so the taxonomy tabs report zero counts and
- * the legacy types map onto their nearest future group. No schema types added.
+ * Regions are live (Create Sim IMP-3): the regions tab counts family==='region'
+ * records. The other taxonomy tabs stay staged; legacy records (no family)
+ * still map onto their nearest future group by their legacy type, and records
+ * that carry a family are excluded from that legacy mapping so a region's
+ * type:'polyline' does not double-count as a line.
  */
 export function buildSimPanelModel(manifest: ProjectManifest | null): SimPanelModel {
   const features = manifest?.features ?? []
-  const count = (type: string): number => features.filter((feature) => feature.type === type).length
+  const familyCount = (family: string): number => features.filter((feature) => feature.family === family).length
+  const legacyCount = (type: string): number =>
+    features.filter((feature) => feature.family === undefined && feature.type === type).length
   return {
     featureCount: features.length,
     groundLabel: 'Ground: not set',
     tabs: [
-      { id: 'regions', label: 'Regions', count: 0, addLabel: '+ Add region' },
-      { id: 'objects', label: 'Objects', count: 0, addLabel: '+ Add object' },
-      { id: 'buildings', label: 'Buildings', count: 0, addLabel: '+ Add building' },
-      { id: 'utilities', label: 'Utilities', count: 0, addLabel: '+ Add utility' },
-      { id: 'lines', label: 'Lines/Breaklines', count: count('polyline'), addLabel: '+ Add line' },
-      { id: 'notes', label: 'Notes/Flags', count: count('marker'), addLabel: '+ Add note' },
-      { id: 'measurements', label: 'Measurements', count: count('measurement'), addLabel: '+ Add measurement' },
+      { id: 'regions', label: 'Regions', count: familyCount('region'), addLabel: '+ Add region' },
+      { id: 'objects', label: 'Objects', count: familyCount('object'), addLabel: '+ Add object' },
+      { id: 'buildings', label: 'Buildings', count: familyCount('building'), addLabel: '+ Add building' },
+      { id: 'utilities', label: 'Utilities', count: familyCount('utility'), addLabel: '+ Add utility' },
+      { id: 'lines', label: 'Lines/Breaklines', count: familyCount('line') + legacyCount('polyline'), addLabel: '+ Add line' },
+      { id: 'notes', label: 'Notes/Flags', count: familyCount('marker') + legacyCount('marker'), addLabel: '+ Add note' },
+      {
+        id: 'measurements',
+        label: 'Measurements',
+        count: familyCount('measurement') + legacyCount('measurement'),
+        addLabel: '+ Add measurement',
+      },
     ],
   }
+}
+
+// ---------------------------------------------------------------------------
+// Right panel: authored-feature list + detail view-models (regions live first)
+// ---------------------------------------------------------------------------
+
+export interface RegionListItem {
+  id: string
+  name: string
+  subtype: string
+  borderVertexCount: number
+  breaklineCount: number
+  snappedEvidenceCount: number
+  freeEvidenceCount: number
+}
+
+export interface BuildingListItem {
+  id: string
+  name: string
+  subtype: string
+  footprintVertexCount: number
+  snappedEvidenceCount: number
+  freeEvidenceCount: number
+}
+
+export interface ObjectListItem {
+  id: string
+  name: string
+  subtype: string
+  snappedEvidenceCount: number
+  freeEvidenceCount: number
+}
+
+export interface LineListItem {
+  id: string
+  name: string
+  subtype: string
+  vertexCount: number
+  isBreakline: boolean
+  snappedEvidenceCount: number
+  freeEvidenceCount: number
+}
+
+export interface MarkerListItem {
+  id: string
+  name: string
+  subtype: string
+  snappedEvidenceCount: number
+  freeEvidenceCount: number
+}
+
+export function buildRegionListModel(manifest: ProjectManifest | null): RegionListItem[] {
+  const features = manifest?.features ?? []
+  return features
+    .filter((feature) => feature.family === 'region')
+    .map((feature) => {
+      const geometry = feature.geometry as { border?: unknown; breaklines?: unknown }
+      const border = Array.isArray(geometry.border) ? geometry.border : []
+      const breaklines = Array.isArray(geometry.breaklines) ? geometry.breaklines : []
+      const evidence = feature.evidenceRefs ?? []
+      const snapped = evidence.filter((ref) => ref.kind !== 'picked-coordinate' && ref.kind !== 'manual-note').length
+      return {
+        id: feature.id,
+        name: feature.name,
+        subtype: feature.subtype ?? 'unknown',
+        borderVertexCount: border.length,
+        breaklineCount: breaklines.length,
+        snappedEvidenceCount: snapped,
+        freeEvidenceCount: evidence.length - snapped,
+      }
+    })
+}
+
+export function buildBuildingListModel(manifest: ProjectManifest | null): BuildingListItem[] {
+  const features = manifest?.features ?? []
+  return features
+    .filter((feature) => feature.family === 'building')
+    .map((feature) => {
+      const geometry = feature.geometry as { footprint?: unknown }
+      const footprint = Array.isArray(geometry.footprint) ? geometry.footprint : []
+      const evidence = feature.evidenceRefs ?? []
+      const snapped = evidence.filter((ref) => ref.kind !== 'picked-coordinate' && ref.kind !== 'manual-note').length
+      return {
+        id: feature.id,
+        name: feature.name,
+        subtype: feature.subtype ?? 'flat',
+        footprintVertexCount: footprint.length,
+        snappedEvidenceCount: snapped,
+        freeEvidenceCount: evidence.length - snapped,
+      }
+    })
+}
+
+function evidenceSplit(feature: { evidenceRefs?: { kind: string }[] }): { snapped: number; free: number } {
+  const evidence = feature.evidenceRefs ?? []
+  const snapped = evidence.filter((ref) => ref.kind !== 'picked-coordinate' && ref.kind !== 'manual-note').length
+  return { snapped, free: evidence.length - snapped }
+}
+
+export function buildObjectListModel(manifest: ProjectManifest | null): ObjectListItem[] {
+  return (manifest?.features ?? [])
+    .filter((feature) => feature.family === 'object')
+    .map((feature) => {
+      const evidence = evidenceSplit(feature)
+      return {
+        id: feature.id,
+        name: feature.name,
+        subtype: feature.subtype ?? 'generic',
+        snappedEvidenceCount: evidence.snapped,
+        freeEvidenceCount: evidence.free,
+      }
+    })
+}
+
+export function buildLineListModel(manifest: ProjectManifest | null): LineListItem[] {
+  return (manifest?.features ?? [])
+    .filter((feature) => feature.family === 'line')
+    .map((feature) => {
+      const geometry = feature.geometry as { vertices?: unknown }
+      const vertices = Array.isArray(geometry.vertices) ? geometry.vertices : []
+      const evidence = evidenceSplit(feature)
+      return {
+        id: feature.id,
+        name: feature.name,
+        subtype: feature.subtype ?? 'line',
+        vertexCount: vertices.length,
+        isBreakline: feature.parameters?.isBreakline !== false,
+        snappedEvidenceCount: evidence.snapped,
+        freeEvidenceCount: evidence.free,
+      }
+    })
+}
+
+export function buildMarkerListModel(manifest: ProjectManifest | null): MarkerListItem[] {
+  return (manifest?.features ?? [])
+    .filter((feature) => feature.family === 'marker')
+    .map((feature) => {
+      const evidence = evidenceSplit(feature)
+      return {
+        id: feature.id,
+        name: feature.name,
+        subtype: feature.subtype ?? 'generic',
+        snappedEvidenceCount: evidence.snapped,
+        freeEvidenceCount: evidence.free,
+      }
+    })
+}
+
+export interface FeatureDetailModel {
+  id: string
+  name: string
+  family: string
+  subtype: string
+  templateId: string | null
+  authorship: string
+  params: {
+    name: string
+    label: string
+    value: string
+    type: TemplateParamSpec['type']
+    options?: string[]
+    editable: boolean
+  }[]
+  cadRefs: { name: string; value: string }[]
+  evidenceTotal: number
+  evidenceSnapped: number
+  evidenceFree: number
+  evidenceBadges: string[]
+  createdAt: string
+  modifiedAt: string
+}
+
+export function buildFeatureDetailModel(manifest: ProjectManifest | null, featureId: string): FeatureDetailModel | null {
+  const feature = manifest?.features.find((candidate) => candidate.id === featureId)
+  if (!feature) return null
+  const evidence = feature.evidenceRefs ?? []
+  const snapped = evidence.filter((ref) => ref.kind !== 'picked-coordinate' && ref.kind !== 'manual-note').length
+  const cad = (feature.representations?.cad ?? {}) as Record<string, unknown>
+  const template = feature.templateId ? getTemplate(feature.templateId) : null
+  const params = template
+    ? template.paramSchema.map((param) => {
+        const value = feature.parameters?.[param.name] ?? param.default
+        return {
+          name: param.name,
+          label: param.label,
+          value: String(value),
+          type: param.type,
+          ...(param.options ? { options: param.options } : {}),
+          editable: true,
+        }
+      })
+    : Object.entries(feature.parameters ?? {}).map(([name, value]) => ({
+        name,
+        label: name,
+        value: String(value),
+        type: 'string' as const,
+        editable: false,
+      }))
+  return {
+    id: feature.id,
+    name: feature.name,
+    family: feature.family ?? 'legacy',
+    subtype: feature.subtype ?? '-',
+    templateId: feature.templateId ?? null,
+    authorship: feature.authorship ?? 'authored',
+    params,
+    cadRefs: Object.entries(cad)
+      .filter(([, value]) => typeof value === 'string')
+      .map(([name, value]) => ({ name, value: String(value) })),
+    evidenceTotal: evidence.length,
+    evidenceSnapped: snapped,
+    evidenceFree: evidence.length - snapped,
+    evidenceBadges: buildEvidenceBadges(feature),
+    createdAt: feature.createdAt,
+    modifiedAt: feature.modifiedAt,
+  }
+}
+
+function buildEvidenceBadges(feature: ProjectManifest['features'][number]): string[] {
+  const evidence = feature.evidenceRefs ?? []
+  const badges = new Set<string>()
+  if (feature.authorship) badges.add(feature.authorship)
+  if (evidence.some((ref) => ref.kind === 'asset-point')) badges.add('snapped-to-cloud')
+  if (evidence.some((ref) => ref.kind === 'asset-vertex' || ref.kind === 'asset-edge')) badges.add('snapped-to-feature')
+  if (evidence.some((ref) => ref.kind === 'picked-coordinate')) badges.add('free-placement')
+  if (evidence.some((ref) => ref.kind === 'manual-note')) badges.add('manual')
+  return [...badges]
 }
 
 // ---------------------------------------------------------------------------

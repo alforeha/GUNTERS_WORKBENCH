@@ -700,6 +700,12 @@ export class LayerController {
     this.adoptSession(await window.workbench.saveProject(this.session.manifest as ProjectManifest))
   }
 
+  /** Persists a UI-transformed manifest (feature authoring, rename/delete) through the single saveProject write path. */
+  async persistManifest(manifest: ProjectManifest): Promise<void> {
+    if (!this.session) return
+    this.adoptSession(await window.workbench.saveProject(manifest))
+  }
+
   async closeProject(): Promise<void> {
     await window.workbench.closeProject()
     this.clearViewerScene()
