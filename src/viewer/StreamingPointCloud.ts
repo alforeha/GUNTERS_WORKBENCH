@@ -22,6 +22,7 @@ import {
   type StreamCameraView,
   type StreamNode,
 } from './pointCloudStreaming';
+import { estimateLowPercentileGroundZ, type GroundEstimate } from './walkSurface';
 
 /** Fetches decoded, origin-relative tile payloads for the given node keys (IPC-backed in-app). */
 export type TileFetcher = (keys: string[]) => Promise<{ key: string; payload: PointCloudNodePayload }[]>;
@@ -212,6 +213,46 @@ export class StreamingPointCloud {
 
   getDisclosure(): string {
     return formatIndexedFullDisclosure(this.loadedPointCount, this.totalPoints, this.settled);
+  }
+
+  walkGroundRadius(): number {
+    return this.units === 'meter' ? 1.25 : 4;
+  }
+
+  fallbackGroundZ(): number {
+    return this.worldBounds.minZ - this.sceneOrigin[2];
+  }
+
+  estimateGroundZ(renderX: number, renderY: number, radius: number, percentile = 0.1, minPoints = 12): GroundEstimate | null {
+    const surveyX = renderX + this.sceneOrigin[0];
+    const surveyY = renderY + this.sceneOrigin[1];
+    const radiusSq = radius * radius;
+    const zSamples: number[] = [];
+    for (const ln of this.loaded.values()) {
+      const { bounds } = ln.node;
+      if (
+        surveyX < bounds.minX - radius ||
+        surveyX > bounds.maxX + radius ||
+        surveyY < bounds.minY - radius ||
+        surveyY > bounds.maxY + radius
+      ) {
+        continue;
+      }
+      for (let i = 0; i < ln.payload.pointCount; i++) {
+        const cls = ln.payload.classifications[i] ?? 0;
+        const rn = ln.payload.returnNumbers[i] ?? 1;
+        const nr = ln.payload.numberOfReturns[i] ?? 1;
+        if (!pointPasses(cls, rn, nr, this.filter)) continue;
+        const base = i * 3;
+        const x = (ln.payload.positions[base] ?? 0) + this.group.position.x;
+        const y = (ln.payload.positions[base + 1] ?? 0) + this.group.position.y;
+        const dx = x - renderX;
+        const dy = y - renderY;
+        if (dx * dx + dy * dy > radiusSq) continue;
+        zSamples.push((ln.payload.positions[base + 2] ?? 0) + this.group.position.z);
+      }
+    }
+    return estimateLowPercentileGroundZ(zSamples, percentile, minPoints);
   }
 
   /**

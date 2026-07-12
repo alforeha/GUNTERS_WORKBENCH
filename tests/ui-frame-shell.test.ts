@@ -43,7 +43,7 @@ describe('header', () => {
     expect(html).toContain('value="orbit"')
     expect(html).toContain('value="top"')
     expect(html).toContain('value="walk"')
-    expect(html).toContain('Walk (basic)')
+    expect(html).toContain('Walk')
     expect(html).toContain('id="header-reset-view"')
   })
 

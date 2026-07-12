@@ -19,6 +19,7 @@ import { RenderFeatures, type FeatureDisplayEntry } from './RenderFeatures';
 import type { FeatureFamily } from '../shared/workbench-types';
 import type { FilterState, PointDisplayMode } from './pointCloudLod';
 import { buildNorthGizmo, projectGizmoNorth, GIZMO_SIZE, GIZMO_MARGIN } from './gizmo';
+import { smoothGroundZ } from './walkSurface';
 
 export type CameraMode = 'orbit' | 'top' | 'hover';
 export type CursorCallback = (pos: { e: number; n: number; z: number } | null) => void;
@@ -154,6 +155,8 @@ export class ViewerEngine {
   private hoverPitch = THREE.MathUtils.degToRad(-5);
   private hoverKeys = new Set<string>();
   private hoverLookDragging = false;
+  private hoverPointCloudIndexHandle: string | null = null;
+  private hoverGroundZ: number | null = null;
   private zoomSensitivity3D = 1.0;
   private fogEnabled = false;
   private edlEnabled = true;
@@ -390,6 +393,8 @@ uniform float edlOrtho;
     if (prevMode === 'hover') {
       this.hoverKeys.clear();
       this.hoverLookDragging = false;
+      this.hoverPointCloudIndexHandle = null;
+      this.hoverGroundZ = null;
     }
     this.mode = mode;
 
@@ -445,11 +450,56 @@ uniform float edlOrtho;
     this.activeCamera = this.perspCamera;
     this.orbitControls.enabled = false;
     this.topControls.enabled = false;
+    this.hoverPointCloudIndexHandle = null;
+    this.hoverGroundZ = hit.point.z / this.exaggeration;
     this.perspCamera.position.set(
       hit.point.x,
       hit.point.y,
       (hit.point.z / this.exaggeration + this.hoverHeight) * this.exaggeration,
     );
+    this.applyHoverLook();
+    this.emitZoomChanged();
+    this.scheduleLabelRefresh();
+    this.requestRender();
+    return true;
+  }
+
+  enterHoverOnPointCloud(handle: string, height: number): boolean {
+    if (this.disposed || !this.sceneOrigin) return false;
+    const streaming = this.pointCloudIndexes.get(handle);
+    if (!streaming) return false;
+    if (this.mode === 'orbit') this.rememberOrbitView();
+    this.hoverHeight = height;
+    const dir = new THREE.Vector3();
+    this.activeCamera.getWorldDirection(dir);
+    dir.z = 0;
+    if (dir.lengthSq() < 1e-6) {
+      dir.copy(this.lastOrbitDirection);
+      dir.z = 0;
+    }
+    if (dir.lengthSq() < 1e-6) dir.set(0, 1, 0);
+    dir.normalize();
+    this.hoverYaw = Math.atan2(dir.x, dir.y);
+    this.hoverPitch = Math.abs(dir.z) > 0.95 ? THREE.MathUtils.degToRad(-5) : THREE.MathUtils.clamp(Math.asin(dir.z), -1.2, 1.2);
+
+    const start = this.perspCamera.position.clone();
+    let x = start.x;
+    let y = start.y;
+    let groundZ = this.resolvePointCloudGroundZAt(handle, x, y);
+    if (groundZ === null) {
+      const center = streaming.bounds.getCenter(new THREE.Vector3());
+      x = center.x;
+      y = center.y;
+      groundZ = this.resolvePointCloudGroundZAt(handle, x, y) ?? streaming.fallbackGroundZ();
+    }
+
+    this.mode = 'hover';
+    this.activeCamera = this.perspCamera;
+    this.orbitControls.enabled = false;
+    this.topControls.enabled = false;
+    this.hoverPointCloudIndexHandle = handle;
+    this.hoverGroundZ = groundZ;
+    this.perspCamera.position.set(x, y, (groundZ + this.hoverHeight) * this.exaggeration);
     this.applyHoverLook();
     this.emitZoomChanged();
     this.scheduleLabelRefresh();
@@ -1653,8 +1703,9 @@ uniform float edlOrtho;
   }
 
   private snapHoverCameraToSurface(): void {
-    const z = this.resolveSurfaceZAt(this.perspCamera.position.x, this.perspCamera.position.y);
+    const z = this.resolveHoverGroundZAt(this.perspCamera.position.x, this.perspCamera.position.y) ?? this.hoverGroundZ;
     if (z === null) return;
+    this.hoverGroundZ = z;
     this.perspCamera.position.z = (z + this.hoverHeight) * this.exaggeration;
     this.applyHoverLook();
     this.scheduleLabelRefresh();
@@ -1674,11 +1725,43 @@ uniform float edlOrtho;
     delta.normalize().multiplyScalar(this.hoverSpeed * (dtMs / 1000));
     const nextX = this.perspCamera.position.x + delta.x;
     const nextY = this.perspCamera.position.y + delta.y;
-    const z = this.resolveSurfaceZAt(nextX, nextY);
+    const z = this.resolveHoverGroundZAt(nextX, nextY);
     if (z === null) return false;
-    this.perspCamera.position.set(nextX, nextY, (z + this.hoverHeight) * this.exaggeration);
+    this.perspCamera.position.x = nextX;
+    this.perspCamera.position.y = nextY;
+    this.hoverGroundZ = z;
+    this.perspCamera.position.z = (z + this.hoverHeight) * this.exaggeration;
     this.applyHoverLook();
     this.markCameraMotion();
+    return true;
+  }
+
+  private resolveHoverGroundZAt(x: number, y: number): number | null {
+    if (this.hoverPointCloudIndexHandle) {
+      return this.resolvePointCloudGroundZAt(this.hoverPointCloudIndexHandle, x, y);
+    }
+    return this.resolveSurfaceZAt(x, y);
+  }
+
+  private resolvePointCloudGroundZAt(handle: string, x: number, y: number): number | null {
+    const streaming = this.pointCloudIndexes.get(handle);
+    if (!streaming) return null;
+    return streaming.estimateGroundZ(x, y, streaming.walkGroundRadius(), 0.1, 12)?.z ?? null;
+  }
+
+  private updateHoverGroundFollow(dtMs: number): boolean {
+    if (this.mode !== 'hover') return false;
+    const nextGround = this.resolveHoverGroundZAt(this.perspCamera.position.x, this.perspCamera.position.y);
+    const smoothed = smoothGroundZ(this.hoverGroundZ, nextGround, dtMs);
+    if (smoothed === null) return false;
+    const nextCameraZ = (smoothed + this.hoverHeight) * this.exaggeration;
+    const changed = this.hoverGroundZ === null || Math.abs(smoothed - this.hoverGroundZ) > 1e-3 || Math.abs(this.perspCamera.position.z - nextCameraZ) > 1e-3;
+    this.hoverGroundZ = smoothed;
+    if (!changed) return false;
+    this.perspCamera.position.z = nextCameraZ;
+    this.applyHoverLook();
+    this.markCameraMotion();
+    this.scheduleLabelRefresh();
     return true;
   }
 
@@ -1948,6 +2031,7 @@ uniform float edlOrtho;
     const dt = this.lastFrameTime > 0 ? time - this.lastFrameTime : 16;
     this.lastFrameTime = time;
     if (this.stepHover(dt)) this.renderRequested = true;
+    if (this.updateHoverGroundFollow(dt)) this.renderRequested = true;
     const doRender = this.renderRequested;
     const doPick = this.pickRequested;
     this.renderRequested = false;

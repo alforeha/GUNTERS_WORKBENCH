@@ -68,6 +68,14 @@ interface DerivedSurfelLayerEntry {
   handle: string
 }
 
+export interface WalkTargetOption {
+  sourceAssetId: string
+  label: string
+  detail: string
+  available: boolean
+  buildIndexFirst: boolean
+}
+
 export interface LayerControllerEvents {
   onSessionChanged(session: ProjectSession | null): void
   onTask(label: string | null, pct?: number | null): void
@@ -128,6 +136,7 @@ export class LayerController {
   private readonly indexLayers = new Map<string, IndexLayerEntry>()
   private readonly derivedSurfaceLayers = new Map<string, DerivedSurfaceLayerEntry>()
   private readonly derivedSurfelLayers = new Map<string, DerivedSurfelLayerEntry>()
+  private walkVisibilityRestore: (() => void) | null = null
 
   /** Session-only per-layer appearance (decision recorded: not persisted to the manifest). */
   private readonly appearance = new Map<string, LayerAppearance>()
@@ -164,6 +173,63 @@ export class LayerController {
 
   getViewer(): ViewerEngine | null {
     return this.viewer
+  }
+
+  getWalkTargets(): WalkTargetOption[] {
+    if (!this.session) return []
+    return this.session.manifest.assets
+      .filter((asset) => asset.kind === 'point-cloud' && asset.pointCloud)
+      .map((sourceAsset) => {
+        const indexAsset = this.session?.manifest.assets.find((asset) => asset.pointCloudIndex?.sourceAssetId === sourceAsset.id)
+        const available = hasValidIndexForStreaming(indexAsset)
+        return {
+          sourceAssetId: sourceAsset.id,
+          label: sourceAsset.name,
+          detail: available
+            ? 'Indexed point cloud walk'
+            : indexAsset
+              ? 'Index is stale. Rebuild index first.'
+              : 'No index yet. Build index first.',
+          available,
+          buildIndexFirst: !available,
+        }
+      })
+  }
+
+  async startIndexedPointCloudWalk(sourceAssetId: string): Promise<{ ok: true; handle: string; label: string } | { ok: false; reason: string }> {
+    if (!this.session) return { ok: false, reason: 'Open a project before entering Walk mode.' }
+    const sourceAsset = this.session.manifest.assets.find((asset) => asset.id === sourceAssetId)
+    const indexAsset = this.session.manifest.assets.find((asset) => asset.pointCloudIndex?.sourceAssetId === sourceAssetId)
+    if (!sourceAsset || sourceAsset.kind !== 'point-cloud') {
+      return { ok: false, reason: 'That point cloud is no longer available for walking.' }
+    }
+    if (!indexAsset || !hasValidIndexForStreaming(indexAsset)) {
+      return { ok: false, reason: 'Build index first to walk this point cloud.' }
+    }
+    const layer = this.session.manifest.simulationLayers.find((candidate) => candidate.assetId === indexAsset.id)
+    if (!layer) {
+      return { ok: false, reason: 'The point-cloud index layer is missing from the current simulation.' }
+    }
+    await this.ensureLayerLoaded(layer.id)
+    const entry = this.indexLayers.get(layer.id)
+    const viewer = this.getViewer()
+    if (!entry || !viewer) {
+      return { ok: false, reason: 'The indexed point cloud could not be loaded for walking.' }
+    }
+    this.endWalkTarget()
+    if (layer.status === 'hidden') {
+      const look = this.appearanceFor(layer.id)
+      viewer.setPointCloudIndexDisplay(entry.handle, true, look.pointSize)
+      this.walkVisibilityRestore = () => {
+        this.viewer?.setPointCloudIndexDisplay(entry.handle, false, look.pointSize)
+      }
+    }
+    return { ok: true, handle: entry.handle, label: sourceAsset.name }
+  }
+
+  endWalkTarget(): void {
+    this.walkVisibilityRestore?.()
+    this.walkVisibilityRestore = null
   }
 
   ensureViewer(): ViewerEngine {

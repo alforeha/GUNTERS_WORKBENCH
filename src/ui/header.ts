@@ -65,7 +65,7 @@ export function renderHeaderHtml(projectName: string | null): string {
         <select id="header-camera-mode">
           <option value="orbit">3D orbit</option>
           <option value="top">Top</option>
-          <option value="walk">Walk (basic)</option>
+          <option value="walk">Walk</option>
         </select>
       </label>
       <button id="header-reset-view" title="Reframe to content bounds">Reset view</button>

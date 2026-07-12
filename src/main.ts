@@ -15,7 +15,7 @@ import { mountHeader, type HeaderCameraMode, type HeaderMenuAction } from './ui/
 import { mountFooter, DEFAULT_WALK_EYE_HEIGHT, DEFAULT_WALK_SPEED } from './ui/footer'
 import { mountLeftPanel, type LeftPanelApi } from './ui/leftPanel'
 import { mountRightPanel, type RightPanelApi } from './ui/rightPanel'
-import { LayerController } from './ui/layers'
+import { LayerController, type WalkTargetOption } from './ui/layers'
 import { FeatureController } from './ui/features'
 import { projectDisplayName, projectUnitsLabel } from './ui/model'
 
@@ -37,8 +37,6 @@ let leftPanel: LeftPanelApi | null = null
 let rightPanel: RightPanelApi | null = null
 let headerApi: ReturnType<typeof mountHeader> | null = null
 let footerApi: ReturnType<typeof mountFooter> | null = null
-
-let walkArmed = false
 let modeBeforeWalk: 'orbit' | 'top' = 'orbit'
 
 function setWalkHint(text: string | null): void {
@@ -101,37 +99,121 @@ function applyCameraModeUi(mode: HeaderCameraMode): void {
 }
 
 function exitWalk(): void {
-  walkArmed = false
   setWalkHint(null)
+  closeWalkTargetPicker()
+  controller.endWalkTarget()
   const viewer = controller.getViewer()
   viewer?.setCameraMode(modeBeforeWalk)
   applyCameraModeUi(modeBeforeWalk)
 }
 
-function requestCameraMode(mode: HeaderCameraMode): void {
+type WalkTargetSelection = { kind: 'select'; sourceAssetId: string } | { kind: 'build'; sourceAssetId: string }
+
+let walkTargetOverlay: HTMLDivElement | null = null
+
+function closeWalkTargetPicker(): void {
+  walkTargetOverlay?.remove()
+  walkTargetOverlay = null
+}
+
+function promptWalkTarget(options: WalkTargetOption[]): Promise<WalkTargetSelection | null> {
+  closeWalkTargetPicker()
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div')
+    walkTargetOverlay = overlay
+    overlay.className = 'about-overlay walk-target-overlay'
+    overlay.innerHTML = `
+      <div class="about-dialog walk-target-dialog">
+        <h2>Walk what?</h2>
+        <p class="about-note">Indexed point clouds are the walkable cloud layer in this pass.</p>
+        <div class="walk-target-list">
+          ${options.length > 0 ? options
+            .map((option) => `
+              <div class="walk-target-row ${option.available ? 'walk-target-row-ready' : 'walk-target-row-disabled'}">
+                <button class="walk-target-option" data-source-asset-id="${option.sourceAssetId}" ${option.available ? '' : 'disabled'}>
+                  <span class="walk-target-label">${option.label}</span>
+                  <span class="walk-target-detail">${option.detail}</span>
+                </button>
+                ${option.buildIndexFirst ? `<button class="walk-target-build" data-build-asset-id="${option.sourceAssetId}">Build index</button>` : ''}
+              </div>
+            `)
+            .join('') : '<p class="about-note">No point clouds are available in this project yet.</p>'}
+        </div>
+        <button class="about-close walk-target-cancel">Cancel</button>
+      </div>
+    `
+
+    const cleanup = (selection: WalkTargetSelection | null) => {
+      if (walkTargetOverlay === overlay) walkTargetOverlay = null
+      document.removeEventListener('keydown', onKeyDown)
+      overlay.remove()
+      resolve(selection)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') cleanup(null)
+    }
+
+    document.addEventListener('keydown', onKeyDown)
+    overlay.addEventListener('click', (event) => {
+      const target = event.target as HTMLElement
+      if (target === overlay || target.classList.contains('walk-target-cancel')) cleanup(null)
+      const selectButton = target.closest<HTMLButtonElement>('.walk-target-option')
+      if (selectButton?.dataset.sourceAssetId) {
+        cleanup({ kind: 'select', sourceAssetId: selectButton.dataset.sourceAssetId })
+        return
+      }
+      const buildButton = target.closest<HTMLButtonElement>('.walk-target-build')
+      if (buildButton?.dataset.buildAssetId) {
+        cleanup({ kind: 'build', sourceAssetId: buildButton.dataset.buildAssetId })
+      }
+    })
+
+    document.body.appendChild(overlay)
+  })
+}
+
+async function requestCameraMode(mode: HeaderCameraMode): Promise<void> {
   const viewer = controller.ensureViewer()
   if (mode === 'orbit' || mode === 'top') {
-    walkArmed = false
+    closeWalkTargetPicker()
     setWalkHint(null)
+    controller.endWalkTarget()
     modeBeforeWalk = mode
     viewer.setCameraMode(mode)
     applyCameraModeUi(mode)
     return
   }
-  // Walk (basic): armed entry - the engine anchors Walk by raycasting a surface
-  // under the pointer, so the user picks the start point with a click.
-  walkArmed = true
-  setWalkHint('Walk (basic): click a surface point in the viewer to start. X exits. Requires a surface; point clouds alone cannot anchor Walk yet.')
-}
 
-// Escape cancels an armed (not yet entered) Walk and reverts the mode UI.
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && walkArmed) {
-    walkArmed = false
-    setWalkHint(null)
+  const selection = await promptWalkTarget(controller.getWalkTargets())
+  if (!selection) {
+    applyCameraModeUi(modeBeforeWalk)
+    return
+  }
+
+  if (selection.kind === 'build') {
+    await controller.buildIndex(selection.sourceAssetId)
+    applyCameraModeUi(modeBeforeWalk)
+    await requestCameraMode('walk')
+    return
+  }
+
+  const walkTarget = await controller.startIndexedPointCloudWalk(selection.sourceAssetId)
+  if (!walkTarget.ok) {
+    setWalkHint(walkTarget.reason)
+    applyCameraModeUi(modeBeforeWalk)
+    return
+  }
+
+  const eyeHeight = footerApi?.getWalkEyeHeight() ?? DEFAULT_WALK_EYE_HEIGHT
+  if (viewer.enterHoverOnPointCloud(walkTarget.handle, eyeHeight)) {
+    setWalkHint(`Walking ${walkTarget.label}. Use W/A/S/D to move, mouse to look, wheel for speed, X exits.`)
+    applyCameraModeUi('walk')
+  } else {
+    controller.endWalkTarget()
+    setWalkHint(`Unable to start Walk on ${walkTarget.label}. Load or rebuild the index and try again.`)
     applyCameraModeUi(modeBeforeWalk)
   }
-})
+}
 
 // Distinguish a click from an orbit drag before attempting Walk entry.
 let pointerDownPos: { x: number; y: number } | null = null
@@ -143,21 +225,8 @@ frame.viewerHost.addEventListener('pointerup', (event) => {
   const moved = Math.hypot(event.clientX - pointerDownPos.x, event.clientY - pointerDownPos.y)
   pointerDownPos = null
   if (moved > 5) return
-  // Feature authoring owns viewer clicks while a draw is active.
   if (featureController.isAuthoring()) {
     featureController.handleViewerClick()
-    return
-  }
-  if (!walkArmed) return
-  const viewer = controller.getViewer()
-  if (!viewer) return
-  const eyeHeight = footerApi?.getWalkEyeHeight() ?? DEFAULT_WALK_EYE_HEIGHT
-  if (viewer.enterHoverAtPointer(eyeHeight)) {
-    walkArmed = false
-    setWalkHint(null)
-    applyCameraModeUi('walk')
-  } else {
-    setWalkHint('No surface under the cursor. Walk needs a surface to stand on - click a rendered surface, or press Esc/choose another view mode to cancel.')
   }
 })
 
