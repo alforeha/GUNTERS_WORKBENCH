@@ -12,14 +12,24 @@ import { RenderGeotiff } from './RenderGeotiff';
 import { RenderPdf, type PdfRenderableSheet } from './RenderPdf';
 import { RenderPointCloud } from './RenderPointCloud';
 import { StreamingPointCloud, type StreamingHierarchy, type TileFetcher } from './StreamingPointCloud';
+import type { RegionXY } from './pointCloudStreaming';
 import { StreamingSurfels, type SurfelHierarchy, type SurfelTileFetcher } from './StreamingSurfels';
 import { AuthoringMachine, type AuthoringGeometryMode, type AuthoringSnapshot } from './authoring';
-import { DEFAULT_SNAP_TOLERANCE_PX, closestPointOnScreenSegment, resolvePlacement, resolveSnap, type SnapCandidate } from './snap';
-import { RenderFeatures, type FeatureDisplayEntry, type SnapPreview } from './RenderFeatures';
-import type { FeatureFamily } from '../shared/workbench-types';
+import { DEFAULT_SNAP_TOLERANCE_PX, closestPointOnScreenSegment, evidenceForPlacement, resolvePlacement, resolveSnap, type SnapCandidate } from './snap';
+import { RenderFeatures, type FeatureDisplayEntry, type FeatureFocusOverlay, type SnapPreview } from './RenderFeatures';
+import type { EvidenceRef, FeatureFamily } from '../shared/workbench-types';
 import type { FilterState, PointDisplayMode } from './pointCloudLod';
 import { buildNorthGizmo, projectGizmoNorth, GIZMO_SIZE, GIZMO_MARGIN } from './gizmo';
+import { pointInPolygonXY } from './isolateClip';
 import { smoothGroundZ } from './walkSurface';
+
+/**
+ * Safety ceiling on points one evidence window may add (manifest size, not a
+ * selection preference): a window keeps EVERYTHING it catches - front and
+ * occluded alike - and only stride-samples beyond this. Sampling is reported
+ * to the user, never silent.
+ */
+const EVIDENCE_WINDOW_MAX = 20000;
 
 export type CameraMode = 'orbit' | 'top' | 'hover';
 export type CursorCallback = (pos: { e: number; n: number; z: number } | null) => void;
@@ -109,6 +119,12 @@ export class ViewerEngine {
   private raycaster = new THREE.Raycaster();
   private pointerNdc = new THREE.Vector2();
   private pointerPx = new THREE.Vector2();
+  /** True while explicit evidence picking is active (no authoring draft). */
+  private evidencePickActive = false;
+  /** Render-local XY isolate polygon applied to clouds added while focus is active. */
+  private isolateFocusXY: { x: number; y: number }[] | null = null;
+  /** Cancels the armed one-shot evidence window drag, resolving it null. */
+  private evidenceWindowCancel: (() => void) | null = null;
   private pointerDirty = false;
   private pointerInside = false;
   private pointerButtonsDown = false;
@@ -817,6 +833,7 @@ uniform float edlOrtho;
     }
     const handle = `p${++this.handleCounter}`;
     const pointCloud = new RenderPointCloud(handle, dataset, this.sceneOrigin);
+    pointCloud.setIsolateClip(this.isolateFocusXY);
     this.pointClouds.set(handle, pointCloud);
     this.contentGroup.add(pointCloud.group);
     this.updateSceneMetrics();
@@ -877,6 +894,7 @@ uniform float edlOrtho;
     }
     const handle = `p${++this.handleCounter}`;
     const streaming = new StreamingPointCloud(handle, hierarchy, this.sceneOrigin, fetchTiles, () => this.requestRender());
+    streaming.setIsolateClip(this.isolateFocusXY);
     this.pointCloudIndexes.set(handle, streaming);
     this.contentGroup.add(streaming.group);
     this.updateSceneMetrics();
@@ -1543,6 +1561,202 @@ uniform float edlOrtho;
     return [...resolved.snapHit.candidate.world];
   }
 
+  /**
+   * Snap-resolves the current pointer for explicit evidence picking: returns
+   * the snapped candidate's survey point plus its provenance record, or null
+   * when nothing snappable is under the cursor. Cloud points only - authored
+   * vertices/edges are excluded so an object's own wireframe can never become
+   * its evidence - and never falls back to free placement.
+   */
+  resolveEvidenceAtPointer(tolerancePx = DEFAULT_SNAP_TOLERANCE_PX): { world: Vec3; evidence: EvidenceRef } | null {
+    const hit = this.resolveCloudSnapAtPointer(tolerancePx);
+    if (!hit) return null;
+    return { world: [...hit.candidate.world], evidence: evidenceForPlacement(hit) };
+  }
+
+  /** Highest-precedence pick restricted to cloud-point candidates. */
+  private resolveCloudSnapAtPointer(tolerancePx: number): ReturnType<typeof resolveSnap> {
+    const candidates = this.collectSnapCandidates(tolerancePx).filter(
+      (candidate) => candidate.sourceKind === 'cloud-point',
+    );
+    return resolveSnap({ pointer: { x: this.pointerPx.x, y: this.pointerPx.y }, candidates, tolerancePx });
+  }
+
+  /**
+   * One-shot rubber-band evidence selection: the next drag in the viewer draws
+   * a window (camera controls suppressed for that drag) and resolves with the
+   * visible cloud points inside it - isolate focus applies, so hidden points
+   * never select. Resolves null on Escape or a click without a drag.
+   */
+  armEvidenceWindow(): Promise<{ picks: { world: Vec3; evidence: EvidenceRef }[]; total: number } | null> {
+    this.cancelEvidenceWindow();
+    if (this.disposed) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      let dragging = false;
+      let startX = 0;
+      let startY = 0;
+      let overlay: HTMLDivElement | null = null;
+      const finish = (picks: { picks: { world: Vec3; evidence: EvidenceRef }[]; total: number } | null): void => {
+        this.container.removeEventListener('pointerdown', onDown, true);
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('keydown', onKey);
+        overlay?.remove();
+        this.container.style.cursor = '';
+        this.evidenceWindowCancel = null;
+        resolve(picks);
+      };
+      const positionOverlay = (clientX: number, clientY: number): void => {
+        if (!overlay) return;
+        overlay.style.left = `${Math.min(startX, clientX)}px`;
+        overlay.style.top = `${Math.min(startY, clientY)}px`;
+        overlay.style.width = `${Math.abs(clientX - startX)}px`;
+        overlay.style.height = `${Math.abs(clientY - startY)}px`;
+      };
+      const onDown = (event: PointerEvent): void => {
+        // Own this drag entirely: no orbit, no click-through to authoring.
+        event.stopPropagation();
+        event.preventDefault();
+        dragging = true;
+        startX = event.clientX;
+        startY = event.clientY;
+        overlay = document.createElement('div');
+        overlay.className = 'evidence-window-rect';
+        document.body.appendChild(overlay);
+        positionOverlay(event.clientX, event.clientY);
+      };
+      const onMove = (event: PointerEvent): void => {
+        if (dragging) positionOverlay(event.clientX, event.clientY);
+      };
+      const onUp = (event: PointerEvent): void => {
+        if (!dragging) return;
+        const rect = this.container.getBoundingClientRect();
+        const minX = Math.min(startX, event.clientX) - rect.left;
+        const maxX = Math.max(startX, event.clientX) - rect.left;
+        const minY = Math.min(startY, event.clientY) - rect.top;
+        const maxY = Math.max(startY, event.clientY) - rect.top;
+        if (maxX - minX < 4 || maxY - minY < 4) {
+          finish(null);
+          return;
+        }
+        finish(this.pickCloudPointsInRect(minX, minY, maxX, maxY));
+      };
+      const onKey = (event: KeyboardEvent): void => {
+        if (event.key === 'Escape') finish(null);
+      };
+      this.container.addEventListener('pointerdown', onDown, true);
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('keydown', onKey);
+      this.container.style.cursor = 'crosshair';
+      this.evidenceWindowCancel = () => finish(null);
+    });
+  }
+
+  cancelEvidenceWindow(): void {
+    this.evidenceWindowCancel?.();
+  }
+
+  /**
+   * Projects loaded index/preview cloud points into the viewport and returns
+   * the visible ones inside the container-local pixel rect (and the isolate
+   * polygon while focus is active). `total` is everything the window caught;
+   * `picks` is stride-sampled only past the manifest-safety ceiling so the
+   * caller can disclose the sampling.
+   */
+  private pickCloudPointsInRect(
+    minX: number,
+    minY: number,
+    maxX: number,
+    maxY: number,
+  ): { picks: { world: Vec3; evidence: EvidenceRef }[]; total: number } {
+    const picks: { world: Vec3; evidence: EvidenceRef }[] = [];
+    if (!this.sceneOrigin) return { picks, total: 0 };
+    const [ox, oy, oz] = this.sceneOrigin;
+    const width = this.container.clientWidth;
+    const height = Math.max(this.container.clientHeight, 1);
+    const camera = this.activeCamera;
+    const viewProj = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    const combined = new THREE.Matrix4();
+    const sphereCenter = new THREE.Vector3();
+    const viewDir = camera.getWorldDirection(new THREE.Vector3());
+    const toCenter = new THREE.Vector3();
+    const targets: { handle: string; group: THREE.Group }[] = [];
+    for (const [handle, cloud] of this.pointClouds) {
+      if (cloud.group.visible) targets.push({ handle, group: cloud.group });
+    }
+    for (const [handle, streaming] of this.pointCloudIndexes) {
+      if (streaming.group.visible) targets.push({ handle, group: streaming.group });
+    }
+    for (const { handle, group } of targets) {
+      const assetId = this.snapAssetIdByHandle.get(handle);
+      group.traverse((child) => {
+        if (!(child instanceof THREE.Points) || !child.visible) return;
+        const positions = child.geometry.getAttribute('position');
+        if (!positions) return;
+        // Tile-level precull: skip tiles whose projected bounding sphere
+        // cannot reach the rect. Deliberately conservative - a sphere that
+        // straddles the camera plane is never culled, so occluded/behind
+        // points inside the window always stay selectable.
+        if (!child.geometry.boundingSphere) child.geometry.computeBoundingSphere();
+        const sphere = child.geometry.boundingSphere;
+        if (sphere) {
+          sphereCenter.copy(sphere.center).applyMatrix4(child.matrixWorld);
+          const radiusWorld = sphere.radius * Math.max(1, this.exaggeration);
+          const alongView = toCenter.copy(sphereCenter).sub(camera.position).dot(viewDir);
+          if (alongView + radiusWorld <= 0) return; // entirely behind the camera plane
+          if (alongView - radiusWorld > this.perspCamera.near) {
+            const projected = sphereCenter.clone().project(camera);
+            const cx = (projected.x * 0.5 + 0.5) * width;
+            const cy = (1 - (projected.y * 0.5 + 0.5)) * height;
+            const unitsPerPixel =
+              this.mode === 'top'
+                ? this.dragWorldUnitsPerPixel()
+                : this.perspectiveUnitsPerPixelAt(Math.max(alongView - radiusWorld, this.perspCamera.near));
+            const radiusPx = radiusWorld / unitsPerPixel;
+            if (cx + radiusPx < minX || cx - radiusPx > maxX || cy + radiusPx < minY || cy - radiusPx > maxY) return;
+          }
+        }
+        combined.multiplyMatrices(viewProj, child.matrixWorld);
+        const ce = combined.elements;
+        const me = child.matrixWorld.elements;
+        // Honor the draw range: tile buffers are allocated for the full
+        // payload but only pack the filter-passing points; the tail is
+        // undrawn zeros that must not become phantom picks.
+        const drawRange = child.geometry.drawRange;
+        const start = drawRange.start;
+        const end =
+          drawRange.count === Infinity ? positions.count : Math.min(positions.count, drawRange.start + drawRange.count);
+        for (let i = start; i < end; i++) {
+          const x = positions.getX(i);
+          const y = positions.getY(i);
+          const z = positions.getZ(i);
+          const w = ce[3]! * x + ce[7]! * y + ce[11]! * z + ce[15]!;
+          if (w <= 0) continue;
+          const sx = (((ce[0]! * x + ce[4]! * y + ce[8]! * z + ce[12]!) / w) * 0.5 + 0.5) * width;
+          if (sx < minX || sx > maxX) continue;
+          const sy = (1 - (((ce[1]! * x + ce[5]! * y + ce[9]! * z + ce[13]!) / w) * 0.5 + 0.5)) * height;
+          if (sy < minY || sy > maxY) continue;
+          const wx = me[0]! * x + me[4]! * y + me[8]! * z + me[12]!;
+          const wy = me[1]! * x + me[5]! * y + me[9]! * z + me[13]!;
+          if (this.isolateFocusXY && !pointInPolygonXY(wx, wy, this.isolateFocusXY)) continue;
+          const wz = me[2]! * x + me[6]! * y + me[10]! * z + me[14]!;
+          picks.push({
+            world: [wx + ox, wy + oy, wz / this.exaggeration + oz],
+            evidence: {
+              kind: 'asset-point',
+              coordinate: [wx + ox, wy + oy, wz / this.exaggeration + oz],
+              ...(assetId ? { assetId } : {}),
+            },
+          });
+        }
+      });
+    }
+    if (picks.length <= EVIDENCE_WINDOW_MAX) return { picks, total: picks.length };
+    const stride = Math.ceil(picks.length / EVIDENCE_WINDOW_MAX);
+    return { picks: picks.filter((_, index) => index % stride === 0), total: picks.length };
+  }
+
   requestCloseFeatureAuthoring(): AuthoringSnapshot {
     this.authoringMachine.requestClose();
     return this.authoringMachine.snapshot();
@@ -1610,6 +1824,70 @@ uniform float edlOrtho;
     this.requestRender();
   }
 
+  /** Emphasis overlay for the feature open in the detail panel; null clears it. */
+  setFeatureFocusOverlay(overlay: FeatureFocusOverlay | null): void {
+    if (this.disposed || !this.sceneOrigin) return;
+    if (!this.renderFeatures) {
+      if (!overlay) return;
+      this.renderFeatures = new RenderFeatures(this.sceneOrigin);
+      this.contentGroup.add(this.renderFeatures.group);
+    }
+    this.renderFeatures.setFocusOverlay(overlay);
+    this.requestRender();
+  }
+
+  /**
+   * Isolate focus mode: hides point-cloud data (index + preview) outside the
+   * survey-space XY polygon. Display-only and instant to toggle; null restores
+   * the full clouds. Other dataset kinds are deliberately untouched.
+   */
+  setIsolateFocus(boundary: Vec3[] | null): void {
+    if (this.disposed) return;
+    const [ox, oy] = this.sceneOrigin ?? [0, 0, 0];
+    this.isolateFocusXY =
+      boundary && boundary.length >= 3
+        ? boundary.map((vertex) => ({ x: vertex[0] - ox, y: vertex[1] - oy }))
+        : null;
+    for (const streaming of this.pointCloudIndexes.values()) streaming.setIsolateClip(this.isolateFocusXY);
+    for (const cloud of this.pointClouds.values()) cloud.setIsolateClip(this.isolateFocusXY);
+    this.requestRender();
+  }
+
+  /**
+   * Isolate load-all: streams every index tile intersecting the survey XY
+   * region at full density (one sector of the isolate area); null restores
+   * SSE-only streaming.
+   */
+  setIsolateLoadRegion(region: RegionXY | null): void {
+    if (this.disposed) return;
+    for (const streaming of this.pointCloudIndexes.values()) streaming.setFocusLoadRegion(region);
+    this.requestRender();
+  }
+
+  /**
+   * Sector plan for loading an isolate boundary's full survey data: one sector
+   * when it fits the render budget, otherwise balanced splits (the plan comes
+   * from index node counts - nothing is loaded to compute it). Planned against
+   * the first visible index cloud; the load region applies to all of them.
+   */
+  planIsolateSectors(boundary: Vec3[]): RegionXY[] {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [x, y] of boundary) {
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+    const region: RegionXY = { minX, minY, maxX, maxY };
+    for (const streaming of this.pointCloudIndexes.values()) {
+      if (streaming.group.visible) return streaming.planRegionSectors(region);
+    }
+    return [region];
+  }
+
   /** Sim master toggle: shows/hides all authored features as one group. */
   setAuthoredFeaturesVisible(visible: boolean): void {
     this.renderFeatures?.setVisible(visible);
@@ -1641,12 +1919,24 @@ uniform float edlOrtho;
         targets.push({ handle, object: streaming.group, cloudSource: 'index' });
       }
     }
+    const [originX, originY] = this.sceneOrigin;
     for (const { handle, object, cloudSource } of targets) {
       const hits = this.cloudHitsNearPointer(object, tolerancePx);
       // Ray-sorted; a handful per source is plenty for a screen-space pick.
-      for (const hit of hits.slice(0, 8)) {
+      let pushed = 0;
+      for (const hit of hits) {
+        if (pushed >= 8) break;
         const candidate = this.cloudSnapCandidateFromHit(handle, cloudSource, hit);
-        if (candidate) out.push(candidate);
+        if (!candidate) continue;
+        // Isolate focus hides these points, so they must not snap either.
+        if (
+          this.isolateFocusXY &&
+          !pointInPolygonXY(candidate.world[0] - originX, candidate.world[1] - originY, this.isolateFocusXY)
+        ) {
+          continue;
+        }
+        out.push(candidate);
+        pushed++;
       }
     }
       if (!cloudHandleFilter) this.collectAuthoredSnapCandidates(out, tolerancePx, pointer.px);
@@ -1765,10 +2055,35 @@ uniform float edlOrtho;
     return { px, ndc };
   }
 
+  /** Evidence-pick mode keeps the snap crosshair live without an authoring draft. */
+  setEvidencePickActive(active: boolean): void {
+    this.evidencePickActive = active;
+    if (!active) {
+      this.cancelEvidenceWindow();
+      this.setSnapPreview(null);
+    }
+  }
+
   private updatePlacementPreview(): void {
     const state = this.authoringMachine.snapshot().state;
-    if (state !== 'placing' && state !== 'addingVertex') {
+    const authoringActive = state === 'placing' || state === 'addingVertex';
+    if (!authoringActive && !this.evidencePickActive) {
       this.setSnapPreview(null);
+      return;
+    }
+    if (!authoringActive) {
+      // Evidence-pick crosshair mirrors the click exactly: cloud points only,
+      // so an authored edge under the cursor never highlights as snappable.
+      const hit = this.resolveCloudSnapAtPointer(DEFAULT_SNAP_TOLERANCE_PX);
+      if (!hit) {
+        this.setSnapPreview(null);
+        return;
+      }
+      this.setSnapPreview({
+        point: hit.candidate.world,
+        kind: hit.candidate.cloudSource === 'index' ? 'index' : 'preview',
+        size: this.snapPreviewSizeAt(hit.candidate.world),
+      });
       return;
     }
     const resolved = this.resolvePlacementAtPointer(DEFAULT_SNAP_TOLERANCE_PX, true);

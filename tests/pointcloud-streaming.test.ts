@@ -2,12 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
   boxDistance,
   deriveFinestVisibleLevels,
+  estimateRegionPoints,
   formatIndexedFullDisclosure,
   isSettled,
   nodeGeometricError,
   planEviction,
+  planRegionSectors,
   projScaleFromPerspective,
   screenSpaceError,
+  selectRegionNodes,
   selectStreamingNodes,
   staleRequestKeys,
   type StreamNode,
@@ -80,6 +83,64 @@ describe('selectStreamingNodes', () => {
   it('returns nothing for an unknown root key', () => {
     const sel = selectStreamingNodes(chainHierarchy(), 'missing', NEAR, { sseThreshold: 1, budgetMax: 1_000_000 });
     expect(sel.nodes).toEqual([]);
+  });
+});
+
+// Root spanning 0..8 with two spatially disjoint children (small gap so seam
+// touches don't double-count in assertions), 100 pts per node.
+function splitHierarchy(): Map<string, StreamNode> {
+  const nodes: StreamNode[] = [
+    { key: 'root', level: 0, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 8, maxY: 8, maxZ: 8 }, pointCount: 100, childKeys: ['a', 'b'] },
+    { key: 'a', level: 1, bounds: { minX: 0, minY: 0, minZ: 0, maxX: 3.9, maxY: 8, maxZ: 8 }, pointCount: 100, childKeys: [] },
+    { key: 'b', level: 1, bounds: { minX: 4.1, minY: 0, minZ: 0, maxX: 8, maxY: 8, maxZ: 8 }, pointCount: 100, childKeys: [] },
+  ];
+  return new Map(nodes.map((n) => [n.key, n]));
+}
+
+describe('selectRegionNodes / estimateRegionPoints', () => {
+  it('selects every level intersecting the region, coarse first', () => {
+    const sel = selectRegionNodes(splitHierarchy(), 'root', { minX: 0, minY: 0, maxX: 8, maxY: 8 }, 5_000_000);
+    expect(sel.keys).toEqual(new Set(['root', 'a', 'b']));
+    expect(sel.nodes[0]!.key).toBe('root');
+    expect(sel.estimatedPoints).toBe(300);
+    expect(sel.budgetLimited).toBe(false);
+  });
+
+  it('excludes branches outside the region XY', () => {
+    const sel = selectRegionNodes(splitHierarchy(), 'root', { minX: 5, minY: 0, maxX: 8, maxY: 8 }, 5_000_000);
+    expect(sel.keys).toEqual(new Set(['root', 'b']));
+    expect(estimateRegionPoints(splitHierarchy(), 'root', { minX: 5, minY: 0, maxX: 8, maxY: 8 })).toBe(200);
+  });
+
+  it('caps at the budget coarse-coverage-first and reports it', () => {
+    const sel = selectRegionNodes(splitHierarchy(), 'root', { minX: 0, minY: 0, maxX: 8, maxY: 8 }, 150);
+    expect(sel.keys).toEqual(new Set(['root']));
+    expect(sel.budgetLimited).toBe(true);
+  });
+});
+
+describe('planRegionSectors', () => {
+  const REGION = { minX: 0, minY: 0, maxX: 8, maxY: 8 };
+
+  it('keeps one sector when the region fits the budget', () => {
+    expect(planRegionSectors(splitHierarchy(), 'root', REGION, 400)).toEqual([REGION]);
+  });
+
+  it('splits an over-budget region into balanced adjacent sectors that fit', () => {
+    const sectors = planRegionSectors(splitHierarchy(), 'root', REGION, 250);
+    expect(sectors).toHaveLength(2);
+    expect(sectors[0]!.maxX).toBe(sectors[1]!.minX); // adjacent halves along the split axis
+    for (const sector of sectors) {
+      expect(estimateRegionPoints(splitHierarchy(), 'root', sector)).toBeLessThanOrEqual(250);
+    }
+  });
+
+  it('stops splitting when subdivision cannot help (root weight everywhere)', () => {
+    // Budget below the root's own count: every sector always includes the root,
+    // so the plan bottoms out at maxSectors instead of recursing forever.
+    const sectors = planRegionSectors(splitHierarchy(), 'root', REGION, 50, 4);
+    expect(sectors.length).toBeLessThanOrEqual(4);
+    expect(sectors.length).toBeGreaterThan(1);
   });
 });
 

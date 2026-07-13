@@ -142,6 +142,174 @@ export function selectStreamingNodes(
   return { nodes, keys, estimatedPoints, budgetLimited };
 }
 
+/** XY rectangle in survey coordinates (matches StreamNode bounds space). */
+export interface RegionXY {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+function nodeIntersectsRegionXY(bounds: StreamBounds, region: RegionXY): boolean {
+  return (
+    bounds.minX <= region.maxX &&
+    bounds.maxX >= region.minX &&
+    bounds.minY <= region.maxY &&
+    bounds.maxY >= region.minY
+  );
+}
+
+/**
+ * Full-density selection for an isolate work area: every node - all levels,
+ * down to the leaves - whose XY bounds intersect the region. Because the
+ * owner-partition index stores disjoint points per level, this union IS the
+ * complete survey data for the area. Coarse-first order (fetch priority),
+ * budget-capped with budgetLimited raised when the cap cut it short.
+ */
+export function selectRegionNodes(
+  nodesByKey: Map<string, StreamNode>,
+  rootKey: string,
+  region: RegionXY,
+  budgetMax: number,
+): StreamSelection {
+  const keys = new Set<string>();
+  const nodes: SelectedStreamNode[] = [];
+  let estimatedPoints = 0;
+  let budgetLimited = false;
+
+  const root = nodesByKey.get(rootKey);
+  if (!root) return { nodes, keys, estimatedPoints, budgetLimited };
+
+  const queue: StreamNode[] = [root];
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    if (!nodeIntersectsRegionXY(node.bounds, region)) continue;
+    if (estimatedPoints + node.pointCount > budgetMax) {
+      budgetLimited = true;
+      continue; // deeper levels of this branch are skipped too (children queue after)
+    }
+    keys.add(node.key);
+    nodes.push({ key: node.key, sse: Infinity, distance: 0, pointCount: node.pointCount });
+    estimatedPoints += node.pointCount;
+    for (const childKey of node.childKeys) {
+      const child = nodesByKey.get(childKey);
+      if (child) queue.push(child);
+    }
+  }
+
+  return { nodes, keys, estimatedPoints, budgetLimited };
+}
+
+/** Total index points intersecting the region (all levels); free from node metadata. */
+export function estimateRegionPoints(
+  nodesByKey: Map<string, StreamNode>,
+  rootKey: string,
+  region: RegionXY,
+): number {
+  let total = 0;
+  const root = nodesByKey.get(rootKey);
+  if (!root) return 0;
+  const queue: StreamNode[] = [root];
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    if (!nodeIntersectsRegionXY(node.bounds, region)) continue;
+    total += node.pointCount;
+    for (const childKey of node.childKeys) {
+      const child = nodesByKey.get(childKey);
+      if (child) queue.push(child);
+    }
+  }
+  return total;
+}
+
+/**
+ * The over-capacity catch: when a region's full-density total exceeds the
+ * budget, split it into sectors the viewer can show one at a time. Each split
+ * halves the region along its longer axis at the point-weighted median of the
+ * intersecting node centers (balanced halves even for skewed data), recursing
+ * until every sector fits the budget or maxSectors is reached.
+ */
+export function planRegionSectors(
+  nodesByKey: Map<string, StreamNode>,
+  rootKey: string,
+  region: RegionXY,
+  budgetMax: number,
+  maxSectors = 16,
+): RegionXY[] {
+  const fits = (candidate: RegionXY): boolean =>
+    estimateRegionPoints(nodesByKey, rootKey, candidate) <= budgetMax;
+  const sectors: RegionXY[] = [];
+
+  const subdivide = (candidate: RegionXY, depthLeft: number): void => {
+    if (depthLeft <= 0 || fits(candidate)) {
+      sectors.push(candidate);
+      return;
+    }
+    const splitX = candidate.maxX - candidate.minX >= candidate.maxY - candidate.minY;
+    const split = weightedMedianSplit(nodesByKey, rootKey, candidate, splitX);
+    if (split === null) {
+      sectors.push(candidate); // no separable weight - splitting cannot help
+      return;
+    }
+    const [a, b] = split;
+    subdivide(a, depthLeft - 1);
+    subdivide(b, depthLeft - 1);
+  };
+
+  subdivide(region, Math.ceil(Math.log2(Math.max(maxSectors, 1))));
+  return sectors;
+}
+
+/** Point-weighted median split of a region along one axis; null when degenerate. */
+function weightedMedianSplit(
+  nodesByKey: Map<string, StreamNode>,
+  rootKey: string,
+  region: RegionXY,
+  alongX: boolean,
+): [RegionXY, RegionXY] | null {
+  const root = nodesByKey.get(rootKey);
+  if (!root) return null;
+  const samples: { center: number; weight: number }[] = [];
+  const queue: StreamNode[] = [root];
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    if (!nodeIntersectsRegionXY(node.bounds, region)) continue;
+    samples.push({
+      center: alongX ? (node.bounds.minX + node.bounds.maxX) / 2 : (node.bounds.minY + node.bounds.maxY) / 2,
+      weight: node.pointCount,
+    });
+    for (const childKey of node.childKeys) {
+      const child = nodesByKey.get(childKey);
+      if (child) queue.push(child);
+    }
+  }
+  if (samples.length === 0) return null;
+  samples.sort((a, b) => a.center - b.center);
+  const totalWeight = samples.reduce((sum, sample) => sum + sample.weight, 0);
+  let acc = 0;
+  let cut = samples[samples.length - 1]!.center;
+  for (const sample of samples) {
+    acc += sample.weight;
+    if (acc >= totalWeight / 2) {
+      cut = sample.center;
+      break;
+    }
+  }
+  const lo = alongX ? region.minX : region.minY;
+  const hi = alongX ? region.maxX : region.maxY;
+  const clamped = Math.min(Math.max(cut, lo + (hi - lo) * 0.05), hi - (hi - lo) * 0.05);
+  if (!(clamped > lo && clamped < hi)) return null;
+  return alongX
+    ? [
+        { ...region, maxX: clamped },
+        { ...region, minX: clamped },
+      ]
+    : [
+        { ...region, maxY: clamped },
+        { ...region, minY: clamped },
+      ];
+}
+
 export interface LoadedStreamEntry {
   key: string;
   pointCount: number;

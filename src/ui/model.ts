@@ -22,6 +22,7 @@ import {
   type ObjectCategoryId,
   type TemplateParamSpec,
 } from '../shared/template-catalog'
+import { isolateBoundaryFromFeature } from '../viewer/generators'
 
 // ---------------------------------------------------------------------------
 // Shared helpers (moved from main.ts so panels and tests share one copy)
@@ -674,7 +675,25 @@ export interface FeatureDetailModel {
     rotationYaw: string
     summary: string
     previewKind: string
+    /** Vertex count of the stored isolate boundary; null when none is drawn. */
+    isolateVertexCount: number | null
+    /** First refs in stored order (window selections can add thousands); index keys removal. */
+    evidenceItems: { index: number; kindLabel: string; coordLabel: string }[]
+    /** Refs beyond the rendered rows; shown as a summary count. */
+    evidenceOverflow: number
   }
+}
+
+/** DOM-safety cap for the scrollable detail evidence list; the rest is summarized as a count. */
+const EVIDENCE_DETAIL_ROWS = 200
+
+const EVIDENCE_KIND_LABEL: Record<string, string> = {
+  'picked-coordinate': 'free pick',
+  'asset-point': 'cloud point',
+  'asset-vertex': 'feature vertex',
+  'asset-edge': 'feature edge',
+  'surface-hit': 'surface',
+  'manual-note': 'note',
 }
 
 export function buildFeatureDetailModel(manifest: ProjectManifest | null, featureId: string): FeatureDetailModel | null {
@@ -744,6 +763,7 @@ function buildObjectEditorModel(feature: ProjectManifest['features'][number]): F
   if (!template?.objectCategory) return null
   const geometry = feature.geometry as { point?: unknown }
   const point = Array.isArray(geometry.point) && geometry.point.length === 3 ? geometry.point : [0, 0, 0]
+  const isolate = isolateBoundaryFromFeature(feature)
   return {
     categoryId: template.objectCategory,
     typeTemplateId: template.id,
@@ -756,6 +776,13 @@ function buildObjectEditorModel(feature: ProjectManifest['features'][number]): F
     rotationYaw: String(feature.parameters?.rotationYaw ?? 0),
     summary: objectSummary(feature),
     previewKind: template.subtype,
+    isolateVertexCount: isolate ? isolate.length : null,
+    evidenceItems: (feature.evidenceRefs ?? []).slice(0, EVIDENCE_DETAIL_ROWS).map((ref, index) => ({
+      index,
+      kindLabel: EVIDENCE_KIND_LABEL[ref.kind] ?? ref.kind,
+      coordLabel: ref.coordinate.map((axis) => axis.toFixed(1)).join(', '),
+    })),
+    evidenceOverflow: Math.max((feature.evidenceRefs ?? []).length - EVIDENCE_DETAIL_ROWS, 0),
   }
 }
 

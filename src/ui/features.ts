@@ -17,6 +17,7 @@ import {
 import type { EvidenceRef, FeatureRecord, ProjectManifest } from '../shared/workbench-types'
 import type { ViewerEngine } from '../viewer'
 import type { Vec3 } from '../viewer/geometry'
+import type { RegionXY } from '../viewer/pointCloudStreaming'
 import {
   buildObjectDisplay,
   buildBuildingDisplay,
@@ -24,6 +25,7 @@ import {
   buildPointPrimitiveDisplay,
   buildRegionPatch,
   buildingGeometryFromFeature,
+  isolateBoundaryFromFeature,
   lineGeometryFromFeature,
   pointPrimitiveGeometryFromFeature,
   regionGeometryFromFeature,
@@ -121,6 +123,27 @@ interface PendingSimpleFeature {
   placementMode: ObjectPlacementMode
 }
 
+export type ObjectEditKind = 'isolate' | 'evidence'
+
+/** In-flight per-object edit mode (isolate boundary draw or evidence picking). */
+export interface ObjectEditView {
+  featureId: string
+  kind: ObjectEditKind
+  /** Isolate draw only: boundary vertices placed so far. */
+  activeVertexCount: number
+  /** Isolate draw only: boundary can close (>= 3 vertices). */
+  canFinish: boolean
+  /** Transient feedback for the last evidence action (e.g. window sampling). */
+  note?: string
+}
+
+/** Active isolate load-all state for the panel (full-density area streaming). */
+export interface IsolateLoadView {
+  featureId: string
+  sectorCount: number
+  activeSector: number
+}
+
 const DEFAULT_OBJECT_TEMPLATE_ID = 'object.box'
 
 /** Reality display tints per region subtype (display hint only, not persisted). */
@@ -147,6 +170,10 @@ export class FeatureController {
   private pendingBuilding: PendingBuilding | null = null
   private simplePhase: SimpleAuthoringPhase | null = null
   private pendingSimple: PendingSimpleFeature | null = null
+  private objectEdit: { featureId: string; kind: ObjectEditKind } | null = null
+  private objectEditNote: string | null = null
+  private focusedFeatureId: string | null = null
+  private isolateLoad: { featureId: string; sectors: RegionXY[]; active: number } | null = null
 
   constructor(deps: FeatureControllerDeps) {
     this.deps = deps
@@ -235,7 +262,284 @@ export class FeatureController {
   }
 
   isAuthoring(): boolean {
-    return this.phase !== null || this.buildingPhase !== null || this.simplePhase !== null
+    return this.phase !== null || this.buildingPhase !== null || this.simplePhase !== null || this.objectEdit !== null
+  }
+
+  getObjectEdit(): ObjectEditView | null {
+    if (!this.objectEdit) return null
+    if (this.objectEdit.kind === 'evidence') {
+      return {
+        ...this.objectEdit,
+        activeVertexCount: 0,
+        canFinish: false,
+        ...(this.objectEditNote ? { note: this.objectEditNote } : {}),
+      }
+    }
+    const draft = this.deps.getViewer()?.getFeatureAuthoringSnapshot().draft
+    const count = draft?.vertices.length ?? 0
+    return { ...this.objectEdit, activeVertexCount: count, canFinish: count >= 3 }
+  }
+
+  /**
+   * Starts drawing the isolate/focus boundary for an object: an XY polygon of
+   * viewer context. Boundary vertices are NEVER stored as evidence - ground
+   * and clutter inside the area stay out of the object's provenance.
+   */
+  startIsolateBoundary(featureId: string): void {
+    const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature || feature.family !== 'object' || this.isAuthoring()) return
+    const viewer = this.deps.ensureViewer()
+    viewer.startFeatureAuthoring('object', feature.templateId ?? null, 'polygon')
+    this.objectEdit = { featureId, kind: 'isolate' }
+    this.deps.onAuthoringChanged()
+  }
+
+  async finishIsolateBoundary(): Promise<void> {
+    const session = this.deps.getSession()
+    const viewer = this.deps.getViewer()
+    if (!session || !viewer || this.objectEdit?.kind !== 'isolate') return
+    viewer.requestCloseFeatureAuthoring()
+    const snapshot = viewer.confirmFeatureAuthoring()
+    if (snapshot.state !== 'complete' || !snapshot.draft || snapshot.draft.vertices.length < 3) return
+    const featureId = this.objectEdit.featureId
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature) return
+    feature.metadata = {
+      ...(feature.metadata ?? {}),
+      isolateBoundary: { polygon: snapshot.draft.vertices.map((vertex) => vertex.world) },
+    }
+    feature.modifiedAt = new Date().toISOString()
+    this.clearObjectEdit()
+    this.clearIsolateLoad() // a redrawn boundary invalidates the old sector plan
+    await this.deps.persistManifest(manifest)
+  }
+
+  async clearIsolateBoundary(featureId: string): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature?.metadata || !('isolateBoundary' in feature.metadata)) return
+    delete feature.metadata.isolateBoundary
+    feature.modifiedAt = new Date().toISOString()
+    this.clearIsolateLoad()
+    await this.deps.persistManifest(manifest)
+  }
+
+  getIsolateLoad(): IsolateLoadView | null {
+    if (!this.isolateLoad) return null
+    return {
+      featureId: this.isolateLoad.featureId,
+      sectorCount: this.isolateLoad.sectors.length,
+      activeSector: this.isolateLoad.active,
+    }
+  }
+
+  /**
+   * Loads the full survey data (index, all levels) inside the object's isolate
+   * boundary. Areas over the render budget are pre-split into balanced sectors
+   * shown one at a time - the over-capacity catch.
+   */
+  startIsolateLoadAll(featureId: string): void {
+    const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature || feature.family !== 'object') return
+    const boundary = isolateBoundaryFromFeature(feature)
+    if (!boundary) return
+    const viewer = this.deps.ensureViewer()
+    const sectors = viewer.planIsolateSectors(boundary)
+    if (sectors.length === 0) return
+    this.isolateLoad = { featureId, sectors, active: 0 }
+    viewer.setIsolateLoadRegion(sectors[0]!)
+    this.applyFocusOverlay()
+    this.deps.onAuthoringChanged()
+  }
+
+  stepIsolateSector(delta: number): void {
+    const viewer = this.deps.getViewer()
+    if (!viewer || !this.isolateLoad || this.isolateLoad.sectors.length < 2) return
+    const count = this.isolateLoad.sectors.length
+    this.isolateLoad.active = (this.isolateLoad.active + delta + count) % count
+    viewer.setIsolateLoadRegion(this.isolateLoad.sectors[this.isolateLoad.active]!)
+    this.applyFocusOverlay()
+    this.deps.onAuthoringChanged()
+  }
+
+  stopIsolateLoadAll(): void {
+    if (!this.isolateLoad) return
+    this.clearIsolateLoad()
+    this.applyFocusOverlay()
+    this.deps.onAuthoringChanged()
+  }
+
+  private clearIsolateLoad(): void {
+    if (!this.isolateLoad) return
+    this.isolateLoad = null
+    this.deps.getViewer()?.setIsolateLoadRegion(null)
+  }
+
+  /** Enters evidence-pick mode: each snapped viewer click adds one explicit ref. */
+  startEvidencePick(featureId: string): void {
+    const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature || feature.family !== 'object' || this.isAuthoring()) return
+    this.objectEdit = { featureId, kind: 'evidence' }
+    this.objectEditNote = null
+    this.deps.ensureViewer().setEvidencePickActive(true)
+    this.deps.onAuthoringChanged()
+  }
+
+  stopEvidencePick(): void {
+    if (this.objectEdit?.kind !== 'evidence') return
+    this.objectEdit = null
+    this.objectEditNote = null
+    this.deps.getViewer()?.setEvidencePickActive(false)
+    this.deps.onAuthoringChanged()
+  }
+
+  /**
+   * One-shot window selection inside evidence-pick mode: the next viewer drag
+   * selects visible cloud points (isolate focus applies) and stores them as
+   * evidence refs in a single persist. Duplicates of existing refs are skipped.
+   */
+  async selectEvidenceWindow(): Promise<void> {
+    const viewer = this.deps.getViewer()
+    if (!viewer || this.objectEdit?.kind !== 'evidence') return
+    const featureId = this.objectEdit.featureId
+    const result = await viewer.armEvidenceWindow()
+    // Mode may have ended (Done/cancel) while the drag was pending.
+    if (!result || result.picks.length === 0 || this.objectEdit?.kind !== 'evidence' || this.objectEdit.featureId !== featureId) return
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature) return
+    const refs = feature.evidenceRefs ?? []
+    const seen = new Set(refs.map((ref) => ref.coordinate.join(',')))
+    const added: EvidenceRef[] = []
+    for (const pick of result.picks) {
+      const key = pick.evidence.coordinate.join(',')
+      if (seen.has(key)) continue
+      seen.add(key)
+      added.push(pick.evidence)
+    }
+    const duplicates = result.picks.length - added.length
+    const sampledOut = result.total - result.picks.length
+    this.objectEditNote =
+      `Window added ${added.length.toLocaleString()} points` +
+      (duplicates > 0 ? `, ${duplicates.toLocaleString()} already present` : '') +
+      (sampledOut > 0 ? `; caught ${result.total.toLocaleString()}, sampled for storage safety` : '')
+    if (added.length === 0) {
+      this.deps.onAuthoringChanged()
+      return
+    }
+    feature.evidenceRefs = [...refs, ...added]
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  async removeEvidenceRef(featureId: string, index: number): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature?.evidenceRefs || index < 0 || index >= feature.evidenceRefs.length) return
+    feature.evidenceRefs.splice(index, 1)
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  async clearEvidenceRefs(featureId: string): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature?.evidenceRefs || feature.evidenceRefs.length === 0) return
+    feature.evidenceRefs = []
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  /** Cancels any in-flight object edit mode without touching other authoring. */
+  cancelObjectEdit(): void {
+    if (!this.objectEdit) return
+    const viewer = this.deps.getViewer()
+    if (this.objectEdit.kind === 'isolate') {
+      viewer?.cancelFeatureAuthoring()
+      viewer?.setAuthoringDraftPreview(null)
+      viewer?.setSnapPreview(null)
+    } else {
+      viewer?.setEvidencePickActive(false)
+    }
+    this.objectEdit = null
+    this.objectEditNote = null
+    this.deps.onAuthoringChanged()
+  }
+
+  /**
+   * Feature open in the detail panel; drives the viewer focus overlay
+   * (isolate boundary emphasis + evidence/origin markers).
+   */
+  setFocusedFeature(featureId: string | null): void {
+    if (this.isolateLoad && this.isolateLoad.featureId !== featureId) this.clearIsolateLoad()
+    this.focusedFeatureId = featureId
+    this.applyFocusOverlay()
+  }
+
+  private applyFocusOverlay(): void {
+    const viewer = this.deps.getViewer()
+    if (!viewer) return
+    const feature = this.focusedFeatureId
+      ? this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === this.focusedFeatureId)
+      : null
+    if (!feature || feature.family !== 'object') {
+      viewer.setFeatureFocusOverlay(null)
+      viewer.setIsolateFocus(null)
+      return
+    }
+    const geometry = feature.geometry as { point?: unknown }
+    const boundary = isolateBoundaryFromFeature(feature)
+    // The active load-all sector renders as a rect only when the area actually
+    // split - a single full-area sector would just retrace the boundary bbox.
+    const load = this.isolateLoad?.featureId === feature.id ? this.isolateLoad : null
+    const sector = load && load.sectors.length > 1 ? load.sectors[load.active]! : null
+    viewer.setFeatureFocusOverlay({
+      boundary,
+      evidence: (feature.evidenceRefs ?? []).map((ref) => [...ref.coordinate] as Vec3),
+      origin: isVec3(geometry.point) ? [...geometry.point] : null,
+      sectorRect: sector && boundary ? { ...sector, z: boundary[0]![2] } : null,
+    })
+    // Focus mode proper: the viewer isolates cloud display to the boundary
+    // while this object is open. Context only - never evidence.
+    viewer.setIsolateFocus(boundary)
+  }
+
+  private async addEvidenceAtPointer(): Promise<void> {
+    const session = this.deps.getSession()
+    const viewer = this.deps.getViewer()
+    if (!session || !viewer || this.objectEdit?.kind !== 'evidence') return
+    const picked = viewer.resolveEvidenceAtPointer()
+    if (!picked) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === this.objectEdit!.featureId)
+    if (!feature) return
+    const refs = feature.evidenceRefs ?? []
+    const duplicate = refs.some(
+      (ref) =>
+        ref.coordinate[0] === picked.evidence.coordinate[0] &&
+        ref.coordinate[1] === picked.evidence.coordinate[1] &&
+        ref.coordinate[2] === picked.evidence.coordinate[2],
+    )
+    if (duplicate) return
+    feature.evidenceRefs = [...refs, picked.evidence]
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  private clearObjectEdit(): void {
+    const viewer = this.deps.getViewer()
+    viewer?.setAuthoringDraftPreview(null)
+    viewer?.setSnapPreview(null)
+    this.objectEdit = null
   }
 
   startRegion(templateId: string): void {
@@ -338,6 +642,18 @@ export class FeatureController {
 
   /** Routed from the viewer-host click handler; true when the click was consumed. */
   handleViewerClick(): boolean {
+    if (this.objectEdit?.kind === 'evidence') {
+      void this.addEvidenceAtPointer()
+      return true
+    }
+    if (this.objectEdit?.kind === 'isolate') {
+      const viewer = this.deps.getViewer()
+      if (!viewer) return false
+      viewer.placeFeatureVertexAtPointer(undefined, true)
+      this.refreshIsolateDraftPreview()
+      this.deps.onAuthoringChanged()
+      return true
+    }
     const regionActive = this.phase !== null && this.phase !== 'review'
     const buildingActive = this.buildingPhase !== null && this.buildingPhase !== 'review'
     const simpleActive = this.simplePhase !== null && this.simplePhase !== 'review'
@@ -781,6 +1097,9 @@ export class FeatureController {
       }
     }
     viewer.setAuthoredFeatures(entries)
+    // Focus overlay reflects manifest state (evidence/boundary), so re-apply
+    // whenever displays regenerate after a persist.
+    this.applyFocusOverlay()
   }
 
   private refreshDraftPreview(): void {
@@ -815,6 +1134,15 @@ export class FeatureController {
     viewer.setAuthoringDraftPreview({ lines, activeVertices })
   }
 
+  private refreshIsolateDraftPreview(): void {
+    const viewer = this.deps.getViewer()
+    if (!viewer || this.objectEdit?.kind !== 'isolate') return
+    const draft = viewer.getFeatureAuthoringSnapshot().draft
+    const activeVertices = draft?.vertices.map((vertex) => vertex.world) ?? []
+    const lines: Vec3[][] = activeVertices.length >= 2 ? [activeVertices] : []
+    viewer.setAuthoringDraftPreview({ lines, activeVertices })
+  }
+
   private refreshSimpleDraftPreview(): void {
     const viewer = this.deps.getViewer()
     if (!viewer || !this.pendingSimple) return
@@ -839,6 +1167,9 @@ export class FeatureController {
     this.pendingBuilding = null
     this.simplePhase = null
     this.pendingSimple = null
+    if (this.objectEdit?.kind === 'evidence') viewer?.setEvidencePickActive(false)
+    this.objectEdit = null
+    this.objectEditNote = null
   }
 
   private objectTemplatesByCategory(): Array<[ObjectCategoryId, FeatureTemplate[]]> {

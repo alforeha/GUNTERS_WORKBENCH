@@ -15,13 +15,17 @@ import {
   formatIndexedFullDisclosure,
   isSettled,
   planEviction,
+  planRegionSectors,
   projScaleFromPerspective,
+  selectRegionNodes,
   selectStreamingNodes,
   staleRequestKeys,
+  type RegionXY,
   type StreamBounds,
   type StreamCameraView,
   type StreamNode,
 } from './pointCloudStreaming';
+import { applyIsolateClip, createIsolateClipUniforms, setIsolateClipPolygon } from './isolateClip';
 import { estimateLowPercentileGroundZ, type GroundEstimate } from './walkSurface';
 
 /** Fetches decoded, origin-relative tile payloads for the given node keys (IPC-backed in-app). */
@@ -77,6 +81,7 @@ export class StreamingPointCloud {
   private readonly worldBounds: StreamBounds;
   private readonly levelStats = new Map<number, { edge: number; averagePointCount: number }>();
   private readonly levelMaterials = new Map<number, THREE.PointsMaterial>();
+  private readonly isolateClip = createIsolateClipUniforms();
   private readonly pinnedKeys = new Set<string>();
   private readonly fetchTiles: TileFetcher;
   private readonly onChanged?: () => void;
@@ -87,6 +92,7 @@ export class StreamingPointCloud {
 
   private visibleAll = true;
   private pointSize = 2;
+  private focusRegion: RegionXY | null = null;
   private displayMode: PointDisplayMode;
   private filter: FilterState = defaultFilterState();
   private overviewSampler: GeotiffOverviewSampler | null = null;
@@ -177,6 +183,25 @@ export class StreamingPointCloud {
     if (this.displayMode === mode) return;
     this.displayMode = mode;
     this.colorEpoch++;
+  }
+
+  /** Isolate focus: render-local XY polygon outside which points are hidden; null restores all. */
+  setIsolateClip(polygonXY: { x: number; y: number }[] | null): void {
+    setIsolateClipPolygon(this.isolateClip, polygonXY);
+  }
+
+  /**
+   * Full-density load region (survey XY) for isolate load-all: every index
+   * node intersecting it streams in alongside normal SSE selection; null
+   * restores SSE-only streaming.
+   */
+  setFocusLoadRegion(region: RegionXY | null): void {
+    this.focusRegion = region;
+  }
+
+  /** Sector plan for a region that may exceed the render budget (survey XY). */
+  planRegionSectors(region: RegionXY): RegionXY[] {
+    return planRegionSectors(this.nodesByKey, this.rootKey, region, this.budgetMax);
   }
 
   setFilter(filter: FilterState): void {
@@ -284,11 +309,20 @@ export class StreamingPointCloud {
       ],
       projScale: projScaleFromPerspective(viewportHeightPx, fovYRadians),
     };
+    // Isolate load-all: the focus region streams at full density and takes
+    // budget priority; SSE keeps at least a slice for coverage elsewhere
+    // (mostly clipped invisible while isolate focus is on anyway).
+    const regionSelection = this.focusRegion
+      ? selectRegionNodes(this.nodesByKey, this.rootKey, this.focusRegion, this.budgetMax)
+      : null;
+    const sseBudget = regionSelection
+      ? Math.max(this.budgetMax - regionSelection.estimatedPoints, Math.floor(this.budgetMax * 0.2))
+      : this.budgetMax;
     const selection = selectStreamingNodes(this.nodesByKey, this.rootKey, camView, {
       sseThreshold: this.sseThreshold,
-      budgetMax: this.budgetMax,
+      budgetMax: sseBudget,
     });
-    this.selectionKeys = new Set([...selection.keys, ...this.pinnedKeys]);
+    this.selectionKeys = new Set([...selection.keys, ...(regionSelection?.keys ?? []), ...this.pinnedKeys]);
     this.finestVisibleLevels = deriveFinestVisibleLevels(
       this.nodesByKey,
       new Set([...this.loaded.keys()].filter((key) => this.selectionKeys.has(key))),
@@ -332,7 +366,8 @@ export class StreamingPointCloud {
       queued.add(key);
       if (toFetch.length >= MAX_FETCH_PER_UPDATE) break;
     }
-    for (const scored of selection.nodes) {
+    // Region tiles fetch ahead of SSE refinement: the tech asked for this area.
+    for (const scored of [...(regionSelection?.nodes ?? []), ...selection.nodes]) {
       if (toFetch.length >= MAX_FETCH_PER_UPDATE) break;
       if (this.loaded.has(scored.key) || this.inFlight.has(scored.key) || queued.has(scored.key)) continue;
       toFetch.push(scored.key);
@@ -518,6 +553,7 @@ export class StreamingPointCloud {
       transparent: true,
       fog: true,
     });
+    applyIsolateClip(material, this.isolateClip);
     this.levelMaterials.set(level, material);
     return material;
   }

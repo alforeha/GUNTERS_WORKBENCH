@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { PointCloudDataset, PointCloudNodePayload, PointCloudOctreeNode } from '../core/contract';
 import type { Vec3 } from './geometry';
+import { applyIsolateClip, createIsolateClipUniforms, setIsolateClipPolygon } from './isolateClip';
 import {
   GeotiffOverviewSampler,
   POINT_BUDGET_MAX,
@@ -39,6 +40,7 @@ export class RenderPointCloud {
 
   private nodes: RenderNode[] = [];
   private material: THREE.PointsMaterial;
+  private readonly isolateClip = createIsolateClipUniforms();
   private visibleAll = true;
   private pointSize = 2;
   private density = 1;
@@ -74,6 +76,7 @@ export class RenderPointCloud {
       transparent: true,
       fog: true,
     });
+    applyIsolateClip(this.material, this.isolateClip);
     this.displayMode = dataset.attributes.hasRgb ? 'rgb' : 'elevation';
     this.nodes = this.flattenNodes(dataset.octree.root);
   }
@@ -113,6 +116,11 @@ export class RenderPointCloud {
     if (this.displayMode === mode) return;
     this.displayMode = mode;
     this.colorEpoch++;
+  }
+
+  /** Isolate focus: render-local XY polygon outside which points are hidden; null restores all. */
+  setIsolateClip(polygonXY: { x: number; y: number }[] | null): void {
+    setIsolateClipPolygon(this.isolateClip, polygonXY);
   }
 
   setFilter(filter: FilterState): void {

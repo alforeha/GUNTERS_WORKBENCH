@@ -30,6 +30,19 @@ export interface SnapPreview {
   kind: 'index' | 'preview' | 'feature' | 'free';
 }
 
+/**
+ * Focus emphasis for the feature currently open in the detail panel: the
+ * user-drawn isolate boundary (context only, never evidence), the explicit
+ * evidence refs, and the object origin. Display only; nothing here persists.
+ */
+export interface FeatureFocusOverlay {
+  boundary: Vec3[] | null;
+  evidence: Vec3[];
+  origin: Vec3 | null;
+  /** Active load-all sector (survey XY rect at boundary height), when the isolate area streams in parts. */
+  sectorRect?: { minX: number; minY: number; maxX: number; maxY: number; z: number } | null;
+}
+
 const DRAFT_LINE_COLOR = 0xffc857;
 const DRAFT_VERTEX_COLOR = 0xffe3a3;
 
@@ -39,6 +52,7 @@ export class RenderFeatures {
   private readonly featureRoot = new THREE.Group();
   private readonly draftRoot = new THREE.Group();
   private readonly snapRoot = new THREE.Group();
+  private readonly focusRoot = new THREE.Group();
   private snapGeometry: AuthoredSnapGeometry = { vertices: [], edges: [] };
 
   constructor(origin: Vec3) {
@@ -47,6 +61,7 @@ export class RenderFeatures {
     this.group.add(this.featureRoot);
     this.group.add(this.draftRoot);
     this.group.add(this.snapRoot);
+    this.group.add(this.focusRoot);
   }
 
   setFeatures(entries: FeatureDisplayEntry[]): void {
@@ -159,6 +174,32 @@ export class RenderFeatures {
     this.snapRoot.add(point);
   }
 
+  setFocusOverlay(overlay: FeatureFocusOverlay | null): void {
+    disposeChildren(this.focusRoot);
+    if (!overlay) return;
+    if (overlay.boundary && overlay.boundary.length >= 3) {
+      const loop = [...overlay.boundary, overlay.boundary[0]!];
+      this.focusRoot.add(buildLine(loop, this.origin, 0x8ab4ff, 'focus-isolate-boundary'));
+    }
+    if (overlay.sectorRect) {
+      const { minX, minY, maxX, maxY, z } = overlay.sectorRect;
+      const rect: Vec3[] = [
+        [minX, minY, z],
+        [maxX, minY, z],
+        [maxX, maxY, z],
+        [minX, maxY, z],
+        [minX, minY, z],
+      ];
+      this.focusRoot.add(buildLine(rect, this.origin, 0xffe3a3, 'focus-load-sector'));
+    }
+    if (overlay.evidence.length > 0) {
+      this.focusRoot.add(buildScreenPoints(overlay.evidence, this.origin, 0x53c7ff, 9, 'focus-evidence-points'));
+    }
+    if (overlay.origin) {
+      this.focusRoot.add(buildScreenPoints([overlay.origin], this.origin, 0xffc857, 10, 'focus-object-origin'));
+    }
+  }
+
   setVisible(visible: boolean): void {
     this.featureRoot.visible = visible;
   }
@@ -167,6 +208,7 @@ export class RenderFeatures {
     disposeChildren(this.featureRoot);
     disposeChildren(this.draftRoot);
     disposeChildren(this.snapRoot);
+    disposeChildren(this.focusRoot);
     this.group.removeFromParent();
   }
 }
@@ -179,6 +221,18 @@ function flattenVec3(points: Vec3[]): Float64Array {
     out[i * 3 + 2] = points[i]![2];
   }
   return out;
+}
+
+function buildScreenPoints(points: Vec3[], origin: Vec3, color: number, sizePx: number, name: string): THREE.Points {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(rebasePositions(flattenVec3(points), origin), 3));
+  const object = new THREE.Points(
+    geometry,
+    new THREE.PointsMaterial({ color, size: sizePx, sizeAttenuation: false, depthTest: false }),
+  );
+  object.name = name;
+  object.renderOrder = 5;
+  return object;
 }
 
 function buildLine(points: Vec3[], origin: Vec3, color: number, name: string): THREE.Line {

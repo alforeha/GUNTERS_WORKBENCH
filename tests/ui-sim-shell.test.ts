@@ -594,6 +594,133 @@ describe('live regions tab', () => {
     )
     expect(html).toContain('Object Preview')
     expect(html).toContain('object-preview-box')
+    expect(html).toContain('object-preview-3d-mount')
+    expect(html).toContain('data-preview-feature-id="feat-object-1"')
+  })
+
+  it('object detail offers isolate area and explicit evidence controls', () => {
+    const manifest = makeManifest({ features: [makeObjectFeature()] })
+    const detail = buildFeatureDetailModel(manifest, 'feat-object-1')
+    const html = renderSimPanelHtml(
+      buildSimPanelModel(manifest),
+      { activeTab: 'objects', simVisible: true, selectedFeatureId: 'feat-object-1' },
+      makeRegionsView(),
+      makeBuildingsView(),
+      { object: makeSimpleView('object', { detail }) },
+    )
+    expect(html).toContain('Isolate Area')
+    expect(html).toContain('No isolate area yet')
+    expect(html).toContain('data-action="feature-isolate-start"')
+    expect(html).not.toContain('data-action="feature-isolate-clear"')
+    expect(html).toContain('data-action="feature-evidence-start"')
+    expect(html).toContain('cloud point @ 1.0, 2.0, 3.0')
+    expect(html).toContain('data-action="feature-evidence-remove"')
+    expect(html).toContain('data-evidence-index="0"')
+  })
+
+  it('object detail shows the stored isolate boundary with redraw/clear actions', () => {
+    const feature = makeObjectFeature()
+    feature.metadata = { isolateBoundary: { polygon: [[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0]] } }
+    const manifest = makeManifest({ features: [feature] })
+    const detail = buildFeatureDetailModel(manifest, 'feat-object-1')
+    const html = renderSimPanelHtml(
+      buildSimPanelModel(manifest),
+      { activeTab: 'objects', simVisible: true, selectedFeatureId: 'feat-object-1' },
+      makeRegionsView(),
+      makeBuildingsView(),
+      { object: makeSimpleView('object', { detail }) },
+    )
+    expect(html).toContain('Isolate area: 4 vertices')
+    expect(html).toContain('Redraw isolate area')
+    expect(html).toContain('data-action="feature-isolate-clear"')
+    expect(html).toContain('data-action="feature-isolate-load"')
+  })
+
+  it('object detail shows the sector stepper while a split load-all is active', () => {
+    const feature = makeObjectFeature()
+    feature.metadata = { isolateBoundary: { polygon: [[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0]] } }
+    const manifest = makeManifest({ features: [feature] })
+    const detail = buildFeatureDetailModel(manifest, 'feat-object-1')
+    const html = renderSimPanelHtml(
+      buildSimPanelModel(manifest),
+      { activeTab: 'objects', simVisible: true, selectedFeatureId: 'feat-object-1' },
+      makeRegionsView(),
+      makeBuildingsView(),
+      {
+        object: makeSimpleView('object', {
+          detail,
+          isolateLoad: { featureId: 'feat-object-1', sectorCount: 3, activeSector: 1 },
+        }),
+      },
+    )
+    expect(html).toContain('sector 2 of 3')
+    expect(html).toContain('data-action="feature-isolate-sector-prev"')
+    expect(html).toContain('data-action="feature-isolate-sector-next"')
+    expect(html).toContain('data-action="feature-isolate-load-stop"')
+    expect(html).not.toContain('Load all survey data in area')
+  })
+
+  it('object detail renders the in-flight isolate draw rail gated on 3 vertices', () => {
+    const manifest = makeManifest({ features: [makeObjectFeature()] })
+    const detail = buildFeatureDetailModel(manifest, 'feat-object-1')
+    const html = renderSimPanelHtml(
+      buildSimPanelModel(manifest),
+      { activeTab: 'objects', simVisible: true, selectedFeatureId: 'feat-object-1' },
+      makeRegionsView(),
+      makeBuildingsView(),
+      {
+        object: makeSimpleView('object', {
+          detail,
+          objectEdit: { featureId: 'feat-object-1', kind: 'isolate', activeVertexCount: 2, canFinish: false },
+        }),
+      },
+    )
+    expect(html).toContain('2 placed')
+    expect(html).toMatch(/data-action="feature-isolate-finish" disabled/)
+    expect(html).toContain('data-action="feature-isolate-cancel"')
+  })
+
+  it('object detail summarizes bulk evidence and offers remove-all', () => {
+    const feature = makeObjectFeature()
+    feature.evidenceRefs = Array.from({ length: 203 }, (_, i) => ({
+      kind: 'asset-point' as const,
+      coordinate: [i, i, i] as [number, number, number],
+      assetId: SOURCE_ASSET_ID,
+    }))
+    const manifest = makeManifest({ features: [feature] })
+    const detail = buildFeatureDetailModel(manifest, 'feat-object-1')
+    expect(detail?.objectEditor?.evidenceItems).toHaveLength(200)
+    expect(detail?.objectEditor?.evidenceOverflow).toBe(3)
+    const html = renderSimPanelHtml(
+      buildSimPanelModel(manifest),
+      { activeTab: 'objects', simVisible: true, selectedFeatureId: 'feat-object-1' },
+      makeRegionsView(),
+      makeBuildingsView(),
+      { object: makeSimpleView('object', { detail }) },
+    )
+    expect(html).toContain('+ 3 more refs (window selections)')
+    expect(html).toContain('data-action="feature-evidence-clear"')
+  })
+
+  it('object detail evidence-pick mode swaps the add button for done + hint', () => {
+    const manifest = makeManifest({ features: [makeObjectFeature()] })
+    const detail = buildFeatureDetailModel(manifest, 'feat-object-1')
+    const html = renderSimPanelHtml(
+      buildSimPanelModel(manifest),
+      { activeTab: 'objects', simVisible: true, selectedFeatureId: 'feat-object-1' },
+      makeRegionsView(),
+      makeBuildingsView(),
+      {
+        object: makeSimpleView('object', {
+          detail,
+          objectEdit: { featureId: 'feat-object-1', kind: 'evidence', activeVertexCount: 0, canFinish: false },
+        }),
+      },
+    )
+    expect(html).toContain('data-action="feature-evidence-stop"')
+    expect(html).toContain('data-action="feature-evidence-window"')
+    expect(html).not.toContain('data-action="feature-evidence-start"')
+    expect(html).toContain('Free clicks are ignored')
   })
 })
 

@@ -572,3 +572,12 @@ select {
 .walk-target-cancel {
   margin-top: 6px;
 }
+
+/* One-shot evidence window selection rubber band (fixed: client coords). */
+.evidence-window-rect {
+  position: fixed;
+  border: 1px dashed #53c7ff;
+  background: rgba(83, 199, 255, 0.12);
+  pointer-events: none;
+  z-index: 1000;
+}

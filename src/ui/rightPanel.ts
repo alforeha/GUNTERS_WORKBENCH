@@ -8,7 +8,8 @@
 
 import type { ProjectSession } from '../shared/ipc'
 import type { ProjectManifest } from '../shared/workbench-types'
-import type { BuildingAuthoringView, RegionAuthoringView, SimpleAuthoringView, SimpleFeatureFamily } from './features'
+import type { BuildingAuthoringView, IsolateLoadView, ObjectEditView, RegionAuthoringView, SimpleAuthoringView, SimpleFeatureFamily } from './features'
+import { createObjectPreview3d, type ObjectPreview3d } from './objectPreview'
 import {
   buildBuildingListModel,
   buildFeatureDetailModel,
@@ -64,6 +65,24 @@ export interface RightPanelFeatureOps {
   remove(featureId: string): Promise<void>
   /** Sim master toggle: show/hide all authored features as one group. */
   setSimVisible?(visible: boolean): void
+  /** Object isolate-area + explicit-evidence editing (Object Refinement V1). */
+  getObjectEdit(): ObjectEditView | null
+  startIsolateBoundary(featureId: string): void
+  finishIsolateBoundary(): Promise<void>
+  clearIsolateBoundary(featureId: string): Promise<void>
+  startEvidencePick(featureId: string): void
+  stopEvidencePick(): void
+  selectEvidenceWindow(): Promise<void>
+  removeEvidenceRef(featureId: string, index: number): Promise<void>
+  clearEvidenceRefs(featureId: string): Promise<void>
+  cancelObjectEdit(): void
+  /** Feature open in the detail panel; drives the viewer focus overlay. */
+  setFocusedFeature(featureId: string | null): void
+  /** Isolate load-all: full-density streaming of the boundary area, in sectors when over budget. */
+  getIsolateLoad(): IsolateLoadView | null
+  startIsolateLoadAll(featureId: string): void
+  stepIsolateSector(delta: number): void
+  stopIsolateLoadAll(): void
 }
 
 export interface RightPanelDeps {
@@ -95,6 +114,10 @@ export interface SimpleTabView {
   authoring: SimpleAuthoringView | null
   list: Array<ObjectListItem | LineListItem | MarkerListItem>
   detail: FeatureDetailModel | null
+  /** In-flight isolate/evidence edit for the open object detail, if any. */
+  objectEdit?: ObjectEditView | null
+  /** Active isolate load-all state for the open object detail, if any. */
+  isolateLoad?: IsolateLoadView | null
 }
 
 export interface RightPanelApi {
@@ -260,7 +283,7 @@ export function renderBuildingsTabHtml(view: BuildingsTabView): string {
 }
 
 export function renderSimpleTabHtml(view: SimpleTabView): string {
-  if (view.detail) return renderFeatureDetailHtml(view.detail)
+  if (view.detail) return renderFeatureDetailHtml(view.detail, view.objectEdit, view.isolateLoad)
   if (view.authoring && view.authoring.family === view.family) return renderSimpleAuthoringHtml(view.authoring)
 
   const emptyText = view.family === 'object' ? SIM_TAB_PLACEHOLDER.objects! : view.family === 'line' ? SIM_TAB_PLACEHOLDER.lines! : SIM_TAB_PLACEHOLDER.notes!
@@ -284,7 +307,7 @@ export function renderSimpleTabHtml(view: SimpleTabView): string {
 }
 
 export function renderObjectsTabHtml(view: SimpleTabView): string {
-  if (view.detail) return renderFeatureDetailHtml(view.detail)
+  if (view.detail) return renderFeatureDetailHtml(view.detail, view.objectEdit, view.isolateLoad)
 
   const toolbarNote =
     view.authoring && view.authoring.family === 'object' && view.authoring.phase === 'placing'
@@ -418,7 +441,13 @@ function renderSimpleAuthoringHtml(authoring: SimpleAuthoringView): string {
   `
 }
 
-export function renderFeatureDetailHtml(detail: FeatureDetailModel): string {
+export function renderFeatureDetailHtml(
+  detail: FeatureDetailModel,
+  objectEdit?: ObjectEditView | null,
+  isolateLoad?: IsolateLoadView | null,
+): string {
+  const activeEdit = objectEdit && objectEdit.featureId === detail.id ? objectEdit : null
+  const activeLoad = isolateLoad && isolateLoad.featureId === detail.id ? isolateLoad : null
   const objectSelectorsHtml = detail.objectEditor
     ? `
       <div class="ws-section">
@@ -454,11 +483,13 @@ export function renderFeatureDetailHtml(detail: FeatureDetailModel): string {
         <div class="ws-section-title">Object Preview</div>
         <div class="object-preview-card">
           <div class="object-preview-label">${escapeHtml(detail.objectEditor.categoryId)} / ${escapeHtml(detail.objectEditor.typeLabel)}</div>
-          <div class="object-preview-graphic object-preview-${escapeHtml(detail.objectEditor.previewKind)}" aria-hidden="true"></div>
+          <div class="object-preview-3d-mount object-preview-${escapeHtml(detail.objectEditor.previewKind)}" data-preview-feature-id="${escapeHtml(detail.id)}"></div>
+          <div class="object-preview-hint">Drag to rotate, wheel to zoom. Origin amber, evidence blue.</div>
           <div class="ws-detail">${escapeHtml(detail.objectEditor.summary)}</div>
         </div>
       </div>`
     : ''
+  const isolateHtml = detail.objectEditor ? renderIsolateSectionHtml(detail, activeEdit, activeLoad) : ''
   const paramsHtml =
     detail.params.length === 0
       ? '<div class="ws-detail">No parameters.</div>'
@@ -487,6 +518,7 @@ export function renderFeatureDetailHtml(detail: FeatureDetailModel): string {
         ${objectSelectorsHtml}
         ${previewHtml}
         ${placementHtml}
+        ${isolateHtml}
         <div class="ws-section">
           <div class="ws-section-title">Parameters</div>
           ${paramsHtml}
@@ -496,10 +528,98 @@ export function renderFeatureDetailHtml(detail: FeatureDetailModel): string {
           <div class="ws-section-title">Evidence</div>
           ${badgesHtml ? `<div class="ws-detail">${badgesHtml}</div>` : ''}
           <div class="ws-detail">${detail.evidenceTotal} refs - ${detail.evidenceSnapped} snapped, ${detail.evidenceFree} free placed</div>
+          ${detail.objectEditor ? renderEvidenceEditorHtml(detail, activeEdit) : ''}
         </div>
         <button class="feature-delete" data-action="feature-delete" data-feature-id="${escapeHtml(detail.id)}">Delete feature</button>
       </div>
   `
+}
+
+/** Isolate Area section: draw rail while active, status + actions otherwise. */
+function renderIsolateSectionHtml(
+  detail: FeatureDetailModel,
+  activeEdit: ObjectEditView | null,
+  activeLoad: IsolateLoadView | null,
+): string {
+  const id = escapeHtml(detail.id)
+  if (activeEdit?.kind === 'isolate') {
+    return `
+      <div class="ws-section">
+        <div class="ws-section-title">Isolate Area</div>
+        <div class="authoring-rail" data-phase="isolate">
+          <div class="authoring-hint">Click in the viewer to place boundary vertices. ${activeEdit.activeVertexCount} placed.</div>
+          <button data-action="feature-isolate-finish"${activeEdit.canFinish ? '' : ' disabled'}>Close boundary</button>
+          <button data-action="feature-isolate-cancel">Cancel</button>
+        </div>
+      </div>`
+  }
+  const vertexCount = detail.objectEditor?.isolateVertexCount ?? null
+  const status =
+    vertexCount === null
+      ? 'No isolate area yet. Draw a boundary to scope viewer focus around this object.'
+      : `Isolate area: ${vertexCount} vertices. Context only - points inside are not evidence.`
+  const loadHtml =
+    vertexCount === null
+      ? ''
+      : activeLoad
+        ? `
+        <div class="ws-detail">${
+          activeLoad.sectorCount > 1
+            ? `Full survey data: sector ${activeLoad.activeSector + 1} of ${activeLoad.sectorCount} (area exceeds display budget; amber rect marks the active sector).`
+            : 'Full survey data loaded for the whole area.'
+        }</div>
+        ${
+          activeLoad.sectorCount > 1
+            ? `<button data-action="feature-isolate-sector-prev">&lt; Prev sector</button>
+        <button data-action="feature-isolate-sector-next">Next sector &gt;</button>`
+            : ''
+        }
+        <button data-action="feature-isolate-load-stop">Stop full data</button>`
+        : `<button data-action="feature-isolate-load" data-feature-id="${id}">Load all survey data in area</button>`
+  return `
+      <div class="ws-section">
+        <div class="ws-section-title">Isolate Area</div>
+        <div class="ws-detail">${escapeHtml(status)}</div>
+        <button data-action="feature-isolate-start" data-feature-id="${id}">${vertexCount === null ? '+ Add isolate area' : 'Redraw isolate area'}</button>
+        ${vertexCount === null ? '' : `<button data-action="feature-isolate-clear" data-feature-id="${id}">Clear isolate area</button>`}
+        ${loadHtml}
+      </div>`
+}
+
+/** Explicit evidence list + add/remove controls (objects only). */
+function renderEvidenceEditorHtml(detail: FeatureDetailModel, activeEdit: ObjectEditView | null): string {
+  const id = escapeHtml(detail.id)
+  const items = detail.objectEditor?.evidenceItems ?? []
+  const overflow = detail.objectEditor?.evidenceOverflow ?? 0
+  const overflowHtml =
+    overflow > 0
+      ? `<div class="ws-detail">+ ${overflow} more refs (window selections)</div>`
+      : ''
+  const clearAllHtml =
+    items.length > 0
+      ? `<button data-action="feature-evidence-clear" data-feature-id="${id}">Remove all evidence</button>`
+      : ''
+  const listHtml =
+    items.length === 0
+      ? '<div class="ws-detail">No explicit evidence refs yet.</div>'
+      : `<div class="evidence-list">${items
+          .map(
+            (item) => `
+          <div class="evidence-item">
+            <span class="evidence-item-label">${escapeHtml(item.kindLabel)} @ ${escapeHtml(item.coordLabel)}</span>
+            <button class="evidence-remove" data-action="feature-evidence-remove" data-feature-id="${id}" data-evidence-index="${item.index}" title="Remove this evidence ref">&times;</button>
+          </div>`,
+          )
+          .join('')}</div>${overflowHtml}${clearAllHtml}`
+  const controlHtml =
+    activeEdit?.kind === 'evidence'
+      ? `
+        <div class="authoring-hint">Click snapped cloud/feature points in the viewer to add evidence, or drag a selection window. Free clicks are ignored; isolated-out points never select.</div>
+        ${activeEdit.note ? `<div class="ws-detail">${escapeHtml(activeEdit.note)}</div>` : ''}
+        <button data-action="feature-evidence-window">Select by window</button>
+        <button data-action="feature-evidence-stop">Done adding evidence</button>`
+      : `<button data-action="feature-evidence-start" data-feature-id="${id}">+ Add evidence point</button>`
+  return `${listHtml}${controlHtml}`
 }
 
 function renderParamControl(detailId: string, param: FeatureDetailModel['params'][number]): string {
@@ -603,6 +723,39 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
   let mode: 'sim' | 'asset' = 'sim'
   let openedAssetId: string | null = null
   const simState: SimPanelViewState = { activeTab: 'regions', simVisible: true, selectedFeatureId: null }
+  // One persistent 3D preview widget: innerHTML re-renders replace the mount
+  // placeholder, so the canvas is re-parented (not recreated) to keep the
+  // WebGL context and the user's orbit pose alive across panel updates.
+  let objectPreview: ObjectPreview3d | null = null
+  let objectPreviewFeatureId: string | null = null
+
+  function syncObjectPreview(): void {
+    const previewMount = mount.querySelector<HTMLElement>('.object-preview-3d-mount')
+    const featureId = previewMount?.dataset.previewFeatureId ?? null
+    const manifest = deps.getSession()?.manifest as ProjectManifest | undefined
+    const feature = featureId ? manifest?.features.find((candidate) => candidate.id === featureId) ?? null : null
+    if (!previewMount || !feature) {
+      objectPreview?.dispose()
+      objectPreview = null
+      objectPreviewFeatureId = null
+      return
+    }
+    if (objectPreview && objectPreviewFeatureId !== featureId) {
+      // A different object gets a fresh framing rather than a stale orbit pose.
+      objectPreview.dispose()
+      objectPreview = null
+    }
+    if (!objectPreview) objectPreview = createObjectPreview3d()
+    objectPreviewFeatureId = featureId
+    previewMount.appendChild(objectPreview.element)
+    objectPreview.update(feature)
+  }
+
+  function closeFeatureDetail(): void {
+    simState.selectedFeatureId = null
+    deps.features.cancelObjectEdit()
+    deps.features.setFocusedFeature(null)
+  }
 
   function buildRegionsView(manifest: ProjectManifest): RegionsTabView {
     const detail = simState.selectedFeatureId ? buildFeatureDetailModel(manifest, simState.selectedFeatureId) : null
@@ -637,6 +790,8 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
         authoring,
         list: buildObjectListModel(manifest),
         detail: detail?.family === 'object' ? detail : null,
+        objectEdit: deps.features.getObjectEdit(),
+        isolateLoad: deps.features.getIsolateLoad(),
       },
       line: {
         family: 'line',
@@ -661,6 +816,7 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       mode = 'sim'
       openedAssetId = null
       mount.innerHTML = renderNoProjectHtml()
+      syncObjectPreview()
       return
     }
     const manifest = session.manifest as ProjectManifest
@@ -668,6 +824,7 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       const model = buildWorkSurfaceModel(manifest, openedAssetId)
       if (model) {
         mount.innerHTML = renderWorkSurfaceHtml(model)
+        syncObjectPreview()
         return
       }
       // Asset vanished (e.g. removed) - fall back to the sim surface.
@@ -681,6 +838,7 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       buildBuildingsView(manifest),
       buildSimpleViews(manifest),
     )
+    syncObjectPreview()
   }
 
   mount.addEventListener('click', (event) => {
@@ -692,7 +850,7 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
 
     if (action === 'sim-tab') {
       simState.activeTab = target.dataset.tabId ?? 'regions'
-      simState.selectedFeatureId = null
+      closeFeatureDetail()
       render()
       return
     }
@@ -777,16 +935,17 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
     }
     if (action === 'feature-select' && featureId) {
       simState.selectedFeatureId = featureId
+      deps.features.setFocusedFeature(featureId)
       render()
       return
     }
     if (action === 'feature-back') {
-      simState.selectedFeatureId = null
+      closeFeatureDetail()
       render()
       return
     }
     if (action === 'feature-delete' && featureId) {
-      simState.selectedFeatureId = null
+      closeFeatureDetail()
       void deps.features.remove(featureId)
       return
     }
@@ -794,6 +953,59 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       event.stopPropagation()
       const visible = target.dataset.visible === 'true'
       void deps.features.updateVisibility(featureId, !visible)
+      return
+    }
+    if (action === 'feature-isolate-start' && featureId) {
+      deps.features.startIsolateBoundary(featureId)
+      return
+    }
+    if (action === 'feature-isolate-finish') {
+      void deps.features.finishIsolateBoundary()
+      return
+    }
+    if (action === 'feature-isolate-cancel') {
+      deps.features.cancelObjectEdit()
+      return
+    }
+    if (action === 'feature-isolate-clear' && featureId) {
+      void deps.features.clearIsolateBoundary(featureId)
+      return
+    }
+    if (action === 'feature-isolate-load' && featureId) {
+      deps.features.startIsolateLoadAll(featureId)
+      return
+    }
+    if (action === 'feature-isolate-load-stop') {
+      deps.features.stopIsolateLoadAll()
+      return
+    }
+    if (action === 'feature-isolate-sector-prev') {
+      deps.features.stepIsolateSector(-1)
+      return
+    }
+    if (action === 'feature-isolate-sector-next') {
+      deps.features.stepIsolateSector(1)
+      return
+    }
+    if (action === 'feature-evidence-start' && featureId) {
+      deps.features.startEvidencePick(featureId)
+      return
+    }
+    if (action === 'feature-evidence-window') {
+      void deps.features.selectEvidenceWindow()
+      return
+    }
+    if (action === 'feature-evidence-stop') {
+      deps.features.stopEvidencePick()
+      return
+    }
+    if (action === 'feature-evidence-remove' && featureId) {
+      const index = Number(target.dataset.evidenceIndex)
+      if (Number.isInteger(index)) void deps.features.removeEvidenceRef(featureId, index)
+      return
+    }
+    if (action === 'feature-evidence-clear' && featureId) {
+      void deps.features.clearEvidenceRefs(featureId)
       return
     }
   })

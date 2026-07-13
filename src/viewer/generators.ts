@@ -565,6 +565,17 @@ export function lineGeometryFromFeature(feature: FeatureRecord): LineGeometry | 
   return { vertices: geometry.vertices.map(cloneVec3) };
 }
 
+/**
+ * User-drawn isolate/focus boundary stored on an object feature. Context only:
+ * it scopes viewer emphasis and future work areas, and is NEVER an evidence
+ * source. Lives in feature.metadata so the manifest schema needs no change.
+ */
+export function isolateBoundaryFromFeature(feature: FeatureRecord): Vec3[] | null {
+  const isolate = feature.metadata?.isolateBoundary as { polygon?: unknown } | undefined;
+  if (!isolate || !isVec3Array(isolate.polygon) || isolate.polygon.length < 3) return null;
+  return isolate.polygon.map(cloneVec3);
+}
+
 function objectNumberParam(feature: FeatureRecord, name: string, fallback: number): number {
   const value = feature.parameters?.[name];
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;

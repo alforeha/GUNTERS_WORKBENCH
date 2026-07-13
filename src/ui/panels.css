@@ -558,6 +558,73 @@
   background: rgba(160, 170, 184, 0.4);
 }
 
+.object-preview-3d-mount {
+  width: 100%;
+  border: 1px solid #22364c;
+  border-radius: 8px;
+  background: #122130;
+  overflow: hidden;
+}
+
+.object-preview-3d {
+  display: flex;
+  justify-content: center;
+}
+
+.object-preview-3d canvas {
+  display: block;
+  max-width: 100%;
+  cursor: grab;
+}
+
+.object-preview-3d canvas:active {
+  cursor: grabbing;
+}
+
+.object-preview-hint {
+  font-size: 11px;
+  color: #7d90a8;
+}
+
+.evidence-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 6px 0;
+  max-height: 190px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.evidence-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 8px;
+  border: 1px solid #22364c;
+  border-radius: 6px;
+  background: rgba(36, 72, 111, 0.18);
+}
+
+.evidence-item-label {
+  font-size: 11px;
+  color: #b7d3ff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evidence-remove {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 1;
+  border-radius: 5px;
+  color: #d6dfeb;
+}
+
 /* ---------------------------------------------------------------------------
    Right panel: opened-asset work surface
 --------------------------------------------------------------------------- */
