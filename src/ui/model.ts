@@ -15,7 +15,13 @@ import type {
   SimulationLayerStatus,
 } from '../shared/workbench-types'
 import { isStaleIndexWarning } from '../shared/pointcloud-index'
-import { getTemplate, type TemplateParamSpec } from '../shared/template-catalog'
+import {
+  getTemplate,
+  objectCategoryLabel,
+  templatesForFamily,
+  type ObjectCategoryId,
+  type TemplateParamSpec,
+} from '../shared/template-catalog'
 
 // ---------------------------------------------------------------------------
 // Shared helpers (moved from main.ts so panels and tests share one copy)
@@ -507,7 +513,11 @@ export interface BuildingListItem {
 export interface ObjectListItem {
   id: string
   name: string
+  category: string
+  typeLabel: string
   subtype: string
+  summary: string
+  visible: boolean
   snappedEvidenceCount: number
   freeEvidenceCount: number
 }
@@ -583,10 +593,15 @@ export function buildObjectListModel(manifest: ProjectManifest | null): ObjectLi
     .filter((feature) => feature.family === 'object')
     .map((feature) => {
       const evidence = evidenceSplit(feature)
+      const template = feature.templateId ? getTemplate(feature.templateId) : null
       return {
         id: feature.id,
         name: feature.name,
+        category: template?.objectCategory ? objectCategoryLabel(template.objectCategory) : 'Object',
+        typeLabel: template?.displayName ?? feature.subtype ?? 'Object',
         subtype: feature.subtype ?? 'generic',
+        summary: objectSummary(feature),
+        visible: feature.display?.visible !== false,
         snappedEvidenceCount: evidence.snapped,
         freeEvidenceCount: evidence.free,
       }
@@ -649,6 +664,17 @@ export interface FeatureDetailModel {
   evidenceBadges: string[]
   createdAt: string
   modifiedAt: string
+  objectEditor?: {
+    categoryId: ObjectCategoryId
+    typeTemplateId: string
+    typeLabel: string
+    categories: { id: ObjectCategoryId; label: string }[]
+    types: { templateId: string; label: string }[]
+    placement: { x: string; y: string; z: string }
+    rotationYaw: string
+    summary: string
+    previewKind: string
+  }
 }
 
 export function buildFeatureDetailModel(manifest: ProjectManifest | null, featureId: string): FeatureDetailModel | null {
@@ -658,8 +684,11 @@ export function buildFeatureDetailModel(manifest: ProjectManifest | null, featur
   const snapped = evidence.filter((ref) => ref.kind !== 'picked-coordinate' && ref.kind !== 'manual-note').length
   const cad = (feature.representations?.cad ?? {}) as Record<string, unknown>
   const template = feature.templateId ? getTemplate(feature.templateId) : null
+  const objectEditor = buildObjectEditorModel(feature)
+  const hiddenObjectParams = new Set(objectEditor ? ['rotationYaw'] : [])
   const params = template
     ? template.paramSchema.map((param) => {
+        if (hiddenObjectParams.has(param.name)) return null
         const value = feature.parameters?.[param.name] ?? param.default
         return {
           name: param.name,
@@ -669,7 +698,7 @@ export function buildFeatureDetailModel(manifest: ProjectManifest | null, featur
           ...(param.options ? { options: param.options } : {}),
           editable: true,
         }
-      })
+      }).filter((param): param is NonNullable<typeof param> => param !== null)
     : Object.entries(feature.parameters ?? {}).map(([name, value]) => ({
         name,
         label: name,
@@ -694,6 +723,7 @@ export function buildFeatureDetailModel(manifest: ProjectManifest | null, featur
     evidenceBadges: buildEvidenceBadges(feature),
     createdAt: feature.createdAt,
     modifiedAt: feature.modifiedAt,
+    ...(objectEditor ? { objectEditor } : {}),
   }
 }
 
@@ -706,6 +736,65 @@ function buildEvidenceBadges(feature: ProjectManifest['features'][number]): stri
   if (evidence.some((ref) => ref.kind === 'picked-coordinate')) badges.add('free-placement')
   if (evidence.some((ref) => ref.kind === 'manual-note')) badges.add('manual')
   return [...badges]
+}
+
+function buildObjectEditorModel(feature: ProjectManifest['features'][number]): FeatureDetailModel['objectEditor'] | null {
+  if (feature.family !== 'object' || !feature.templateId) return null
+  const template = getTemplate(feature.templateId)
+  if (!template?.objectCategory) return null
+  const geometry = feature.geometry as { point?: unknown }
+  const point = Array.isArray(geometry.point) && geometry.point.length === 3 ? geometry.point : [0, 0, 0]
+  return {
+    categoryId: template.objectCategory,
+    typeTemplateId: template.id,
+    typeLabel: template.displayName,
+    categories: objectCategories(),
+    types: templatesForFamily('object')
+      .filter((candidate) => candidate.objectCategory === template.objectCategory)
+      .map((candidate) => ({ templateId: candidate.id, label: candidate.displayName })),
+    placement: { x: String(point[0]), y: String(point[1]), z: String(point[2]) },
+    rotationYaw: String(feature.parameters?.rotationYaw ?? 0),
+    summary: objectSummary(feature),
+    previewKind: template.subtype,
+  }
+}
+
+function objectCategories(): { id: ObjectCategoryId; label: string }[] {
+  const ids = new Set<ObjectCategoryId>()
+  for (const template of templatesForFamily('object')) {
+    if (template.objectCategory) ids.add(template.objectCategory)
+  }
+  return [...ids].map((id) => ({ id, label: objectCategoryLabel(id) }))
+}
+
+function objectSummary(feature: ProjectManifest['features'][number]): string {
+  const template = feature.templateId ? getTemplate(feature.templateId) : null
+  const value = (name: string, fallback: number): number => {
+    const raw = feature.parameters?.[name]
+    return typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback
+  }
+  const evidence = evidenceSplit(feature)
+  const evidenceState = evidence.snapped > 0 ? 'snapped evidence' : evidence.free > 0 ? 'manual placement' : 'no evidence'
+  switch (template?.subtype) {
+    case 'box':
+      return `${formatMeasure(value('width', 0))}w x ${formatMeasure(value('depth', 0))}d x ${formatMeasure(value('height', 0))}h - ${evidenceState}`
+    case 'cylinder':
+      return `dia ${formatMeasure(value('diameter', 0))} x ${formatMeasure(value('height', 0))}h - ${evidenceState}`
+    case 'pine':
+    case 'simple-tree':
+    case 'post':
+      return `${formatMeasure(value('height', 0))}h - ${evidenceState}`
+    case 'shrub':
+      return `${formatMeasure(value('width', 0))}w x ${formatMeasure(value('depth', 0))}d x ${formatMeasure(value('height', 0))}h - ${evidenceState}`
+    case 'sign':
+      return `${formatMeasure(value('signWidth', 0))}w x ${formatMeasure(value('signHeight', 0))}h face - ${evidenceState}`
+    default:
+      return evidenceState
+  }
+}
+
+function formatMeasure(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/\.00$/, '')
 }
 
 // ---------------------------------------------------------------------------

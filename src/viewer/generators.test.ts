@@ -9,6 +9,7 @@ import type { Vec3 } from './geometry';
 import {
   buildBuildingDisplay,
   buildLineDisplay,
+  buildObjectDisplay,
   buildPointPrimitiveDisplay,
   buildRegionPatch,
   buildingGeometryFromFeature,
@@ -224,6 +225,48 @@ describe('IMP-5 primitive displays', () => {
     ]);
   })
 
+  it('builds a centered box object mesh and outline', () => {
+    const feature: FeatureRecord = {
+      id: 'feat-object-box',
+      simulationId: 'sim-1',
+      type: 'marker',
+      name: 'Box 1',
+      geometry: { point: [10, 20, 5] },
+      createdAt: '2026-07-12T00:00:00.000Z',
+      modifiedAt: '2026-07-12T00:00:00.000Z',
+      family: 'object',
+      templateId: 'object.box',
+      subtype: 'box',
+      parameters: { width: 4, depth: 6, height: 8, rotationYaw: 0 },
+    };
+    const display = buildObjectDisplay(feature);
+
+    expect(display?.fill?.indices.length).toBeGreaterThan(0);
+    expect(display?.lines).toHaveLength(6);
+    expect(display?.lines[0]?.[0]).toEqual([8, 17, 1]);
+    expect(display?.lines[1]?.[0]).toEqual([8, 17, 9]);
+  })
+
+  it('builds a sign from a base-origin post and sign face', () => {
+    const feature: FeatureRecord = {
+      id: 'feat-object-sign',
+      simulationId: 'sim-1',
+      type: 'marker',
+      name: 'Sign 1',
+      geometry: { point: [0, 0, 0] },
+      createdAt: '2026-07-12T00:00:00.000Z',
+      modifiedAt: '2026-07-12T00:00:00.000Z',
+      family: 'object',
+      templateId: 'object.sign',
+      subtype: 'sign',
+      parameters: { postHeight: 8, signWidth: 4, signHeight: 2, numberOfFaces: 2, rotationYaw: 0 },
+    };
+    const display = buildObjectDisplay(feature);
+
+    expect(display?.fill?.indices.length).toBeGreaterThan(0);
+    expect(display?.lines.some((line) => line.some((point) => point[2] >= 8))).toBe(true);
+  })
+
   it('passes authored line vertices through and computes plan length', () => {
     const line = buildLineDisplay({ vertices: [[0, 0, 0], [3, 4, 1], [6, 4, 1]] });
     expect(line.lines).toEqual([[[0, 0, 0], [3, 4, 1], [6, 4, 1]]]);
@@ -240,6 +283,7 @@ describe('IMP-5 primitive displays', () => {
       createdAt: '2026-07-09T00:00:00.000Z',
       modifiedAt: '2026-07-09T00:00:00.000Z',
       family: 'object',
+      templateId: 'object.box',
     };
     const markerFeature = { ...objectFeature, id: 'feat-marker-1', family: 'marker' as const };
     const lineFeature: FeatureRecord = {

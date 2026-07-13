@@ -26,7 +26,7 @@ describe('catalog coverage', () => {
       ['grass', 'pavement', 'gravel', 'dirt', 'concrete', 'landscape', 'water', 'unknown'].sort(),
     )
     expect(subtypes('object')).toEqual(
-      ['tree', 'sign', 'pole', 'hydrant', 'valve', 'manhole', 'inlet', 'generic'].sort(),
+      ['box', 'cylinder', 'pine', 'simple-tree', 'shrub', 'sign', 'post'].sort(),
     )
     expect(subtypes('building')).toEqual(['flat', 'gable', 'hip'].sort())
     expect(subtypes('line')).toEqual(

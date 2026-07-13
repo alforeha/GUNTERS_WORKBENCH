@@ -99,14 +99,14 @@ function makeBuildingFeature(id = 'feat-building-1'): FeatureRecord {
 function makeObjectFeature(id = 'feat-object-1'): FeatureRecord {
   return {
     ...makeFeature(id, 'marker'),
-    name: 'Object 1 (tree)',
+    name: 'Box 1',
     family: 'object',
-    templateId: 'object.tree',
-    subtype: 'tree',
+    templateId: 'object.box',
+    subtype: 'box',
     authorship: 'authored',
     geometry: { point: [1, 2, 3] },
     evidenceRefs: [{ kind: 'asset-point', coordinate: [1, 2, 3], assetId: SOURCE_ASSET_ID }],
-    parameters: { height: 20, dripline: 8 },
+    parameters: { width: 6, depth: 6, height: 6, rotationYaw: 0 },
   }
 }
 
@@ -171,7 +171,10 @@ function makeBuildingsView(overrides: Partial<BuildingsTabView> = {}): Buildings
 function makeSimpleView(family: 'object' | 'line' | 'marker', overrides: Partial<SimpleTabView> = {}): SimpleTabView {
   const templates =
     family === 'object'
-      ? [{ id: 'object.tree', displayName: 'Tree' }]
+      ? [
+          { id: 'object.box', displayName: 'Box' },
+          { id: 'object.cylinder', displayName: 'Cylinder' },
+        ]
       : family === 'line'
         ? [{ id: 'line.curb', displayName: 'Curb' }]
         : [{ id: 'marker.spot-elevation', displayName: 'Spot elevation' }]
@@ -379,8 +382,11 @@ describe('live IMP-5 tabs', () => {
       makeBuildingsView(),
       simple,
     )
-    expect(objectHtml).toContain('id="object-template-select"')
-    expect(objectHtml).toContain('Object 1 (tree)')
+    expect(objectHtml).toContain('Object total: 1')
+    expect(objectHtml).toContain('+ Add Object')
+    expect(objectHtml).toContain('feature-pill-toggle')
+    expect(objectHtml).toContain('Generic / Box')
+    expect(objectHtml).toContain('Box 1')
     expect(objectHtml).toContain('1 snapped / 0 free')
 
     const lineHtml = renderSimPanelHtml(
@@ -572,6 +578,22 @@ describe('live regions tab', () => {
     expect(html).toContain('3 refs - 2 snapped, 1 free placed')
     expect(html).toContain('data-action="feature-delete"')
     expect(html).toContain('data-action="feature-back"')
+  })
+
+  it('object detail includes the Object Preview section', () => {
+    const manifest = makeManifest({ features: [makeObjectFeature()] })
+    const detail = buildFeatureDetailModel(manifest, 'feat-object-1')
+    const html = renderSimPanelHtml(
+      buildSimPanelModel(manifest),
+      { activeTab: 'objects', simVisible: true, selectedFeatureId: 'feat-object-1' },
+      makeRegionsView(),
+      makeBuildingsView(),
+      {
+        object: makeSimpleView('object', { detail }),
+      },
+    )
+    expect(html).toContain('Object Preview')
+    expect(html).toContain('object-preview-box')
   })
 })
 

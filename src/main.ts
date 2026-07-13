@@ -38,10 +38,17 @@ let rightPanel: RightPanelApi | null = null
 let headerApi: ReturnType<typeof mountHeader> | null = null
 let footerApi: ReturnType<typeof mountFooter> | null = null
 let modeBeforeWalk: 'orbit' | 'top' = 'orbit'
+let pendingWalkStart:
+  | { handle: string; label: string; eyeHeight: number }
+  | null = null
 
 function setWalkHint(text: string | null): void {
   walkHint.hidden = text === null
   walkHint.textContent = text ?? ''
+}
+
+function clearPendingWalkStart(): void {
+  pendingWalkStart = null
 }
 
 function renderAll(session: ProjectSession | null): void {
@@ -49,6 +56,7 @@ function renderAll(session: ProjectSession | null): void {
   footerApi?.setUnits(projectUnitsLabel(session ? (session.manifest as ProjectManifest) : null))
   leftPanel?.render()
   rightPanel?.render()
+  renderToolRail()
 }
 
 const controller = new LayerController(frame.viewerHost, {
@@ -75,7 +83,81 @@ const featureController: FeatureController = new FeatureController({
   persistManifest: (manifest) => controller.persistManifest(manifest),
   onAuthoringChanged() {
     rightPanel?.render()
+    renderToolRail()
   },
+})
+
+let activeObjectToolbarMenu: 'category' | 'type' | 'placement' | null = null
+
+function renderToolRail(): void {
+  const toolbar = featureController.getObjectCreationToolbar()
+  if (!toolbar) {
+    activeObjectToolbarMenu = null
+    frame.toolRailMount.hidden = true
+    frame.toolRailMount.innerHTML = ''
+    return
+  }
+  const categoryCode = toolbarCategoryCode(toolbar.categoryId)
+  const typeCode = toolbarTypeCode(toolbar.typeTemplateId)
+  const placementCode = toolbar.placementMode === 'snap' ? 'SNAP' : 'FREE'
+  const popoverHtml = renderObjectToolbarPopover(toolbar, activeObjectToolbarMenu)
+  frame.toolRailMount.hidden = false
+  frame.toolRailMount.innerHTML = `
+    <div class="viewer-tool-strip object-creation-toolbar" role="toolbar" aria-label="Object creation toolbar">
+      <span class="viewer-tool-chip viewer-tool-chip-static" title="Object creation mode">OBJ</span>
+      <button class="viewer-tool-chip${activeObjectToolbarMenu === 'category' ? ' viewer-tool-chip-active' : ''}" data-action="object-toolbar-toggle-category" title="Object category">${categoryCode}</button>
+      <button class="viewer-tool-chip${activeObjectToolbarMenu === 'type' ? ' viewer-tool-chip-active' : ''}" data-action="object-toolbar-toggle-type" title="Object type">${typeCode}</button>
+      <button class="viewer-tool-chip${activeObjectToolbarMenu === 'placement' ? ' viewer-tool-chip-active' : ''}" data-action="object-toolbar-toggle-placement" title="Placement mode">${placementCode}</button>
+      <button class="viewer-tool-chip viewer-tool-chip-close" data-action="object-toolbar-cancel" title="Cancel object creation">X</button>
+    </div>
+    ${popoverHtml}
+  `
+}
+
+frame.toolRailMount.addEventListener('click', (event) => {
+  const target = (event.target as HTMLElement).closest<HTMLElement>('[data-action]')
+  if (!target) return
+  if (target.dataset.action === 'object-toolbar-toggle-category') {
+    activeObjectToolbarMenu = activeObjectToolbarMenu === 'category' ? null : 'category'
+    renderToolRail()
+    return
+  }
+  if (target.dataset.action === 'object-toolbar-toggle-type') {
+    activeObjectToolbarMenu = activeObjectToolbarMenu === 'type' ? null : 'type'
+    renderToolRail()
+    return
+  }
+  if (target.dataset.action === 'object-toolbar-toggle-placement') {
+    activeObjectToolbarMenu = activeObjectToolbarMenu === 'placement' ? null : 'placement'
+    renderToolRail()
+    return
+  }
+  if (target.dataset.action === 'object-toolbar-set-category') {
+    const category = target.dataset.value
+    if (category === 'generic' || category === 'foliage' || category === 'site-fixture') {
+      activeObjectToolbarMenu = null
+      featureController.setObjectCreationCategory(category)
+    }
+    return
+  }
+  if (target.dataset.action === 'object-toolbar-set-type' && target.dataset.value) {
+    activeObjectToolbarMenu = null
+    featureController.setObjectCreationTemplate(target.dataset.value)
+    return
+  }
+  if (target.dataset.action === 'object-toolbar-set-placement') {
+    const mode = target.dataset.value
+    if (mode === 'snap' || mode === 'manual') {
+      activeObjectToolbarMenu = null
+      featureController.setObjectPlacementMode(mode)
+      renderToolRail()
+    }
+    return
+  }
+  if (target.dataset.action === 'object-toolbar-cancel') {
+    activeObjectToolbarMenu = null
+    featureController.cancel()
+  }
 })
 
 function wireViewerCallbacks(viewer: ViewerEngine): void {
@@ -101,6 +183,7 @@ function applyCameraModeUi(mode: HeaderCameraMode): void {
 function exitWalk(): void {
   setWalkHint(null)
   closeWalkTargetPicker()
+  clearPendingWalkStart()
   controller.endWalkTarget()
   const viewer = controller.getViewer()
   viewer?.setCameraMode(modeBeforeWalk)
@@ -177,6 +260,7 @@ async function requestCameraMode(mode: HeaderCameraMode): Promise<void> {
   if (mode === 'orbit' || mode === 'top') {
     closeWalkTargetPicker()
     setWalkHint(null)
+    clearPendingWalkStart()
     controller.endWalkTarget()
     modeBeforeWalk = mode
     viewer.setCameraMode(mode)
@@ -204,30 +288,64 @@ async function requestCameraMode(mode: HeaderCameraMode): Promise<void> {
     return
   }
 
-  const eyeHeight = footerApi?.getWalkEyeHeight() ?? DEFAULT_WALK_EYE_HEIGHT
-  if (viewer.enterHoverOnPointCloud(walkTarget.handle, eyeHeight)) {
-    setWalkHint(`Walking ${walkTarget.label}. Use W/A/S/D to move, mouse to look, wheel for speed, X exits.`)
-    applyCameraModeUi('walk')
-  } else {
-    controller.endWalkTarget()
-    setWalkHint(`Unable to start Walk on ${walkTarget.label}. Load or rebuild the index and try again.`)
-    applyCameraModeUi(modeBeforeWalk)
+  pendingWalkStart = {
+    handle: walkTarget.handle,
+    label: walkTarget.label,
+    eyeHeight: footerApi?.getWalkEyeHeight() ?? DEFAULT_WALK_EYE_HEIGHT,
   }
+  setWalkHint(`Click a start point on ${walkTarget.label}.`)
 }
 
 // Distinguish a click from an orbit drag before attempting Walk entry.
 let pointerDownPos: { x: number; y: number } | null = null
+const AUTHORING_CLICK_MAX_MOVEMENT_PX = 5
+const WALK_START_PICK_TOLERANCE_PX = 24
+
+function handleAuthoringPointerUp(clientX: number, clientY: number): void {
+  if (!pointerDownPos) return
+  const moved = Math.hypot(clientX - pointerDownPos.x, clientY - pointerDownPos.y)
+  pointerDownPos = null
+  if (moved > AUTHORING_CLICK_MAX_MOVEMENT_PX) return
+  if (pendingWalkStart) {
+    const viewer = controller.getViewer()
+    const startPoint = viewer?.pickIndexedPointAtClient(
+      pendingWalkStart.handle,
+      clientX,
+      clientY,
+      WALK_START_PICK_TOLERANCE_PX,
+    ) ?? null
+    if (!viewer || !startPoint) {
+      setWalkHint(`No indexed point found there. Click a visible point on ${pendingWalkStart.label}.`)
+      return
+    }
+    if (viewer.enterHoverOnPointCloud(pendingWalkStart.handle, pendingWalkStart.eyeHeight, startPoint)) {
+      setWalkHint(`Walking ${pendingWalkStart.label}. Use W/A/S/D to move, mouse to look, wheel for speed, X exits.`)
+      clearPendingWalkStart()
+      applyCameraModeUi('walk')
+      return
+    }
+    controller.endWalkTarget()
+    setWalkHint(`Unable to start Walk on ${pendingWalkStart.label}. Load or rebuild the index and try again.`)
+    clearPendingWalkStart()
+    applyCameraModeUi(modeBeforeWalk)
+    return
+  }
+  if (featureController.isAuthoring()) {
+    featureController.handleViewerClick()
+  }
+}
+
 frame.viewerHost.addEventListener('pointerdown', (event) => {
   pointerDownPos = { x: event.clientX, y: event.clientY }
 })
 frame.viewerHost.addEventListener('pointerup', (event) => {
-  if (!pointerDownPos) return
-  const moved = Math.hypot(event.clientX - pointerDownPos.x, event.clientY - pointerDownPos.y)
+  handleAuthoringPointerUp(event.clientX, event.clientY)
+})
+window.addEventListener('pointerup', (event) => {
+  handleAuthoringPointerUp(event.clientX, event.clientY)
+})
+window.addEventListener('pointercancel', () => {
   pointerDownPos = null
-  if (moved > 5) return
-  if (featureController.isAuthoring()) {
-    featureController.handleViewerClick()
-  }
 })
 
 function showAboutDialog(): void {
@@ -251,6 +369,57 @@ function showAboutDialog(): void {
     if (target === overlay || target.classList.contains('about-close')) overlay.remove()
   })
   document.body.appendChild(overlay)
+}
+
+function renderObjectToolbarPopover(
+  toolbar: NonNullable<ReturnType<typeof featureController.getObjectCreationToolbar>>,
+  activeMenu: 'category' | 'type' | 'placement' | null,
+): string {
+  if (!activeMenu) return ''
+  if (activeMenu === 'category') {
+    const items = toolbar.categories
+      .map(
+        (category) =>
+          `<button class="viewer-tool-option${category.id === toolbar.categoryId ? ' viewer-tool-option-active' : ''}" data-action="object-toolbar-set-category" data-value="${category.id}">${toolbarCategoryCode(category.id)} <span>${category.label}</span></button>`,
+      )
+      .join('')
+    return `<div class="viewer-tool-popover" role="menu" aria-label="Object category">${items}</div>`
+  }
+  if (activeMenu === 'type') {
+    const items = toolbar.types
+      .map(
+        (type) =>
+          `<button class="viewer-tool-option${type.templateId === toolbar.typeTemplateId ? ' viewer-tool-option-active' : ''}" data-action="object-toolbar-set-type" data-value="${type.templateId}">${toolbarTypeCode(type.templateId)} <span>${type.label}</span></button>`,
+      )
+      .join('')
+    return `<div class="viewer-tool-popover" role="menu" aria-label="Object type">${items}</div>`
+  }
+  return `
+    <div class="viewer-tool-popover" role="menu" aria-label="Placement options">
+      <button class="viewer-tool-option${toolbar.placementMode === 'snap' ? ' viewer-tool-option-active' : ''}" data-action="object-toolbar-set-placement" data-value="snap">SNAP <span>Snap to data</span></button>
+      <button class="viewer-tool-option${toolbar.placementMode === 'manual' ? ' viewer-tool-option-active' : ''}" data-action="object-toolbar-set-placement" data-value="manual">FREE <span>Manual / free place</span></button>
+      <button class="viewer-tool-option planned-control" disabled title="Planned - isolate area arrives in a later pass">ISO <span>Isolate area (planned)</span></button>
+    </div>
+  `
+}
+
+function toolbarCategoryCode(categoryId: 'generic' | 'foliage' | 'site-fixture'): string {
+  if (categoryId === 'generic') return 'GEN'
+  if (categoryId === 'foliage') return 'FOL'
+  return 'FIX'
+}
+
+function toolbarTypeCode(templateId: string): string {
+  const codeByTemplate: Record<string, string> = {
+    'object.box': 'BOX',
+    'object.cylinder': 'CYL',
+    'object.pine': 'PINE',
+    'object.simple-tree': 'TREE',
+    'object.shrub': 'SHRUB',
+    'object.sign': 'SIGN',
+    'object.post': 'POST',
+  }
+  return codeByTemplate[templateId] ?? 'TYPE'
 }
 
 function handleMenuAction(action: HeaderMenuAction): void {
@@ -316,6 +485,7 @@ rightPanel = mountRightPanel(frame.rightPanelMount, {
     getAuthoring: () => featureController.getAuthoring(),
     getBuildingAuthoring: () => featureController.getBuildingAuthoring(),
     getSimpleAuthoring: () => featureController.getSimpleAuthoring(),
+    startObjectCreation: () => featureController.startObjectCreation(),
     startRegion: (templateId) => featureController.startRegion(templateId),
     startBuilding: (templateId) => featureController.startBuilding(templateId),
     startObject: (templateId) => featureController.startObject(templateId),
@@ -332,6 +502,10 @@ rightPanel = mountRightPanel(frame.rightPanelMount, {
     cancel: () => featureController.cancel(),
     rename: (featureId, name) => featureController.renameFeature(featureId, name),
     updateParam: (featureId, paramName, value) => featureController.updateFeatureParameter(featureId, paramName, value),
+    updateObjectCategory: (featureId, categoryId) => featureController.updateObjectCategory(featureId, categoryId as 'generic' | 'foliage' | 'site-fixture'),
+    updateObjectTemplate: (featureId, templateId) => featureController.updateObjectTemplate(featureId, templateId),
+    updatePlacement: (featureId, axis, value) => featureController.updateFeaturePlacement(featureId, axis, value),
+    updateVisibility: (featureId, visible) => featureController.updateFeatureVisibility(featureId, visible),
     remove: (featureId) => featureController.deleteFeature(featureId),
     setSimVisible: (visible) => featureController.setSimVisible(visible),
   },

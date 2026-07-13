@@ -9,6 +9,7 @@
 // triangulated at its authored elevations, with breaklines carried through as
 // draped display polylines and spot elevations accepted-but-inert.
 
+import { getTemplate } from '../shared/template-catalog';
 import type { FeatureRecord } from '../shared/workbench-types';
 import type { Vec3 } from './geometry';
 
@@ -428,6 +429,11 @@ export interface PointPrimitiveDisplay {
   lines: Vec3[][];
 }
 
+export interface SolidPrimitiveDisplay {
+  fill?: { positions: Float64Array; indices: Uint32Array };
+  lines: Vec3[][];
+}
+
 export interface PointPrimitiveGeometry {
   point: Vec3;
 }
@@ -464,6 +470,77 @@ export function buildPointPrimitiveDisplay(input: PointPrimitiveInput): PointPri
   };
 }
 
+export function buildObjectDisplay(feature: FeatureRecord): SolidPrimitiveDisplay | null {
+  if (feature.family !== 'object') return null;
+  const geometry = pointPrimitiveGeometryFromFeature(feature);
+  const template = feature.templateId ? getTemplate(feature.templateId) : null;
+  if (!geometry || !template) return null;
+
+  const yawDeg = objectNumberParam(feature, 'rotationYaw', 0);
+  switch (template.subtype) {
+    case 'box':
+      return buildBoxPrimitive({
+        point: geometry.point,
+        width: objectNumberParam(feature, 'width', 6),
+        depth: objectNumberParam(feature, 'depth', 6),
+        height: objectNumberParam(feature, 'height', 6),
+        yawDeg,
+        origin: 'center',
+      });
+    case 'cylinder':
+      return buildCylinderPrimitive({
+        point: geometry.point,
+        radius: objectNumberParam(feature, 'diameter', 4) / 2,
+        height: objectNumberParam(feature, 'height', 8),
+        yawDeg,
+        origin: 'center',
+      });
+    case 'pine':
+      return buildPinePrimitive({
+        point: geometry.point,
+        height: objectNumberParam(feature, 'height', 18),
+        baseRadius: objectNumberParam(feature, 'baseRadius', 5),
+        trunkHeight: objectNumberParam(feature, 'trunkHeight', 4),
+        yawDeg,
+      });
+    case 'simple-tree':
+      return buildSimpleTreePrimitive({
+        point: geometry.point,
+        height: objectNumberParam(feature, 'height', 20),
+        canopyRadius: objectNumberParam(feature, 'canopyRadius', 7),
+        trunkHeight: objectNumberParam(feature, 'trunkHeight', 6),
+        yawDeg,
+      });
+    case 'shrub':
+      return buildShrubPrimitive({
+        point: geometry.point,
+        width: objectNumberParam(feature, 'width', 6),
+        depth: objectNumberParam(feature, 'depth', 5),
+        height: objectNumberParam(feature, 'height', 3),
+        yawDeg,
+      });
+    case 'sign':
+      return buildSignPrimitive({
+        point: geometry.point,
+        postHeight: objectNumberParam(feature, 'postHeight', 8),
+        signWidth: objectNumberParam(feature, 'signWidth', 4),
+        signHeight: objectNumberParam(feature, 'signHeight', 2),
+        numberOfFaces: objectNumberParam(feature, 'numberOfFaces', 2),
+        yawDeg,
+      });
+    case 'post':
+      return buildCylinderPrimitive({
+        point: geometry.point,
+        radius: objectNumberParam(feature, 'diameter', 0.75) / 2,
+        height: objectNumberParam(feature, 'height', 6),
+        yawDeg,
+        origin: 'base',
+      });
+    default:
+      return null;
+  }
+}
+
 export function buildLineDisplay(input: LineGeometry): LineDisplay {
   let lengthXY = 0;
   for (let i = 1; i < input.vertices.length; i++) {
@@ -486,4 +563,318 @@ export function lineGeometryFromFeature(feature: FeatureRecord): LineGeometry | 
   const geometry = feature.geometry as { vertices?: unknown };
   if (!isVec3Array(geometry.vertices)) return null;
   return { vertices: geometry.vertices.map(cloneVec3) };
+}
+
+function objectNumberParam(feature: FeatureRecord, name: string, fallback: number): number {
+  const value = feature.parameters?.[name];
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+interface PrimitiveBuffers {
+  positions: number[];
+  indices: number[];
+  lines: Vec3[][];
+}
+
+type VerticalOrigin = 'center' | 'base';
+
+function createBuffers(): PrimitiveBuffers {
+  return { positions: [], indices: [], lines: [] };
+}
+
+function toDisplay(buffers: PrimitiveBuffers): SolidPrimitiveDisplay {
+  return {
+    ...(buffers.indices.length > 0
+      ? {
+          fill: {
+            positions: Float64Array.from(buffers.positions),
+            indices: Uint32Array.from(buffers.indices),
+          },
+        }
+      : {}),
+    lines: buffers.lines,
+  };
+}
+
+function mergePrimitive(into: PrimitiveBuffers, next: SolidPrimitiveDisplay): void {
+  if (next.fill) {
+    const base = into.positions.length / 3;
+    into.positions.push(...next.fill.positions);
+    for (const index of next.fill.indices) into.indices.push(base + index);
+  }
+  into.lines.push(...next.lines.map((line) => line.map(cloneVec3)));
+}
+
+function rotateXY(x: number, y: number, yawRad: number): [number, number] {
+  const c = Math.cos(yawRad);
+  const s = Math.sin(yawRad);
+  return [x * c - y * s, x * s + y * c];
+}
+
+function worldPoint(anchor: Vec3, localX: number, localY: number, localZ: number, yawRad: number): Vec3 {
+  const [rx, ry] = rotateXY(localX, localY, yawRad);
+  return [anchor[0] + rx, anchor[1] + ry, anchor[2] + localZ];
+}
+
+function pushPoint(positions: number[], point: Vec3): number {
+  positions.push(point[0], point[1], point[2]);
+  return positions.length / 3 - 1;
+}
+
+function ringLine(points: Vec3[]): Vec3[] {
+  return points.length === 0 ? [] : [...points.map(cloneVec3), cloneVec3(points[0]!)];
+}
+
+function zRange(anchorZ: number, height: number, origin: VerticalOrigin): { bottom: number; top: number } {
+  if (origin === 'center') return { bottom: anchorZ - height / 2, top: anchorZ + height / 2 };
+  return { bottom: anchorZ, top: anchorZ + height };
+}
+
+function buildBoxPrimitive(input: {
+  point: Vec3;
+  width: number;
+  depth: number;
+  height: number;
+  yawDeg: number;
+  origin: VerticalOrigin;
+}): SolidPrimitiveDisplay {
+  const width = Math.max(input.width, 0.1);
+  const depth = Math.max(input.depth, 0.1);
+  const height = Math.max(input.height, 0.1);
+  const yawRad = (input.yawDeg * Math.PI) / 180;
+  const z = zRange(input.point[2], height, input.origin);
+  const locals: Array<[number, number, number]> = [
+    [-width / 2, -depth / 2, z.bottom - input.point[2]],
+    [width / 2, -depth / 2, z.bottom - input.point[2]],
+    [width / 2, depth / 2, z.bottom - input.point[2]],
+    [-width / 2, depth / 2, z.bottom - input.point[2]],
+    [-width / 2, -depth / 2, z.top - input.point[2]],
+    [width / 2, -depth / 2, z.top - input.point[2]],
+    [width / 2, depth / 2, z.top - input.point[2]],
+    [-width / 2, depth / 2, z.top - input.point[2]],
+  ];
+  const points = locals.map(([x, y, localZ]) => worldPoint(input.point, x, y, localZ, yawRad));
+  const positions: number[] = [];
+  for (const point of points) pushPoint(positions, point);
+  const indices = [
+    0, 1, 2, 0, 2, 3,
+    4, 6, 5, 4, 7, 6,
+    0, 4, 5, 0, 5, 1,
+    1, 5, 6, 1, 6, 2,
+    2, 6, 7, 2, 7, 3,
+    3, 7, 4, 3, 4, 0,
+  ];
+  return {
+    fill: { positions: Float64Array.from(positions), indices: Uint32Array.from(indices) },
+    lines: [ringLine(points.slice(0, 4)), ringLine(points.slice(4, 8)), [points[0]!, points[4]!], [points[1]!, points[5]!], [points[2]!, points[6]!], [points[3]!, points[7]!]],
+  };
+}
+
+function buildCylinderPrimitive(input: {
+  point: Vec3;
+  radius: number;
+  height: number;
+  yawDeg: number;
+  origin: VerticalOrigin;
+  segments?: number;
+}): SolidPrimitiveDisplay {
+  const radius = Math.max(input.radius, 0.05);
+  const height = Math.max(input.height, 0.1);
+  const yawRad = (input.yawDeg * Math.PI) / 180;
+  const segments = Math.max(input.segments ?? 12, 6);
+  const z = zRange(input.point[2], height, input.origin);
+  const bottomLocalZ = z.bottom - input.point[2];
+  const topLocalZ = z.top - input.point[2];
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const bottom: Vec3[] = [];
+  const top: Vec3[] = [];
+  for (let i = 0; i < segments; i++) {
+    const angle = (Math.PI * 2 * i) / segments;
+    bottom.push(worldPoint(input.point, Math.cos(angle) * radius, Math.sin(angle) * radius, bottomLocalZ, yawRad));
+    top.push(worldPoint(input.point, Math.cos(angle) * radius, Math.sin(angle) * radius, topLocalZ, yawRad));
+  }
+  const bottomIds = bottom.map((point) => pushPoint(positions, point));
+  const topIds = top.map((point) => pushPoint(positions, point));
+  const bottomCenterId = pushPoint(positions, [input.point[0], input.point[1], z.bottom]);
+  const topCenterId = pushPoint(positions, [input.point[0], input.point[1], z.top]);
+  for (let i = 0; i < segments; i++) {
+    const next = (i + 1) % segments;
+    indices.push(bottomIds[i]!, bottomIds[next]!, topIds[next]!);
+    indices.push(bottomIds[i]!, topIds[next]!, topIds[i]!);
+    indices.push(bottomCenterId, bottomIds[next]!, bottomIds[i]!);
+    indices.push(topCenterId, topIds[i]!, topIds[next]!);
+  }
+  return {
+    fill: { positions: Float64Array.from(positions), indices: Uint32Array.from(indices) },
+    lines: [ringLine(bottom), ringLine(top), [bottom[0]!, top[0]!], [bottom[Math.floor(segments / 4)]!, top[Math.floor(segments / 4)]!]],
+  };
+}
+
+function buildConePrimitive(input: { point: Vec3; radius: number; height: number; yawDeg: number }): SolidPrimitiveDisplay {
+  const radius = Math.max(input.radius, 0.05);
+  const height = Math.max(input.height, 0.1);
+  const yawRad = (input.yawDeg * Math.PI) / 180;
+  const segments = 12;
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const base: Vec3[] = [];
+  for (let i = 0; i < segments; i++) {
+    const angle = (Math.PI * 2 * i) / segments;
+    base.push(worldPoint(input.point, Math.cos(angle) * radius, Math.sin(angle) * radius, 0, yawRad));
+  }
+  const tip: Vec3 = [input.point[0], input.point[1], input.point[2] + height];
+  const baseIds = base.map((point) => pushPoint(positions, point));
+  const tipId = pushPoint(positions, tip);
+  const centerId = pushPoint(positions, input.point);
+  for (let i = 0; i < segments; i++) {
+    const next = (i + 1) % segments;
+    indices.push(baseIds[i]!, baseIds[next]!, tipId);
+    indices.push(centerId, baseIds[next]!, baseIds[i]!);
+  }
+  return {
+    fill: { positions: Float64Array.from(positions), indices: Uint32Array.from(indices) },
+    lines: [ringLine(base), [base[0]!, tip], [base[4]!, tip], [base[8]!, tip]],
+  };
+}
+
+function buildEllipsoidPrimitive(input: { center: Vec3; radiusX: number; radiusY: number; radiusZ: number; yawDeg: number }): SolidPrimitiveDisplay {
+  const radiusX = Math.max(input.radiusX, 0.05);
+  const radiusY = Math.max(input.radiusY, 0.05);
+  const radiusZ = Math.max(input.radiusZ, 0.05);
+  const yawRad = (input.yawDeg * Math.PI) / 180;
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const latSegments = 5;
+  const lonSegments = 8;
+  const vertexIds: number[][] = [];
+  for (let lat = 0; lat <= latSegments; lat++) {
+    const phi = (Math.PI * lat) / latSegments;
+    const row: number[] = [];
+    for (let lon = 0; lon <= lonSegments; lon++) {
+      const theta = (Math.PI * 2 * lon) / lonSegments;
+      const localX = Math.cos(theta) * Math.sin(phi) * radiusX;
+      const localY = Math.sin(theta) * Math.sin(phi) * radiusY;
+      const localZ = Math.cos(phi) * radiusZ;
+      row.push(pushPoint(positions, worldPoint(input.center, localX, localY, localZ, yawRad)));
+    }
+    vertexIds.push(row);
+  }
+  for (let lat = 0; lat < latSegments; lat++) {
+    for (let lon = 0; lon < lonSegments; lon++) {
+      const a = vertexIds[lat]![lon]!;
+      const b = vertexIds[lat]![lon + 1]!;
+      const c = vertexIds[lat + 1]![lon + 1]!;
+      const d = vertexIds[lat + 1]![lon]!;
+      indices.push(a, b, c, a, c, d);
+    }
+  }
+  const equator: Vec3[] = [];
+  for (let lon = 0; lon < lonSegments; lon++) {
+    const theta = (Math.PI * 2 * lon) / lonSegments;
+    equator.push(worldPoint(input.center, Math.cos(theta) * radiusX, Math.sin(theta) * radiusY, 0, yawRad));
+  }
+  return {
+    fill: { positions: Float64Array.from(positions), indices: Uint32Array.from(indices) },
+    lines: [ringLine(equator)],
+  };
+}
+
+function buildPinePrimitive(input: { point: Vec3; height: number; baseRadius: number; trunkHeight: number; yawDeg: number }): SolidPrimitiveDisplay {
+  const totalHeight = Math.max(input.height, 0.5);
+  const trunkHeight = Math.max(Math.min(input.trunkHeight, totalHeight * 0.5), 0.25);
+  const buffers = createBuffers();
+  mergePrimitive(
+    buffers,
+    buildCylinderPrimitive({ point: input.point, radius: Math.max(input.baseRadius * 0.12, 0.15), height: trunkHeight, yawDeg: input.yawDeg, origin: 'base', segments: 10 }),
+  );
+  mergePrimitive(
+    buffers,
+    buildConePrimitive({ point: [input.point[0], input.point[1], input.point[2] + trunkHeight], radius: Math.max(input.baseRadius, 0.2), height: Math.max(totalHeight - trunkHeight, 0.2), yawDeg: input.yawDeg }),
+  );
+  return toDisplay(buffers);
+}
+
+function buildSimpleTreePrimitive(input: { point: Vec3; height: number; canopyRadius: number; trunkHeight: number; yawDeg: number }): SolidPrimitiveDisplay {
+  const totalHeight = Math.max(input.height, 0.5);
+  const trunkHeight = Math.max(Math.min(input.trunkHeight, totalHeight * 0.7), 0.3);
+  const canopyHeight = Math.max(totalHeight - trunkHeight, 0.2);
+  const buffers = createBuffers();
+  mergePrimitive(
+    buffers,
+    buildCylinderPrimitive({ point: input.point, radius: Math.max(input.canopyRadius * 0.12, 0.15), height: trunkHeight, yawDeg: input.yawDeg, origin: 'base', segments: 10 }),
+  );
+  mergePrimitive(
+    buffers,
+    buildEllipsoidPrimitive({ center: [input.point[0], input.point[1], input.point[2] + trunkHeight + canopyHeight / 2], radiusX: Math.max(input.canopyRadius, 0.2), radiusY: Math.max(input.canopyRadius, 0.2), radiusZ: canopyHeight / 2, yawDeg: input.yawDeg }),
+  );
+  return toDisplay(buffers);
+}
+
+function buildShrubPrimitive(input: { point: Vec3; width: number; depth: number; height: number; yawDeg: number }): SolidPrimitiveDisplay {
+  return buildEllipsoidPrimitive({
+    center: [input.point[0], input.point[1], input.point[2] + Math.max(input.height, 0.1) / 2],
+    radiusX: Math.max(input.width, 0.1) / 2,
+    radiusY: Math.max(input.depth, 0.1) / 2,
+    radiusZ: Math.max(input.height, 0.1) / 2,
+    yawDeg: input.yawDeg,
+  });
+}
+
+function buildSignPrimitive(input: {
+  point: Vec3;
+  postHeight: number;
+  signWidth: number;
+  signHeight: number;
+  numberOfFaces: number;
+  yawDeg: number;
+}): SolidPrimitiveDisplay {
+  const buffers = createBuffers();
+  const postHeight = Math.max(input.postHeight, 0.2);
+  const signHeight = Math.max(input.signHeight, 0.2);
+  mergePrimitive(
+    buffers,
+    buildCylinderPrimitive({ point: input.point, radius: Math.max(input.signWidth * 0.04, 0.08), height: postHeight, yawDeg: input.yawDeg, origin: 'base', segments: 10 }),
+  );
+  mergePrimitive(
+    buffers,
+    buildSignFacesPrimitive({
+      point: input.point,
+      postHeight,
+      signWidth: input.signWidth,
+      signHeight,
+      numberOfFaces: input.numberOfFaces,
+      yawDeg: input.yawDeg,
+    }),
+  );
+  return toDisplay(buffers);
+}
+
+function buildSignFacesPrimitive(input: {
+  point: Vec3;
+  postHeight: number;
+  signWidth: number;
+  signHeight: number;
+  numberOfFaces: number;
+  yawDeg: number;
+}): SolidPrimitiveDisplay {
+  const buffers = createBuffers();
+  const faceCount = Math.max(1, Math.min(4, Math.round(input.numberOfFaces)));
+  const mountCenterZ = input.point[2] + Math.max(input.postHeight - input.signHeight / 2, input.signHeight / 2);
+  const depth = Math.max(input.signWidth * 0.08, 0.08);
+  for (let index = 0; index < faceCount; index++) {
+    const yawDeg = input.yawDeg + (360 / faceCount) * index;
+    mergePrimitive(
+      buffers,
+      buildBoxPrimitive({
+        point: [input.point[0], input.point[1], mountCenterZ],
+        width: Math.max(input.signWidth, 0.2),
+        depth,
+        height: input.signHeight,
+        yawDeg,
+        origin: 'center',
+      }),
+    );
+  }
+  return toDisplay(buffers);
 }

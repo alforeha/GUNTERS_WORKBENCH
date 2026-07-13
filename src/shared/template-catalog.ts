@@ -8,6 +8,14 @@ import type { FeatureFamily } from './workbench-types';
 
 export const TEMPLATE_CATALOG_VERSION = 1;
 
+export type ObjectCategoryId = 'generic' | 'foliage' | 'site-fixture';
+
+export const OBJECT_CATEGORY_LABELS: Record<ObjectCategoryId, string> = {
+  generic: 'Generic',
+  foliage: 'Foliage',
+  'site-fixture': 'Site Fixture',
+};
+
 export type TemplateParamType = 'number' | 'string' | 'boolean' | 'enum';
 
 export interface TemplateParamSpec {
@@ -49,6 +57,7 @@ export interface FeatureTemplate {
   family: FeatureFamily;
   subtype: string;
   displayName: string;
+  objectCategory?: ObjectCategoryId;
   paramSchema: TemplateParamSpec[];
   reality?: TemplateRealityRefs;
   cad?: TemplateCadRefs;
@@ -85,13 +94,14 @@ function region(
 function objectTemplate(
   subtype: string,
   displayName: string,
-  opts: { params: TemplateParamSpec[]; block: string; pointCode: string; primitive: string },
+  opts: { category: ObjectCategoryId; params: TemplateParamSpec[]; block: string; pointCode: string; primitive: string },
 ): FeatureTemplate {
   return {
     id: `object.${subtype}`,
     family: 'object',
     subtype,
     displayName,
+    objectCategory: opts.category,
     paramSchema: opts.params,
     reality: { primitive: opts.primitive },
     cad: { block: opts.block, pointCode: opts.pointCode },
@@ -145,6 +155,7 @@ function marker(subtype: string, displayName: string, opts: { params?: TemplateP
 
 const heightParam = (def: number): TemplateParamSpec => num('height', 'Height', def, { min: 0 });
 const decayParam = num('decay', 'Decay', 0, { min: 0, max: 1 });
+const yawParam = num('rotationYaw', 'Rotation / yaw', 0, { min: -180, max: 180 });
 
 const catalog: FeatureTemplate[] = [
   // Regions: the region patch is the surface-patch input; hatch is a reference name only.
@@ -161,43 +172,84 @@ const catalog: FeatureTemplate[] = [
   region('water', 'Water', { hatch: 'WATER' }),
   region('unknown', 'Unknown', { hatch: 'ANSI31' }),
 
-  // Objects: point-anchored primitives, excluded from ground behavior.
-  objectTemplate('tree', 'Tree', {
+  // Objects: first-pass site objects, point-anchored and evidence-backed.
+  objectTemplate('box', 'Box', {
+    category: 'generic',
+    params: [
+      num('width', 'Width', 6, { min: 0 }),
+      num('depth', 'Depth', 6, { min: 0 }),
+      heightParam(6),
+      yawParam,
+    ],
+    block: 'OBJ_BOX',
+    pointCode: 'OBJ-BOX',
+    primitive: 'box',
+  }),
+  objectTemplate('cylinder', 'Cylinder', {
+    category: 'generic',
+    params: [num('diameter', 'Diameter', 4, { min: 0 }), heightParam(8), yawParam],
+    block: 'OBJ_CYL',
+    pointCode: 'OBJ-CYL',
+    primitive: 'cylinder',
+  }),
+  objectTemplate('pine', 'Pine', {
+    category: 'foliage',
+    params: [
+      heightParam(18),
+      num('baseRadius', 'Base radius', 5, { min: 0 }),
+      num('trunkHeight', 'Trunk height', 4, { min: 0 }),
+      num('coverage', 'Density / coverage', 0.8, { min: 0, max: 1 }),
+      yawParam,
+    ],
+    block: 'TREE-PINE',
+    pointCode: 'TREE-PINE',
+    primitive: 'pine',
+  }),
+  objectTemplate('simple-tree', 'Simple tree', {
+    category: 'foliage',
     params: [
       heightParam(20),
-      num('dripline', 'Dripline radius', 8, { min: 0 }),
-      num('leafCoverage', 'Leaf coverage', 0.7, { min: 0, max: 1 }),
+      num('canopyRadius', 'Canopy radius', 7, { min: 0 }),
+      num('trunkHeight', 'Trunk height', 6, { min: 0 }),
+      num('canopyCoverage', 'Canopy coverage', 0.75, { min: 0, max: 1 }),
+      yawParam,
     ],
-    block: 'TREE',
-    pointCode: 'TREE',
-    primitive: 'tree-billboard',
+    block: 'TREE-SIMPLE',
+    pointCode: 'TREE-SIMPLE',
+    primitive: 'simple-tree',
   }),
-  objectTemplate('sign', 'Sign', { params: [heightParam(7)], block: 'SIGN', pointCode: 'SIGN', primitive: 'sign-post' }),
-  objectTemplate('pole', 'Pole', { params: [heightParam(25)], block: 'POLE', pointCode: 'POLE', primitive: 'pole' }),
-  objectTemplate('hydrant', 'Hydrant', { params: [heightParam(3)], block: 'HYD', pointCode: 'HYD', primitive: 'hydrant' }),
-  objectTemplate('valve', 'Valve', {
-    params: [num('scale', 'Scale', 1, { min: 0 })],
-    block: 'VALVE',
-    pointCode: 'VLV',
-    primitive: 'flush-disc',
+  objectTemplate('shrub', 'Shrub', {
+    category: 'foliage',
+    params: [
+      num('width', 'Width', 6, { min: 0 }),
+      num('depth', 'Depth', 5, { min: 0 }),
+      heightParam(3),
+      num('coverage', 'Density / coverage', 0.7, { min: 0, max: 1 }),
+      yawParam,
+    ],
+    block: 'SHRUB',
+    pointCode: 'SHRUB',
+    primitive: 'shrub',
   }),
-  objectTemplate('manhole', 'Manhole', {
-    params: [num('diameter', 'Rim diameter', 2, { min: 0 })],
-    block: 'MH',
-    pointCode: 'MH',
-    primitive: 'flush-disc',
+  objectTemplate('sign', 'Sign', {
+    category: 'site-fixture',
+    params: [
+      num('postHeight', 'Post height', 8, { min: 0 }),
+      num('signWidth', 'Sign width', 4, { min: 0 }),
+      num('signHeight', 'Sign height', 2, { min: 0 }),
+      num('numberOfFaces', 'Number of faces', 2, { min: 1, max: 4 }),
+      yawParam,
+    ],
+    block: 'SIGN',
+    pointCode: 'SIGN',
+    primitive: 'sign',
   }),
-  objectTemplate('inlet', 'Inlet', {
-    params: [num('width', 'Width', 3, { min: 0 })],
-    block: 'INLET',
-    pointCode: 'INLET',
-    primitive: 'flush-box',
-  }),
-  objectTemplate('generic', 'Generic object', {
-    params: [num('scale', 'Scale', 1, { min: 0 })],
-    block: 'GENERIC',
-    pointCode: 'GEN',
-    primitive: 'generic-box',
+  objectTemplate('post', 'Post', {
+    category: 'site-fixture',
+    params: [num('diameter', 'Diameter', 0.75, { min: 0 }), heightParam(6), yawParam],
+    block: 'POST',
+    pointCode: 'POST',
+    primitive: 'post',
   }),
 
   // Buildings: composite family; ridge is infer-with-override (IMP-4).
@@ -257,4 +309,8 @@ export function getTemplate(id: string): FeatureTemplate | null {
 
 export function templatesForFamily(family: FeatureFamily): FeatureTemplate[] {
   return TEMPLATE_CATALOG.filter((template) => template.family === family);
+}
+
+export function objectCategoryLabel(category: ObjectCategoryId): string {
+  return OBJECT_CATEGORY_LABELS[category];
 }

@@ -24,6 +24,12 @@ export interface AuthoredSnapGeometry {
   edges: { featureId: string; a: Vec3; b: Vec3 }[];
 }
 
+export interface SnapPreview {
+  point: Vec3;
+  size: number;
+  kind: 'index' | 'preview' | 'feature' | 'free';
+}
+
 const DRAFT_LINE_COLOR = 0xffc857;
 const DRAFT_VERTEX_COLOR = 0xffe3a3;
 
@@ -32,6 +38,7 @@ export class RenderFeatures {
   private readonly origin: Vec3;
   private readonly featureRoot = new THREE.Group();
   private readonly draftRoot = new THREE.Group();
+  private readonly snapRoot = new THREE.Group();
   private snapGeometry: AuthoredSnapGeometry = { vertices: [], edges: [] };
 
   constructor(origin: Vec3) {
@@ -39,6 +46,7 @@ export class RenderFeatures {
     this.group.name = 'authored-features';
     this.group.add(this.featureRoot);
     this.group.add(this.draftRoot);
+    this.group.add(this.snapRoot);
   }
 
   setFeatures(entries: FeatureDisplayEntry[]): void {
@@ -54,9 +62,13 @@ export class RenderFeatures {
         const material = new THREE.MeshBasicMaterial({
           color: entry.fillColor,
           transparent: true,
-          opacity: 0.35,
+          opacity: 0.48,
           side: THREE.DoubleSide,
+          depthTest: false,
           depthWrite: false,
+          polygonOffset: true,
+          polygonOffsetFactor: -2,
+          polygonOffsetUnits: -2,
         });
         const mesh = new THREE.Mesh(geometry, material);
         mesh.name = `feature-fill:${entry.featureId}`;
@@ -105,6 +117,48 @@ export class RenderFeatures {
     this.draftRoot.add(points);
   }
 
+  setSnapPreview(preview: SnapPreview | null): void {
+    disposeChildren(this.snapRoot);
+    if (!preview) return;
+    const colorByKind: Record<SnapPreview['kind'], number> = {
+      index: 0x53c7ff,
+      preview: 0x5fd4c3,
+      feature: 0xffc857,
+      free: 0xb7c0cc,
+    };
+    // Engine sizes the preview at the marker's depth (~tolerance px on screen);
+    // the floor only guards a degenerate zero-size loop.
+    const half = Math.max(preview.size * 0.5, 0.005);
+    const [x, y, z] = preview.point;
+    const loop: Vec3[] = [
+      [x - half, y - half, z],
+      [x + half, y - half, z],
+      [x + half, y + half, z],
+      [x - half, y + half, z],
+      [x - half, y - half, z],
+    ];
+    const crossA: Vec3[] = [
+      [x - half, y, z],
+      [x + half, y, z],
+    ];
+    const crossB: Vec3[] = [
+      [x, y - half, z],
+      [x, y + half, z],
+    ];
+    this.snapRoot.add(buildLine(loop, this.origin, colorByKind[preview.kind], 'snap-preview-loop'));
+    this.snapRoot.add(buildLine(crossA, this.origin, colorByKind[preview.kind], 'snap-preview-cross-a'));
+    this.snapRoot.add(buildLine(crossB, this.origin, colorByKind[preview.kind], 'snap-preview-cross-b'));
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(rebasePositions(Float64Array.from([x, y, z]), this.origin), 3));
+    const point = new THREE.Points(
+      geometry,
+      new THREE.PointsMaterial({ color: colorByKind[preview.kind], size: 8, sizeAttenuation: false, depthTest: false }),
+    );
+    point.name = 'snap-preview-point';
+    point.renderOrder = 5;
+    this.snapRoot.add(point);
+  }
+
   setVisible(visible: boolean): void {
     this.featureRoot.visible = visible;
   }
@@ -112,6 +166,7 @@ export class RenderFeatures {
   dispose(): void {
     disposeChildren(this.featureRoot);
     disposeChildren(this.draftRoot);
+    disposeChildren(this.snapRoot);
     this.group.removeFromParent();
   }
 }
@@ -129,7 +184,10 @@ function flattenVec3(points: Vec3[]): Float64Array {
 function buildLine(points: Vec3[], origin: Vec3, color: number, name: string): THREE.Line {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(rebasePositions(flattenVec3(points), origin), 3));
-  const line = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color }));
+  const line = new THREE.Line(
+    geometry,
+    new THREE.LineBasicMaterial({ color, depthTest: false, depthWrite: false, transparent: true, opacity: 0.96 }),
+  );
   line.name = name;
   line.renderOrder = 3;
   return line;

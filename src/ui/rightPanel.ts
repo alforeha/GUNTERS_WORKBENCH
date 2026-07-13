@@ -40,6 +40,7 @@ export interface RightPanelFeatureOps {
   getAuthoring(): RegionAuthoringView | null
   getBuildingAuthoring(): BuildingAuthoringView | null
   getSimpleAuthoring(): SimpleAuthoringView | null
+  startObjectCreation(): void
   startRegion(templateId: string): void
   startBuilding(templateId: string): void
   startObject(templateId: string): void
@@ -56,6 +57,10 @@ export interface RightPanelFeatureOps {
   cancel(): void
   rename(featureId: string, name: string): Promise<void>
   updateParam(featureId: string, paramName: string, value: string): Promise<void>
+  updateObjectCategory(featureId: string, categoryId: string): Promise<void>
+  updateObjectTemplate(featureId: string, templateId: string): Promise<void>
+  updatePlacement(featureId: string, axis: 'x' | 'y' | 'z', value: string): Promise<void>
+  updateVisibility(featureId: string, visible: boolean): Promise<void>
   remove(featureId: string): Promise<void>
   /** Sim master toggle: show/hide all authored features as one group. */
   setSimVisible?(visible: boolean): void
@@ -106,7 +111,7 @@ export interface SimPanelViewState {
 
 const SIM_TAB_PLACEHOLDER: Record<string, string> = {
   regions: 'No regions yet. Pick a subtype below and draw the first border in the viewer.',
-  objects: 'No objects yet. Object placement from cloud evidence arrives with the Create Sim phase.',
+  objects: 'No objects yet. Use + Add Object to open the placement toolbar in the viewer.',
   buildings: 'No buildings yet. Building massing arrives with the Create Sim phase.',
   utilities: 'No utilities yet. Utility features arrive with the Create Sim phase.',
   lines: 'No lines or breaklines yet.',
@@ -140,7 +145,7 @@ export function renderSimPanelHtml(
       : activeTab.id === 'buildings' && buildings
         ? renderBuildingsTabHtml(buildings)
         : activeTab.id === 'objects' && simpleTabs?.object
-          ? renderSimpleTabHtml(simpleTabs.object)
+          ? renderObjectsTabHtml(simpleTabs.object)
           : activeTab.id === 'lines' && simpleTabs?.line
             ? renderSimpleTabHtml(simpleTabs.line)
             : activeTab.id === 'notes' && simpleTabs?.marker
@@ -278,6 +283,28 @@ export function renderSimpleTabHtml(view: SimpleTabView): string {
   `
 }
 
+export function renderObjectsTabHtml(view: SimpleTabView): string {
+  if (view.detail) return renderFeatureDetailHtml(view.detail)
+
+  const toolbarNote =
+    view.authoring && view.authoring.family === 'object' && view.authoring.phase === 'placing'
+      ? '<div class="tab-note">Object placement toolbar is active in the viewer.</div>'
+      : ''
+  const listHtml =
+    view.list.length === 0
+      ? `<div class="tab-placeholder">${escapeHtml(SIM_TAB_PLACEHOLDER.objects!)}</div>`
+      : view.list.map((item) => renderObjectRowHtml(item as ObjectListItem)).join('')
+
+  return `
+      <div class="object-tab-topstrip">
+        <span class="object-tab-total">Object total: ${view.list.length}</span>
+        <button class="sim-add-button" data-action="object-add">+ Add Object</button>
+      </div>
+      ${toolbarNote}
+      <div class="feature-list">${listHtml}</div>
+  `
+}
+
 function renderSimpleRowHtml(family: SimpleFeatureFamily, item: ObjectListItem | LineListItem | MarkerListItem): string {
   const evidence = `${item.snappedEvidenceCount} snapped / ${item.freeEvidenceCount} free`
   let sub = item.subtype
@@ -291,6 +318,20 @@ function renderSimpleRowHtml(family: SimpleFeatureFamily, item: ObjectListItem |
         <span class="feature-sub">${escapeHtml(sub)}</span>
         <span class="evidence-badge" title="Evidence: snap-backed vs free-placed vertices">${evidence}</span>
       </button>`
+}
+
+function renderObjectRowHtml(item: ObjectListItem): string {
+  const evidence = `${item.snappedEvidenceCount} snapped / ${item.freeEvidenceCount} free`
+  return `
+      <div class="feature-row feature-row-object">
+        <span class="feature-row-object-main">
+          <button class="feature-pill feature-pill-toggle${item.visible ? '' : ' feature-pill-off'}" data-action="feature-visibility" data-feature-id="${escapeHtml(item.id)}" data-visible="${item.visible ? 'true' : 'false'}" title="${item.visible ? 'Hide object' : 'Show object'}">${escapeHtml(item.category)} / ${escapeHtml(item.typeLabel)}</button>
+          <button class="feature-row-object-copy" data-action="feature-select" data-feature-id="${escapeHtml(item.id)}">
+            <span class="feature-name">${escapeHtml(item.name)}</span>
+            <span class="feature-sub">${escapeHtml(item.summary)} · ${evidence}</span>
+          </button>
+        </span>
+      </div>`
 }
 
 function renderRegionAuthoringHtml(authoring: RegionAuthoringView): string {
@@ -378,6 +419,46 @@ function renderSimpleAuthoringHtml(authoring: SimpleAuthoringView): string {
 }
 
 export function renderFeatureDetailHtml(detail: FeatureDetailModel): string {
+  const objectSelectorsHtml = detail.objectEditor
+    ? `
+      <div class="ws-section">
+        <div class="ws-section-title">Object</div>
+        <label class="ws-meta-row"><span class="ws-meta-label">Category</span><span class="ws-meta-value"><select data-action="feature-object-category" data-feature-id="${escapeHtml(detail.id)}">${detail.objectEditor.categories
+          .map(
+            (category) =>
+              `<option value="${escapeHtml(category.id)}"${category.id === detail.objectEditor!.categoryId ? ' selected' : ''}>${escapeHtml(category.label)}</option>`,
+          )
+          .join('')}</select></span></label>
+        <label class="ws-meta-row"><span class="ws-meta-label">Type</span><span class="ws-meta-value"><select data-action="feature-object-type" data-feature-id="${escapeHtml(detail.id)}">${detail.objectEditor.types
+          .map(
+            (type) =>
+              `<option value="${escapeHtml(type.templateId)}"${type.templateId === detail.objectEditor!.typeTemplateId ? ' selected' : ''}>${escapeHtml(type.label)}</option>`,
+          )
+          .join('')}</select></span></label>
+        <div class="ws-detail">${escapeHtml(detail.objectEditor.summary)}</div>
+      </div>`
+    : ''
+  const placementHtml = detail.objectEditor
+    ? `
+      <div class="ws-section">
+        <div class="ws-section-title">Placement</div>
+        <label class="ws-meta-row"><span class="ws-meta-label">X</span><span class="ws-meta-value"><input type="number" value="${escapeHtml(detail.objectEditor.placement.x)}" data-action="feature-placement" data-feature-id="${escapeHtml(detail.id)}" data-axis="x" /></span></label>
+        <label class="ws-meta-row"><span class="ws-meta-label">Y</span><span class="ws-meta-value"><input type="number" value="${escapeHtml(detail.objectEditor.placement.y)}" data-action="feature-placement" data-feature-id="${escapeHtml(detail.id)}" data-axis="y" /></span></label>
+        <label class="ws-meta-row"><span class="ws-meta-label">Z</span><span class="ws-meta-value"><input type="number" value="${escapeHtml(detail.objectEditor.placement.z)}" data-action="feature-placement" data-feature-id="${escapeHtml(detail.id)}" data-axis="z" /></span></label>
+        <label class="ws-meta-row"><span class="ws-meta-label">Rotation</span><span class="ws-meta-value"><input type="number" value="${escapeHtml(detail.objectEditor.rotationYaw)}" data-action="feature-param" data-feature-id="${escapeHtml(detail.id)}" data-param-name="rotationYaw" /></span></label>
+      </div>`
+    : ''
+  const previewHtml = detail.objectEditor
+    ? `
+      <div class="ws-section">
+        <div class="ws-section-title">Object Preview</div>
+        <div class="object-preview-card">
+          <div class="object-preview-label">${escapeHtml(detail.objectEditor.categoryId)} / ${escapeHtml(detail.objectEditor.typeLabel)}</div>
+          <div class="object-preview-graphic object-preview-${escapeHtml(detail.objectEditor.previewKind)}" aria-hidden="true"></div>
+          <div class="ws-detail">${escapeHtml(detail.objectEditor.summary)}</div>
+        </div>
+      </div>`
+    : ''
   const paramsHtml =
     detail.params.length === 0
       ? '<div class="ws-detail">No parameters.</div>'
@@ -403,6 +484,9 @@ export function renderFeatureDetailHtml(detail: FeatureDetailModel): string {
           <div class="ws-meta-row"><span class="ws-meta-label">Subtype</span><span class="ws-meta-value">${escapeHtml(detail.subtype)}</span></div>
           ${detail.templateId ? `<div class="ws-meta-row"><span class="ws-meta-label">Template</span><span class="ws-meta-value">${escapeHtml(detail.templateId)}</span></div>` : ''}
         </div>
+        ${objectSelectorsHtml}
+        ${previewHtml}
+        ${placementHtml}
         <div class="ws-section">
           <div class="ws-section-title">Parameters</div>
           ${paramsHtml}
@@ -642,8 +726,7 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       return
     }
     if (action === 'object-add') {
-      const select = mount.querySelector<HTMLSelectElement>('#object-template-select')
-      if (select?.value) deps.features.startObject(select.value)
+      deps.features.startObjectCreation()
       return
     }
     if (action === 'line-add') {
@@ -707,6 +790,12 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       void deps.features.remove(featureId)
       return
     }
+    if (action === 'feature-visibility' && featureId) {
+      event.stopPropagation()
+      const visible = target.dataset.visible === 'true'
+      void deps.features.updateVisibility(featureId, !visible)
+      return
+    }
   })
 
   mount.addEventListener('change', (event) => {
@@ -723,6 +812,21 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
     if (target.dataset.action === 'feature-param' && target.dataset.featureId && target.dataset.paramName) {
       const value = target instanceof HTMLInputElement && target.type === 'checkbox' ? String(target.checked) : (target as HTMLInputElement | HTMLSelectElement).value
       void deps.features.updateParam(target.dataset.featureId, target.dataset.paramName, value)
+      return
+    }
+    if (target.dataset.action === 'feature-object-type' && target.dataset.featureId && target instanceof HTMLSelectElement) {
+      void deps.features.updateObjectTemplate(target.dataset.featureId, target.value)
+      return
+    }
+    if (target.dataset.action === 'feature-object-category' && target.dataset.featureId && target instanceof HTMLSelectElement) {
+      void deps.features.updateObjectCategory(target.dataset.featureId, target.value)
+      return
+    }
+    if (target.dataset.action === 'feature-placement' && target.dataset.featureId && target.dataset.axis) {
+      const axis = target.dataset.axis
+      if (axis === 'x' || axis === 'y' || axis === 'z') {
+        void deps.features.updatePlacement(target.dataset.featureId, axis, (target as HTMLInputElement).value)
+      }
     }
   })
 

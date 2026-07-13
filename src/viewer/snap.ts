@@ -41,6 +41,7 @@ export const SNAP_PRECEDENCE: readonly SnapSourceKind[] = [
 
 export interface SnapCandidate {
   sourceKind: SnapSourceKind;
+  cloudSource?: 'preview' | 'index';
   /** Survey-space coordinate the placement snaps to. */
   world: Vec3;
   /** Projected viewport position in pixels. */

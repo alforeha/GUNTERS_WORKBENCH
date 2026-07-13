@@ -6,11 +6,19 @@
 // region patch generator on every session change.
 
 import type { ProjectSession } from '../shared/ipc'
-import { getTemplate, templatesForFamily, type FeatureTemplate, type TemplateParamSpec } from '../shared/template-catalog'
+import {
+  getTemplate,
+  objectCategoryLabel,
+  templatesForFamily,
+  type FeatureTemplate,
+  type ObjectCategoryId,
+  type TemplateParamSpec,
+} from '../shared/template-catalog'
 import type { EvidenceRef, FeatureRecord, ProjectManifest } from '../shared/workbench-types'
 import type { ViewerEngine } from '../viewer'
 import type { Vec3 } from '../viewer/geometry'
 import {
+  buildObjectDisplay,
   buildBuildingDisplay,
   buildLineDisplay,
   buildPointPrimitiveDisplay,
@@ -64,6 +72,7 @@ export interface BuildingAuthoringView {
 
 export type SimpleFeatureFamily = 'object' | 'line' | 'marker'
 export type SimpleAuthoringPhase = 'placing' | 'review'
+export type ObjectPlacementMode = 'snap' | 'manual'
 
 export interface SimpleAuthoringView {
   family: SimpleFeatureFamily
@@ -75,6 +84,14 @@ export interface SimpleAuthoringView {
   canReview: boolean
   snappedCount: number
   freeCount: number
+}
+
+export interface ObjectCreationToolbarView {
+  categoryId: ObjectCategoryId
+  typeTemplateId: string
+  placementMode: ObjectPlacementMode
+  categories: { id: ObjectCategoryId; label: string }[]
+  types: { templateId: string; label: string }[]
 }
 
 interface AuthoredVertexRecord {
@@ -101,7 +118,10 @@ interface PendingSimpleFeature {
   templateId: string
   subtype: string
   vertices: AuthoredVertexRecord[]
+  placementMode: ObjectPlacementMode
 }
+
+const DEFAULT_OBJECT_TEMPLATE_ID = 'object.box'
 
 /** Reality display tints per region subtype (display hint only, not persisted). */
 const REGION_FILL_COLOR: Record<string, number> = {
@@ -247,25 +267,73 @@ export class FeatureController {
   }
 
   startObject(templateId: string): void {
-    this.startSimpleFeature('object', templateId)
+    this.startSimpleFeature('object', templateId, 'snap')
+  }
+
+  startObjectCreation(): void {
+    this.startSimpleFeature('object', DEFAULT_OBJECT_TEMPLATE_ID, 'snap')
   }
 
   startLine(templateId: string): void {
-    this.startSimpleFeature('line', templateId)
+    this.startSimpleFeature('line', templateId, 'snap')
   }
 
   startMarker(templateId: string): void {
-    this.startSimpleFeature('marker', templateId)
+    this.startSimpleFeature('marker', templateId, 'snap')
   }
 
-  private startSimpleFeature(family: SimpleFeatureFamily, templateId: string): void {
+  getObjectCreationToolbar(): ObjectCreationToolbarView | null {
+    if (this.simplePhase !== 'placing' || this.pendingSimple?.family !== 'object') return null
+    const currentTemplate = getTemplate(this.pendingSimple.templateId)
+    const categoryId = currentTemplate?.objectCategory ?? 'generic'
+    return {
+      categoryId,
+      typeTemplateId: this.pendingSimple.templateId,
+      placementMode: this.pendingSimple.placementMode,
+      categories: this.objectTemplatesByCategory().map(([id]) => ({ id, label: objectCategoryLabel(id) })),
+      types: this.objectTemplates()
+        .filter((template) => template.objectCategory === categoryId)
+        .map((template) => ({ templateId: template.id, label: template.displayName })),
+    }
+  }
+
+  setObjectCreationCategory(categoryId: ObjectCategoryId): void {
+    if (this.simplePhase !== 'placing' || this.pendingSimple?.family !== 'object') return
+    const template = this.objectTemplates().find((candidate) => candidate.objectCategory === categoryId)
+    if (!template) return
+    this.restartPendingObjectCreation(template.id, this.pendingSimple.placementMode)
+  }
+
+  setObjectCreationTemplate(templateId: string): void {
+    if (this.simplePhase !== 'placing' || this.pendingSimple?.family !== 'object') return
+    this.restartPendingObjectCreation(templateId, this.pendingSimple.placementMode)
+  }
+
+  setObjectPlacementMode(mode: ObjectPlacementMode): void {
+    if (this.simplePhase !== 'placing' || this.pendingSimple?.family !== 'object' || !this.pendingSimple) return
+    this.pendingSimple.placementMode = mode
+    this.deps.onAuthoringChanged()
+  }
+
+  private startSimpleFeature(
+    family: SimpleFeatureFamily,
+    templateId: string,
+    placementMode: ObjectPlacementMode,
+  ): void {
     const template = getTemplate(templateId)
     if (!template || template.family !== family || !this.deps.getSession() || this.isAuthoring()) return
     const viewer = this.deps.ensureViewer()
     viewer.startFeatureAuthoring(family, templateId, family === 'line' ? 'polyline' : 'point')
     this.simplePhase = 'placing'
-    this.pendingSimple = { family, templateId, subtype: template.subtype, vertices: [] }
+    this.pendingSimple = { family, templateId, subtype: template.subtype, vertices: [], placementMode }
     this.deps.onAuthoringChanged()
+  }
+
+  private restartPendingObjectCreation(templateId: string, placementMode: ObjectPlacementMode): void {
+    this.deps.getViewer()?.cancelFeatureAuthoring()
+    this.simplePhase = null
+    this.pendingSimple = null
+    this.startSimpleFeature('object', templateId, placementMode)
   }
 
   /** Routed from the viewer-host click handler; true when the click was consumed. */
@@ -276,8 +344,9 @@ export class FeatureController {
     if (!regionActive && !buildingActive && !simpleActive) return false
     const viewer = this.deps.getViewer()
     if (!viewer) return false
-    viewer.placeFeatureVertexAtPointer()
-    this.captureCompletedPointDraft()
+    const placementMode = this.pendingSimple?.family === 'object' ? this.pendingSimple.placementMode : 'snap'
+    const snapshot = viewer.placeFeatureVertexAtPointer(undefined, placementMode !== 'manual')
+    this.captureCompletedPointDraft(snapshot)
     this.refreshDraftPreview()
     this.refreshBuildingDraftPreview()
     this.refreshSimpleDraftPreview()
@@ -285,15 +354,20 @@ export class FeatureController {
     return true
   }
 
-  private captureCompletedPointDraft(): void {
+  private captureCompletedPointDraft(snapshot?: ReturnType<ViewerEngine['getFeatureAuthoringSnapshot']>): void {
     if (!this.pendingSimple || this.pendingSimple.family === 'line' || this.simplePhase !== 'placing') return
-    const snapshot = this.deps.getViewer()?.getFeatureAuthoringSnapshot()
-    if (snapshot?.state !== 'complete' || !snapshot.draft) return
-    this.pendingSimple.vertices = snapshot.draft.vertices.map((vertex) => ({
+    const resolved = snapshot ?? this.deps.getViewer()?.getFeatureAuthoringSnapshot()
+    if (resolved?.state !== 'complete' || !resolved.draft) return
+    this.pendingSimple.vertices = resolved.draft.vertices.map((vertex) => ({
       world: vertex.world,
       snapped: vertex.snapped,
       evidence: vertex.evidence,
     }))
+    if (this.pendingSimple.family === 'object') {
+      this.simplePhase = 'review'
+      void this.finishSimpleFeature()
+      return
+    }
     this.simplePhase = 'review'
   }
 
@@ -482,15 +556,19 @@ export class FeatureController {
     const now = new Date().toISOString()
     const familyCount = manifest.features.filter((feature) => feature.family === pending.family).length
     const type = pending.family === 'line' ? 'polyline' : 'marker'
+    const point = pending.vertices[0]?.world ?? [0, 0, 0]
     const record: FeatureRecord = {
       id: `feat-${crypto.randomUUID()}`,
       simulationId: manifest.realitySimulation.id,
       type,
-      name: `${featureFamilyLabel(pending.family)} ${familyCount + 1} (${pending.subtype})`,
+      name:
+        pending.family === 'object'
+          ? `${template?.displayName ?? 'Object'} ${familyCount + 1}`
+          : `${featureFamilyLabel(pending.family)} ${familyCount + 1} (${pending.subtype})`,
       geometry:
         pending.family === 'line'
           ? { vertices: pending.vertices.map((vertex) => vertex.world) }
-          : { point: pending.vertices[0]!.world },
+          : { point },
       createdAt: now,
       modifiedAt: now,
       family: pending.family,
@@ -505,7 +583,7 @@ export class FeatureController {
         ...(template?.report ? { report: { ...template.report } } : {}),
       },
       display: { visible: true },
-      metadata: {},
+      metadata: pending.family === 'object' && template?.objectCategory ? { objectCategory: template.objectCategory } : {},
     }
     manifest.features.push(record)
     this.clearAuthoring()
@@ -545,6 +623,62 @@ export class FeatureController {
     await this.deps.persistManifest(manifest)
   }
 
+  async updateObjectTemplate(featureId: string, templateId: string): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    const nextTemplate = getTemplate(templateId)
+    if (!feature || feature.family !== 'object' || !nextTemplate || nextTemplate.family !== 'object') return
+    const previousTemplate = feature.templateId ? getTemplate(feature.templateId) : null
+    feature.templateId = nextTemplate.id
+    feature.subtype = nextTemplate.subtype
+    feature.parameters = remapTemplateParameters(feature.parameters ?? {}, previousTemplate, nextTemplate)
+    feature.representations = {
+      ...(nextTemplate.cad ? { cad: { ...nextTemplate.cad } } : {}),
+      ...(nextTemplate.report ? { report: { ...nextTemplate.report } } : {}),
+    }
+    feature.metadata = { ...(feature.metadata ?? {}), ...(nextTemplate.objectCategory ? { objectCategory: nextTemplate.objectCategory } : {}) }
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  async updateObjectCategory(featureId: string, categoryId: ObjectCategoryId): Promise<void> {
+    const template = this.objectTemplates().find((candidate) => candidate.objectCategory === categoryId)
+    if (!template) return
+    await this.updateObjectTemplate(featureId, template.id)
+  }
+
+  async updateFeaturePlacement(featureId: string, axis: 'x' | 'y' | 'z', rawValue: string): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const value = Number(rawValue)
+    if (!Number.isFinite(value)) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature || (feature.family !== 'object' && feature.family !== 'marker')) return
+    const geometry = feature.geometry as { point?: unknown }
+    if (!isVec3(geometry.point)) return
+    const point: Vec3 = [geometry.point[0], geometry.point[1], geometry.point[2]]
+    if (axis === 'x') point[0] = value
+    if (axis === 'y') point[1] = value
+    if (axis === 'z') point[2] = value
+    feature.geometry = { ...feature.geometry, point }
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  async updateFeatureVisibility(featureId: string, visible: boolean): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature) return
+    feature.display = { ...(feature.display ?? { visible: true }), visible }
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
   async deleteFeature(featureId: string): Promise<void> {
     const session = this.deps.getSession()
     if (!session) return
@@ -566,11 +700,12 @@ export class FeatureController {
     const session = this.deps.getSession()
     const features = (session?.manifest.features ?? []).filter(
       (feature): feature is FeatureRecord =>
-        feature.family === 'region' ||
-        feature.family === 'building' ||
-        feature.family === 'object' ||
-        feature.family === 'line' ||
-        feature.family === 'marker',
+        feature.display?.visible !== false &&
+        (feature.family === 'region' ||
+          feature.family === 'building' ||
+          feature.family === 'object' ||
+          feature.family === 'line' ||
+          feature.family === 'marker'),
     )
     const viewer = features.length > 0 ? this.deps.ensureViewer() : this.deps.getViewer()
     if (!viewer) return
@@ -617,7 +752,14 @@ export class FeatureController {
       continue
     }
     for (const feature of features) {
-      if (feature.family === 'object' || feature.family === 'marker') {
+      if (feature.family === 'object') {
+        const display = buildObjectDisplay(feature)
+        if (!display) continue
+        const color = objectDisplayColor(feature)
+        entries.push({ featureId: feature.id, ...display, fillColor: color.fill, lineColor: color.line })
+        continue
+      }
+      if (feature.family === 'marker') {
         const geometry = pointPrimitiveGeometryFromFeature(feature)
         if (!geometry) continue
         const display = buildPointPrimitiveDisplay({
@@ -625,7 +767,7 @@ export class FeatureController {
           size: numberParam(feature, 'scale', numberParam(feature, 'diameter', 2)),
           height: numberParam(feature, 'height', 2),
         })
-        const color = feature.family === 'object' ? 0x6d8fbd : 0xffc857
+        const color = 0xffc857
         entries.push({ featureId: feature.id, lines: display.lines, fillColor: color, lineColor: color })
         continue
       }
@@ -690,12 +832,24 @@ export class FeatureController {
     const viewer = this.deps.getViewer()
     viewer?.cancelFeatureAuthoring()
     viewer?.setAuthoringDraftPreview(null)
+    viewer?.setSnapPreview(null)
     this.phase = null
     this.pending = null
     this.buildingPhase = null
     this.pendingBuilding = null
     this.simplePhase = null
     this.pendingSimple = null
+  }
+
+  private objectTemplatesByCategory(): Array<[ObjectCategoryId, FeatureTemplate[]]> {
+    const groups = new Map<ObjectCategoryId, FeatureTemplate[]>()
+    for (const template of this.objectTemplates()) {
+      const category = template.objectCategory ?? 'generic'
+      const bucket = groups.get(category) ?? []
+      bucket.push(template)
+      groups.set(category, bucket)
+    }
+    return [...groups.entries()]
   }
 }
 
@@ -723,4 +877,36 @@ function coerceParamValue(param: TemplateParamSpec, rawValue: string): number | 
     return param.options?.includes(rawValue) ? rawValue : undefined
   }
   return rawValue
+}
+
+function remapTemplateParameters(
+  existing: Record<string, unknown>,
+  previousTemplate: FeatureTemplate | null,
+  nextTemplate: FeatureTemplate,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const param of nextTemplate.paramSchema) {
+    const raw = existing[param.name]
+    if (raw === undefined) {
+      out[param.name] = param.default
+      continue
+    }
+    const coerced = coerceParamValue(param, String(raw))
+    out[param.name] = coerced === undefined ? param.default : coerced
+  }
+  if (previousTemplate?.family === 'object' && existing.rotationYaw !== undefined && out.rotationYaw === undefined) {
+    out.rotationYaw = existing.rotationYaw
+  }
+  return out
+}
+
+function isVec3(value: unknown): value is Vec3 {
+  return Array.isArray(value) && value.length === 3 && value.every((axis) => typeof axis === 'number')
+}
+
+function objectDisplayColor(feature: FeatureRecord): { fill: number; line: number } {
+  const template = feature.templateId ? getTemplate(feature.templateId) : null
+  if (template?.objectCategory === 'foliage') return { fill: 0x6ea05a, line: 0x335f2e }
+  if (template?.objectCategory === 'site-fixture') return { fill: 0xa0aab8, line: 0x495464 }
+  return { fill: 0x7ea4c6, line: 0x284c70 }
 }

@@ -49,6 +49,7 @@ export function mountFrame(app: HTMLElement): FrameRefs {
   const footerMount = app.querySelector<HTMLElement>('#frame-footer')
   const leftPanelMount = app.querySelector<HTMLElement>('#left-panel')
   const rightPanelMount = app.querySelector<HTMLElement>('#right-panel')
+  const viewerWrap = app.querySelector<HTMLElement>('#viewer-wrap')
   const viewerHost = app.querySelector<HTMLElement>('#viewer-host')
   const bannerMount = app.querySelector<HTMLElement>('#banner-mount')
   const toolRailMount = app.querySelector<HTMLElement>('#tool-rail')
@@ -60,6 +61,7 @@ export function mountFrame(app: HTMLElement): FrameRefs {
     !footerMount ||
     !leftPanelMount ||
     !rightPanelMount ||
+    !viewerWrap ||
     !viewerHost ||
     !bannerMount ||
     !toolRailMount ||
@@ -75,6 +77,8 @@ export function mountFrame(app: HTMLElement): FrameRefs {
   function applyPanelState(): void {
     leftPanelMount!.classList.toggle('panel-closed', !leftOpen)
     rightPanelMount!.classList.toggle('panel-closed', !rightOpen)
+    viewerWrap!.style.setProperty('--viewer-left-overlay-inset', leftOpen ? 'var(--panel-width)' : '0px')
+    viewerWrap!.style.setProperty('--viewer-right-overlay-inset', rightOpen ? 'var(--panel-width)' : '0px')
     leftEdgeButton!.textContent = leftOpen ? '<|' : '|<'
     rightEdgeButton!.textContent = rightOpen ? '|>' : '>|'
     leftEdgeButton!.classList.toggle('edge-button-open', leftOpen)

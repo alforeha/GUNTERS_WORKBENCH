@@ -14,8 +14,8 @@ import { RenderPointCloud } from './RenderPointCloud';
 import { StreamingPointCloud, type StreamingHierarchy, type TileFetcher } from './StreamingPointCloud';
 import { StreamingSurfels, type SurfelHierarchy, type SurfelTileFetcher } from './StreamingSurfels';
 import { AuthoringMachine, type AuthoringGeometryMode, type AuthoringSnapshot } from './authoring';
-import { DEFAULT_SNAP_TOLERANCE_PX, closestPointOnScreenSegment, resolvePlacement, type SnapCandidate } from './snap';
-import { RenderFeatures, type FeatureDisplayEntry } from './RenderFeatures';
+import { DEFAULT_SNAP_TOLERANCE_PX, closestPointOnScreenSegment, resolvePlacement, resolveSnap, type SnapCandidate } from './snap';
+import { RenderFeatures, type FeatureDisplayEntry, type SnapPreview } from './RenderFeatures';
 import type { FeatureFamily } from '../shared/workbench-types';
 import type { FilterState, PointDisplayMode } from './pointCloudLod';
 import { buildNorthGizmo, projectGizmoNorth, GIZMO_SIZE, GIZMO_MARGIN } from './gizmo';
@@ -464,7 +464,7 @@ uniform float edlOrtho;
     return true;
   }
 
-  enterHoverOnPointCloud(handle: string, height: number): boolean {
+  enterHoverOnPointCloud(handle: string, height: number, startWorld?: Vec3): boolean {
     if (this.disposed || !this.sceneOrigin) return false;
     const streaming = this.pointCloudIndexes.get(handle);
     if (!streaming) return false;
@@ -482,10 +482,14 @@ uniform float edlOrtho;
     this.hoverYaw = Math.atan2(dir.x, dir.y);
     this.hoverPitch = Math.abs(dir.z) > 0.95 ? THREE.MathUtils.degToRad(-5) : THREE.MathUtils.clamp(Math.asin(dir.z), -1.2, 1.2);
 
-    const start = this.perspCamera.position.clone();
-    let x = start.x;
-    let y = start.y;
-    let groundZ = this.resolvePointCloudGroundZAt(handle, x, y);
+    const startRender = startWorld ? this.surveyToRenderLocal(startWorld) : null;
+    let x = startRender?.[0] ?? this.perspCamera.position.x;
+    let y = startRender?.[1] ?? this.perspCamera.position.y;
+    // The clicked point anchors XY only; ground comes from local low-percentile
+    // samples so a canopy/wall/sign click still starts at eye height on ground.
+    let groundZ = startRender
+      ? this.estimateWalkStartGroundZ(handle, x, y) ?? startRender[2]
+      : this.resolvePointCloudGroundZAt(handle, x, y);
     if (groundZ === null) {
       const center = streaming.bounds.getCenter(new THREE.Vector3());
       x = center.x;
@@ -1514,18 +1518,29 @@ uniform float edlOrtho;
    * Snap-resolves the current pointer and records one draft vertex. Falls back
    * to flagged free placement at the surface/plane hit under the pointer.
    */
-  placeFeatureVertexAtPointer(tolerancePx = DEFAULT_SNAP_TOLERANCE_PX): AuthoringSnapshot {
-    const freeHit = this.pickWorldPointAtPointer();
-    const placement = resolvePlacement(
-      {
-        pointer: { x: this.pointerPx.x, y: this.pointerPx.y },
-        candidates: this.collectSnapCandidates(tolerancePx),
-        tolerancePx,
-      },
-      freeHit ? this.renderToSurvey(freeHit) : null,
-    );
+  placeFeatureVertexAtPointer(tolerancePx = DEFAULT_SNAP_TOLERANCE_PX, allowSnap = true): AuthoringSnapshot {
+    const placement = this.resolvePlacementAtPointer(tolerancePx, allowSnap).placement;
     if (placement) this.authoringMachine.place(placement);
     return this.authoringMachine.snapshot();
+  }
+
+  pickIndexedPointAtPointer(handle: string, tolerancePx = DEFAULT_SNAP_TOLERANCE_PX): Vec3 | null {
+    const resolved = this.resolvePlacementAtPointer(tolerancePx, true, handle);
+    if (!resolved.snapHit || resolved.snapHit.candidate.sourceKind !== 'cloud-point') return null;
+    return [...resolved.snapHit.candidate.world];
+  }
+
+  pickIndexedPointAtClient(
+    handle: string,
+    clientX: number,
+    clientY: number,
+    tolerancePx = DEFAULT_SNAP_TOLERANCE_PX,
+  ): Vec3 | null {
+    const pointer = this.pointerStateFromClient(clientX, clientY);
+    if (!pointer) return null;
+    const resolved = this.resolvePlacementAtPointer(tolerancePx, true, handle, pointer);
+    if (!resolved.snapHit || resolved.snapHit.candidate.sourceKind !== 'cloud-point') return null;
+    return [...resolved.snapHit.candidate.world];
   }
 
   requestCloseFeatureAuthoring(): AuthoringSnapshot {
@@ -1585,6 +1600,16 @@ uniform float edlOrtho;
     this.requestRender();
   }
 
+  setSnapPreview(preview: SnapPreview | null): void {
+    if (this.disposed || !this.sceneOrigin) return;
+    if (!this.renderFeatures) {
+      this.renderFeatures = new RenderFeatures(this.sceneOrigin);
+      this.contentGroup.add(this.renderFeatures.group);
+    }
+    this.renderFeatures.setSnapPreview(preview);
+    this.requestRender();
+  }
+
   /** Sim master toggle: shows/hides all authored features as one group. */
   setAuthoredFeaturesVisible(visible: boolean): void {
     this.renderFeatures?.setVisible(visible);
@@ -1598,35 +1623,44 @@ uniform float edlOrtho;
    * entries are never snap sources (resolveSnap and the manifest schema both
    * back this up).
    */
-  private collectSnapCandidates(tolerancePx: number): SnapCandidate[] {
+  private collectSnapCandidates(
+    tolerancePx: number,
+    cloudHandleFilter: string | null = null,
+    pointer = { px: this.pointerPx, ndc: this.pointerNdc },
+  ): SnapCandidate[] {
     const out: SnapCandidate[] = [];
-    if (this.disposed || !this.pointerInside || !this.sceneOrigin) return out;
-    this.raycaster.setFromCamera(this.pointerNdc, this.activeCamera);
-    this.raycaster.params.Points.threshold = this.dragWorldUnitsPerPixel() * tolerancePx;
-    const targets: { handle: string; object: THREE.Object3D }[] = [];
+    if (this.disposed || !this.sceneOrigin) return out;
+    if (!cloudHandleFilter && !this.pointerInside) return out;
+    this.raycaster.setFromCamera(pointer.ndc, this.activeCamera);
+    const targets: { handle: string; object: THREE.Object3D; cloudSource: 'preview' | 'index' }[] = [];
     for (const [handle, cloud] of this.pointClouds) {
-      if (cloud.group.visible) targets.push({ handle, object: cloud.group });
+      if (!cloudHandleFilter && cloud.group.visible) targets.push({ handle, object: cloud.group, cloudSource: 'preview' });
     }
     for (const [handle, streaming] of this.pointCloudIndexes) {
-      if (streaming.group.visible) targets.push({ handle, object: streaming.group });
+      if ((!cloudHandleFilter || cloudHandleFilter === handle) && streaming.group.visible) {
+        targets.push({ handle, object: streaming.group, cloudSource: 'index' });
+      }
     }
-    for (const { handle, object } of targets) {
-      const hits = this.raycaster.intersectObject(object, true);
+    for (const { handle, object, cloudSource } of targets) {
+      const hits = this.cloudHitsNearPointer(object, tolerancePx);
       // Ray-sorted; a handful per source is plenty for a screen-space pick.
       for (const hit of hits.slice(0, 8)) {
-        const candidate = this.cloudSnapCandidateFromHit(handle, hit);
+        const candidate = this.cloudSnapCandidateFromHit(handle, cloudSource, hit);
         if (candidate) out.push(candidate);
       }
     }
-    this.collectAuthoredSnapCandidates(out, tolerancePx);
+      if (!cloudHandleFilter) this.collectAuthoredSnapCandidates(out, tolerancePx, pointer.px);
     return out;
   }
 
   /** Authored-feature vertex/edge candidates from the rendered feature set. */
-  private collectAuthoredSnapCandidates(out: SnapCandidate[], tolerancePx: number): void {
+    private collectAuthoredSnapCandidates(
+      out: SnapCandidate[],
+      tolerancePx: number,
+      pointer: { x: number; y: number },
+    ): void {
     const snapGeometry = this.renderFeatures?.getSnapGeometry();
     if (!snapGeometry) return;
-    const pointer = { x: this.pointerPx.x, y: this.pointerPx.y };
     for (const vertex of snapGeometry.vertices) {
       const screen = this.surveyToScreen(vertex.world);
       if (!screen) continue;
@@ -1668,7 +1702,7 @@ uniform float edlOrtho;
   }
 
   /** Reads the actual snapped VERTEX (not the ray point) and projects it to pixels. */
-  private cloudSnapCandidateFromHit(handle: string, hit: THREE.Intersection): SnapCandidate | null {
+  private cloudSnapCandidateFromHit(handle: string, cloudSource: 'preview' | 'index', hit: THREE.Intersection): SnapCandidate | null {
     if (hit.index === undefined || !(hit.object instanceof THREE.Points)) return null;
     const positions = hit.object.geometry.getAttribute('position');
     if (!positions || hit.index >= positions.count) return null;
@@ -1677,6 +1711,7 @@ uniform float edlOrtho;
     const assetId = this.snapAssetIdByHandle.get(handle);
     return {
       sourceKind: 'cloud-point',
+      cloudSource,
       world: this.renderToSurvey(vertex),
       screen: {
         x: (projected.x * 0.5 + 0.5) * this.container.clientWidth,
@@ -1690,6 +1725,82 @@ uniform float edlOrtho;
   private renderToSurvey(point: THREE.Vector3): Vec3 {
     const [ox, oy, oz] = this.sceneOrigin ?? [0, 0, 0];
     return [point.x + ox, point.y + oy, point.z / this.exaggeration + oz];
+  }
+
+  private surveyToRenderLocal(world: Vec3): Vec3 {
+    const [ox, oy, oz] = this.sceneOrigin ?? [0, 0, 0];
+    return [world[0] - ox, world[1] - oy, world[2] - oz];
+  }
+
+  private resolvePlacementAtPointer(
+    tolerancePx: number,
+    allowSnap: boolean,
+    cloudHandleFilter: string | null = null,
+    pointer = { px: this.pointerPx, ndc: this.pointerNdc },
+  ): {
+    placement: ReturnType<typeof resolvePlacement>
+    snapHit: ReturnType<typeof resolveSnap>
+  } {
+    const freeHit = cloudHandleFilter ? null : this.pickWorldPointAtPointer();
+    const freeWorld = freeHit ? this.renderToSurvey(freeHit) : null;
+    const query = {
+      pointer: { x: pointer.px.x, y: pointer.px.y },
+      candidates: this.collectSnapCandidates(tolerancePx, cloudHandleFilter, pointer),
+      tolerancePx,
+    };
+    const snapHit = allowSnap ? resolveSnap(query) : null;
+    if (snapHit) return { placement: snapHit, snapHit };
+    if (!allowSnap && freeWorld) return { placement: { snapped: false as const, world: freeWorld }, snapHit: null };
+    return { placement: resolvePlacement(query, freeWorld), snapHit: null };
+  }
+
+  private pointerStateFromClient(clientX: number, clientY: number): { px: THREE.Vector2; ndc: THREE.Vector2 } | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const px = new THREE.Vector2(clientX - rect.left, clientY - rect.top);
+    const ndc = new THREE.Vector2(
+      (px.x / rect.width) * 2 - 1,
+      -(px.y / rect.height) * 2 + 1,
+    );
+    return { px, ndc };
+  }
+
+  private updatePlacementPreview(): void {
+    const state = this.authoringMachine.snapshot().state;
+    if (state !== 'placing' && state !== 'addingVertex') {
+      this.setSnapPreview(null);
+      return;
+    }
+    const resolved = this.resolvePlacementAtPointer(DEFAULT_SNAP_TOLERANCE_PX, true);
+    if (!resolved.placement) {
+      this.setSnapPreview(null);
+      return;
+    }
+    const kind: SnapPreview['kind'] = resolved.placement.snapped
+      ? resolved.snapHit?.candidate.sourceKind === 'cloud-point'
+        ? resolved.snapHit.candidate.cloudSource === 'index'
+          ? 'index'
+          : 'preview'
+        : 'feature'
+      : 'free';
+    const point = resolved.placement.snapped ? resolved.placement.candidate.world : resolved.placement.world;
+    this.setSnapPreview({
+      point,
+      kind,
+      size: this.snapPreviewSizeAt(point),
+    });
+  }
+
+  /** Crosshair sized ~tolerance px at the marker's own depth, so it neither
+   *  balloons nor vanishes when the camera is close (hover/walk, tight zoom). */
+  private snapPreviewSizeAt(world: Vec3): number {
+    if (this.mode === 'top') {
+      return Math.max(this.dragWorldUnitsPerPixel() * DEFAULT_SNAP_TOLERANCE_PX * 1.4, 0.01);
+    }
+    const [ox, oy, oz] = this.sceneOrigin ?? [0, 0, 0];
+    const local = new THREE.Vector3(world[0] - ox, world[1] - oy, (world[2] - oz) * this.exaggeration);
+    const depth = Math.max(this.perspCamera.position.distanceTo(local), this.perspCamera.near);
+    return Math.max(this.perspectiveUnitsPerPixelAt(depth) * DEFAULT_SNAP_TOLERANCE_PX * 1.4, 0.01);
   }
 
   private applyHoverLook(): void {
@@ -1747,6 +1858,22 @@ uniform float edlOrtho;
     const streaming = this.pointCloudIndexes.get(handle);
     if (!streaming) return null;
     return streaming.estimateGroundZ(x, y, streaming.walkGroundRadius(), 0.1, 12)?.z ?? null;
+  }
+
+  /**
+   * Ground Z for an explicit walk-start reference click: low-percentile
+   * samples inside a widening disc, so coarse pre-stream LOD still yields a
+   * floor near the clicked XY before fine tiles load.
+   */
+  private estimateWalkStartGroundZ(handle: string, x: number, y: number): number | null {
+    const streaming = this.pointCloudIndexes.get(handle);
+    if (!streaming) return null;
+    const base = streaming.walkGroundRadius();
+    for (const [mult, minPts] of [[1, 12], [2, 12], [4, 8], [8, 6]] as const) {
+      const est = streaming.estimateGroundZ(x, y, base * mult, 0.1, minPts);
+      if (est) return est.z;
+    }
+    return null;
   }
 
   private updateHoverGroundFollow(dtMs: number): boolean {
@@ -1925,6 +2052,7 @@ uniform float edlOrtho;
   private handlePointerLeave = (): void => {
     this.pointerInside = false;
     this.hoverLookDragging = false;
+    this.setSnapPreview(null);
     this.cursorCb?.(null);
     if (this.editSurfaceHandle) this.setHoveredVertex(null);
   };
@@ -2255,7 +2383,9 @@ this.postQuad.material.uniforms['edlOrtho'].value = this.activeCamera instanceof
   }
 
   private updateCursorReadout(): void {
-    if (!this.cursorCb || !this.sceneOrigin) return;
+    if (!this.sceneOrigin) return;
+    this.updatePlacementPreview();
+    if (!this.cursorCb) return;
     this.raycaster.setFromCamera(this.pointerNdc, this.activeCamera);
     this.raycaster.firstHitOnly = true; // three-mesh-bvh fast path
     if (this.editSurfaceHandle) {
@@ -2356,6 +2486,51 @@ this.postQuad.material.uniforms['edlOrtho'].value = this.activeCamera instanceof
       n,
       z,
       precisionHint: surface.model.precisionHint,
+    });
+  }
+
+  /**
+   * Cloud-point hits near the current raycaster ray with the Points threshold
+   * matched to the hits' actual depth. The orbit pivot is the wrong depth
+   * reference at close zoom and in hover/walk, so perspective picking probes a
+   * doubling depth ladder (misses are cheap bounding-sphere rejects), then
+   * re-casts once at the nearest hit's depth so the gate stays ~tolerancePx on
+   * screen at any range. Callers must have set the raycaster from the pointer.
+   */
+  private cloudHitsNearPointer(object: THREE.Object3D, tolerancePx: number): THREE.Intersection[] {
+    if (this.mode === 'top') {
+      // Orthographic: world-units-per-pixel is depth-independent.
+      this.raycaster.params.Points.threshold = this.dragWorldUnitsPerPixel() * tolerancePx;
+      return this.raycaster.intersectObject(object, true);
+    }
+    // Content is rebased around the origin, so camera distance to origin plus
+    // the scene radius bounds every candidate's depth.
+    const maxDepth = this.perspCamera.position.length() + Math.max(this.sceneRadius, 1);
+    let depth = Math.max(this.perspCamera.near * 2, maxDepth / 1024);
+    let hits: THREE.Intersection[] = [];
+    for (;;) {
+      this.raycaster.params.Points.threshold = this.perspectiveUnitsPerPixelAt(depth) * tolerancePx;
+      hits = this.raycaster.intersectObject(object, true);
+      if (hits.length > 0 || depth >= maxDepth) break;
+      depth = Math.min(depth * 2, maxDepth);
+    }
+    if (hits.length === 0) return hits;
+    const refined =
+      this.perspectiveUnitsPerPixelAt(Math.max(hits[0]!.distance, this.perspCamera.near)) * tolerancePx;
+    if (refined < this.raycaster.params.Points.threshold) {
+      this.raycaster.params.Points.threshold = refined;
+      hits = this.raycaster.intersectObject(object, true);
+    }
+    return hits;
+  }
+
+  private perspectiveUnitsPerPixelAt(distance: number): number {
+    return worldUnitsPerPixel({
+      projection: 'perspective',
+      viewportHeightPx: this.container.clientHeight,
+      distanceToPoint: distance,
+      fovDeg: this.perspCamera.fov,
+      exaggeration: this.exaggeration,
     });
   }
 
