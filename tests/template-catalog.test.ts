@@ -28,7 +28,8 @@ describe('catalog coverage', () => {
     expect(subtypes('object')).toEqual(
       ['box', 'cylinder', 'pine', 'simple-tree', 'shrub', 'sign', 'post'].sort(),
     )
-    expect(subtypes('building')).toEqual(['flat', 'gable', 'hip'].sort())
+    // 'envelope' is the beta envelope-first building (building-catalog.ts).
+    expect(subtypes('building')).toEqual(['envelope', 'flat', 'gable', 'hip'].sort())
     expect(subtypes('line')).toEqual(
       ['curb', 'flowline', 'ridge', 'ditch', 'wall-top', 'wall-bottom', 'edge-of-pavement', 'fence'].sort(),
     )

@@ -26,13 +26,14 @@ import {
   buildPointPrimitiveDisplay,
   buildRegionPatch,
   buildingGeometryFromFeature,
-  isolateBoundaryFromFeature,
   lineGeometryFromFeature,
   pointPrimitiveGeometryFromFeature,
   regionGeometryFromFeature,
   type BuildingRoofType,
 } from '../viewer/generators'
 import { buildUtilityDisplayEntry, utilityOriginFromFeature } from '../viewer/utilityGenerators'
+import { buildBuildingComponentDisplayEntries, focusBoundaryFromFeature, isEnvelopeBuilding } from '../viewer/buildingGenerators'
+import { emptyBuildingComponents } from '../shared/building-catalog'
 import type { FeatureDisplayEntry } from '../viewer/RenderFeatures'
 
 export interface FeatureControllerDeps {
@@ -116,7 +117,8 @@ interface PendingRegion {
 
 interface PendingBuilding {
   templateId: string
-  subtype: BuildingRoofType
+  /** Legacy massing roof type, or 'envelope' for the beta envelope-first building. */
+  subtype: BuildingRoofType | 'envelope'
   footprint: AuthoredVertexRecord[]
 }
 
@@ -355,7 +357,7 @@ export class FeatureController {
   startIsolateLoadAll(featureId: string): void {
     const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
     if (!feature || !isRefinableFamily(feature)) return
-    const boundary = isolateBoundaryFromFeature(feature)
+    const boundary = focusBoundaryFromFeature(feature)
     if (!boundary) return
     const viewer = this.deps.ensureViewer()
     const sectors = viewer.planIsolateSectors(boundary)
@@ -513,7 +515,7 @@ export class FeatureController {
       : feature.family === 'utility'
         ? utilityOriginFromFeature(feature)
         : null
-    const boundary = isolateBoundaryFromFeature(feature)
+    const boundary = focusBoundaryFromFeature(feature)
     // The active load-all sector renders as a rect only when the area actually
     // split - a single full-area sector would just retrace the boundary bbox.
     const load = this.isolateLoad?.featureId === feature.id ? this.isolateLoad : null
@@ -575,7 +577,10 @@ export class FeatureController {
       template.family !== 'building' ||
       !this.deps.getSession() ||
       this.isAuthoring() ||
-      (template.subtype !== 'flat' && template.subtype !== 'gable' && template.subtype !== 'hip')
+      (template.subtype !== 'flat' &&
+        template.subtype !== 'gable' &&
+        template.subtype !== 'hip' &&
+        template.subtype !== 'envelope')
     ) {
       return
     }
@@ -830,15 +835,18 @@ export class FeatureController {
     const buildingCount = manifest.features.filter((feature) => feature.family === 'building').length
     const featureId = `feat-${crypto.randomUUID()}`
     const footprint = this.pendingBuilding.footprint.map((vertex) => vertex.world)
+    const envelope = this.pendingBuilding.subtype === 'envelope'
     const record: FeatureRecord = {
       id: featureId,
       simulationId: manifest.realitySimulation.id,
       type: 'polyline',
       name: `Building ${buildingCount + 1} (${this.pendingBuilding.subtype})`,
-      geometry: {
-        footprint,
-        roofType: this.pendingBuilding.subtype,
-      },
+      geometry: envelope
+        ? { footprint }
+        : {
+            footprint,
+            roofType: this.pendingBuilding.subtype,
+          },
       createdAt: now,
       modifiedAt: now,
       family: 'building',
@@ -846,14 +854,21 @@ export class FeatureController {
       subtype: this.pendingBuilding.subtype,
       authorship: 'authored',
       lifecycleStatus: 'authored',
-      evidenceRefs: this.pendingBuilding.footprint.map((vertex) => vertex.evidence),
+      // Envelope buildings: the boundary is context, NEVER evidence - the
+      // record starts with no evidence refs (same rule as isolate boundaries).
+      evidenceRefs: envelope ? [] : this.pendingBuilding.footprint.map((vertex) => vertex.evidence),
       parameters: params,
       representations: {
         ...(template?.cad ? { cad: { ...template.cad } } : {}),
         ...(template?.report ? { report: { ...template.report } } : {}),
       },
       display: { visible: true },
-      metadata: { ridge: 'inferred-with-override-reserved' },
+      // The envelope IS the building's isolate/focus boundary (resolved via
+      // focusBoundaryFromFeature); metadata.isolateBoundary stays reserved for
+      // a user-drawn tighter override, so isolation can never be lost.
+      metadata: envelope
+        ? { building: emptyBuildingComponents() }
+        : { ridge: 'inferred-with-override-reserved' },
     }
     manifest.features.push(record)
     manifest.exclusionZones.push({
@@ -1101,6 +1116,14 @@ export class FeatureController {
         })
         continue
       }
+      if (isEnvelopeBuilding(feature)) {
+        // Envelope buildings render as components: envelope outline + accepted
+        // faces + hosted features (several entries share one featureId).
+        for (const parts of buildBuildingComponentDisplayEntries(feature)) {
+          entries.push({ featureId: feature.id, ...parts })
+        }
+        continue
+      }
       const geometry = buildingGeometryFromFeature(feature)
       if (!geometry) continue
       const display = buildBuildingDisplay({
@@ -1278,8 +1301,8 @@ function simpleFeatureMetadata(pending: PendingSimpleFeature, template: FeatureT
 }
 
 /** Families whose detail supports isolate areas + explicit evidence refinement. */
-function isRefinableFamily(feature: FeatureRecord): feature is FeatureRecord & { family: 'object' | 'utility' } {
-  return feature.family === 'object' || feature.family === 'utility'
+function isRefinableFamily(feature: FeatureRecord): feature is FeatureRecord & { family: 'object' | 'utility' | 'building' } {
+  return feature.family === 'object' || feature.family === 'utility' || feature.family === 'building'
 }
 
 function coerceParamValue(param: TemplateParamSpec, rawValue: string): number | string | boolean | undefined {

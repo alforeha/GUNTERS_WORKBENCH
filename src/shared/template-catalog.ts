@@ -5,6 +5,7 @@
 // code) and no template editor exists: the catalog is code, not project data.
 
 import type { FeatureFamily } from './workbench-types';
+import { BUILDING_ENVELOPE_TEMPLATE } from './building-catalog';
 import { UTILITY_TEMPLATES, type UtilityClassId, type UtilitySystemId } from './utility-catalog';
 
 export const TEMPLATE_CATALOG_VERSION = 1;
@@ -259,7 +260,11 @@ const catalog: FeatureTemplate[] = [
     primitive: 'post',
   }),
 
-  // Buildings: composite family; ridge is infer-with-override (IMP-4).
+  // Buildings: the envelope-first beta building leads (definitions in
+  // building-catalog.ts); the legacy parametric massing templates follow.
+  BUILDING_ENVELOPE_TEMPLATE,
+
+  // Legacy massing: composite family; ridge is infer-with-override (IMP-4).
   building('flat', 'Flat roof', [heightParam(10), num('overhang', 'Overhang', 1, { min: 0 })]),
   building('gable', 'Gable roof', [
     heightParam(10),

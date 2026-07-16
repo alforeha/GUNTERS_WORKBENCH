@@ -10,6 +10,9 @@ import type { ProjectSession } from '../shared/ipc'
 import type { UtilitySystemId } from '../shared/utility-catalog'
 import type { ProjectManifest } from '../shared/workbench-types'
 import type { BuildingAuthoringView, IsolateLoadView, ObjectEditView, RegionAuthoringView, SimpleAuthoringView, SimpleFeatureFamily } from './features'
+import type { BuildingFaceFitView } from './buildingController'
+import { buildBuildingEditorModel, buildBuildingRowsModel, type BuildingEditorModel } from './buildingModel'
+import { renderBuildingsListHtml, renderBuildingSectionsHtml } from './buildingsPanel'
 import { createObjectPreview3d, type ObjectPreview3d } from './objectPreview'
 import { renderUtilitiesTabHtml } from './utilitiesPanel'
 import {
@@ -21,7 +24,6 @@ import {
   type UtilityListItem,
 } from './utilityModel'
 import {
-  buildBuildingListModel,
   buildFeatureDetailModel,
   buildLineListModel,
   buildMarkerListModel,
@@ -95,6 +97,20 @@ export interface RightPanelFeatureOps {
   startIsolateLoadAll(featureId: string): void
   stepIsolateSector(delta: number): void
   stopIsolateLoadAll(): void
+  /** Building components (beta envelope buildings): evidence-fitted faces + hosted features. */
+  getBuildingFaceFit(): BuildingFaceFitView | null
+  getBuildingFitNote(): string | null
+  startBuildingFaceFit(featureId: string, kind: 'wall' | 'roof'): void
+  acceptBuildingFaceFit(): Promise<void>
+  cancelBuildingFaceFit(): void
+  renameBuildingFace(featureId: string, faceId: string, name: string): Promise<void>
+  setBuildingFaceVisibility(featureId: string, faceId: string, visible: boolean): Promise<void>
+  removeBuildingFace(featureId: string, faceId: string): Promise<void>
+  addBuildingFaceFeature(featureId: string, faceId: string, type: string): Promise<void>
+  updateBuildingFeatureParam(featureId: string, componentId: string, param: string, value: string): Promise<void>
+  updateBuildingFeatureType(featureId: string, componentId: string, type: string): Promise<void>
+  setBuildingFeatureVisibility(featureId: string, componentId: string, visible: boolean): Promise<void>
+  removeBuildingFaceFeature(featureId: string, componentId: string): Promise<void>
 }
 
 export interface RightPanelDeps {
@@ -118,6 +134,12 @@ export interface BuildingsTabView {
   authoring: BuildingAuthoringView | null
   list: BuildingListItem[]
   detail: FeatureDetailModel | null
+  /** Envelope-building detail extras (faces, features, fit rail), when open. */
+  buildingEditor?: BuildingEditorModel | null
+  /** In-flight isolate/evidence edit for the open building detail, if any. */
+  objectEdit?: ObjectEditView | null
+  /** Active isolate load-all state for the open building detail, if any. */
+  isolateLoad?: IsolateLoadView | null
 }
 
 export interface SimpleTabView {
@@ -270,34 +292,11 @@ export function renderRegionsTabHtml(view: RegionsTabView): string {
 }
 
 export function renderBuildingsTabHtml(view: BuildingsTabView): string {
-  if (view.detail) return renderFeatureDetailHtml(view.detail)
+  if (view.detail) {
+    return renderFeatureDetailHtml(view.detail, view.objectEdit, view.isolateLoad, undefined, view.buildingEditor)
+  }
   if (view.authoring) return renderBuildingAuthoringHtml(view.authoring)
-
-  const listHtml =
-    view.list.length === 0
-      ? `<div class="tab-placeholder">${escapeHtml(SIM_TAB_PLACEHOLDER.buildings!)}</div>`
-      : view.list
-          .map(
-            (item) => `
-      <button class="feature-row" data-action="feature-select" data-feature-id="${escapeHtml(item.id)}">
-        <span class="feature-name">${escapeHtml(item.name)}</span>
-        <span class="feature-sub">${escapeHtml(item.subtype)} roof - ${item.footprintVertexCount} footprint vertices</span>
-        <span class="evidence-badge" title="Evidence: snap-backed vs free-placed vertices">${item.snappedEvidenceCount} snapped / ${item.freeEvidenceCount} free</span>
-      </button>`,
-          )
-          .join('')
-
-  const optionsHtml = view.templates
-    .map((template) => `<option value="${escapeHtml(template.id)}">${escapeHtml(template.displayName)}</option>`)
-    .join('')
-
-  return `
-      <div class="feature-list">${listHtml}</div>
-      <div class="region-add-row">
-        <select id="building-template-select" title="Building roof type (from the template catalog)">${optionsHtml}</select>
-        <button class="sim-add-button" data-action="building-add">+ Add building</button>
-      </div>
-  `
+  return renderBuildingsListHtml(view.list, view.templates)
 }
 
 export function renderSimpleTabHtml(view: SimpleTabView): string {
@@ -422,19 +421,26 @@ function renderRegionAuthoringHtml(authoring: RegionAuthoringView): string {
 function renderBuildingAuthoringHtml(authoring: BuildingAuthoringView): string {
   const evidenceLine = `<div class="authoring-evidence">${authoring.snappedCount} snapped / ${authoring.freeCount} free placed</div>`
   const cancelButton = `<button data-action="region-cancel">Cancel</button>`
+  const envelope = authoring.subtype === 'envelope'
   if (authoring.phase === 'footprint') {
+    const hint = envelope
+      ? `Building envelope: click in the viewer to draw the envelope boundary. ${authoring.activeVertexCount} placed.`
+      : `Building (${escapeHtml(authoring.subtype)}): click in the viewer to place footprint vertices. ${authoring.activeVertexCount} placed.`
     return `
       <div class="authoring-rail" data-phase="footprint">
-        <div class="authoring-hint">Building (${escapeHtml(authoring.subtype)}): click in the viewer to place footprint vertices. ${authoring.activeVertexCount} placed.</div>
+        <div class="authoring-hint">${hint}</div>
         ${evidenceLine}
-        <button data-action="building-close-footprint"${authoring.canCloseFootprint ? '' : ' disabled'}>Close footprint</button>
+        <button data-action="building-close-footprint"${authoring.canCloseFootprint ? '' : ' disabled'}>${envelope ? 'Close envelope' : 'Close footprint'}</button>
         ${cancelButton}
       </div>
     `
   }
+  const reviewHint = envelope
+    ? `Envelope closed (${authoring.footprintVertexCount} vertices). Finish to create the building; its envelope becomes the focus area.`
+    : `Footprint closed (${authoring.footprintVertexCount} vertices). Finish to create massing and an exclusion zone.`
   return `
       <div class="authoring-rail" data-phase="review">
-        <div class="authoring-hint">Footprint closed (${authoring.footprintVertexCount} vertices). Finish to create massing and an exclusion zone.</div>
+        <div class="authoring-hint">${reviewHint}</div>
         ${evidenceLine}
         <button data-action="building-finish">Finish building</button>
         ${cancelButton}
@@ -474,12 +480,15 @@ export function renderFeatureDetailHtml(
   objectEdit?: ObjectEditView | null,
   isolateLoad?: IsolateLoadView | null,
   utilityEditor?: UtilityEditorModel | null,
+  buildingEditor?: BuildingEditorModel | null,
 ): string {
   const activeEdit = objectEdit && objectEdit.featureId === detail.id ? objectEdit : null
   const activeLoad = isolateLoad && isolateLoad.featureId === detail.id ? isolateLoad : null
-  // Objects and utilities share the refinement machinery (preview, isolate,
-  // explicit evidence); this is the one gate for those sections.
-  const refine = detail.objectEditor ?? utilityEditor ?? null
+  // Objects, utilities and envelope buildings share the refinement machinery
+  // (isolate area, explicit evidence); this is the one gate for those
+  // sections. The 3D preview card stays object/utility-only.
+  const refinePreview = detail.objectEditor ?? utilityEditor ?? null
+  const refine = refinePreview ?? buildingEditor ?? null
   const objectSelectorsHtml = detail.objectEditor
     ? `
       <div class="ws-section">
@@ -514,15 +523,15 @@ export function renderFeatureDetailHtml(
     : utilityEditor
       ? `${utilityEditor.systemLabel} / ${utilityEditor.classLabel}`
       : ''
-  const previewHtml = refine
+  const previewHtml = refinePreview
     ? `
       <div class="ws-section">
         <div class="ws-section-title">${detail.objectEditor ? 'Object Preview' : 'Utility Preview'}</div>
         <div class="object-preview-card">
           <div class="object-preview-label">${escapeHtml(previewLabel)}</div>
-          <div class="object-preview-3d-mount object-preview-${escapeHtml(refine.previewKind)}" data-preview-feature-id="${escapeHtml(detail.id)}"></div>
+          <div class="object-preview-3d-mount object-preview-${escapeHtml(refinePreview.previewKind)}" data-preview-feature-id="${escapeHtml(detail.id)}"></div>
           <div class="object-preview-hint">Drag to rotate, wheel to zoom. Origin amber, evidence blue.</div>
-          <div class="ws-detail">${escapeHtml(refine.summary)}</div>
+          <div class="ws-detail">${escapeHtml(refinePreview.summary)}</div>
         </div>
       </div>`
     : ''
@@ -556,7 +565,16 @@ export function renderFeatureDetailHtml(
         <div class="ws-detail">Alignment points are fixed after placement in beta; delete and re-place the run to change them.</div>
       </div>`
     : ''
-  const isolateHtml = refine ? renderIsolateSectionHtml(detail, refine.isolateVertexCount, activeEdit, activeLoad) : ''
+  const isolateHtml = refine
+    ? renderIsolateSectionHtml(
+        detail,
+        refine.isolateVertexCount,
+        activeEdit,
+        activeLoad,
+        buildingEditor ? { override: buildingEditor.isolateOverride } : null,
+      )
+    : ''
+  const buildingHtml = buildingEditor ? renderBuildingSectionsHtml(detail.id, buildingEditor) : ''
   const paramsHtml =
     detail.params.length === 0
       ? '<div class="ws-detail">No parameters.</div>'
@@ -587,6 +605,7 @@ export function renderFeatureDetailHtml(
         ${previewHtml}
         ${placementHtml}
         ${utilityPlacementHtml}
+        ${buildingHtml}
         ${isolateHtml}
         <div class="ws-section">
           <div class="ws-section-title">Parameters</div>
@@ -610,6 +629,8 @@ function renderIsolateSectionHtml(
   vertexCount: number | null,
   activeEdit: ObjectEditView | null,
   activeLoad: IsolateLoadView | null,
+  /** Buildings only: isolation is never optional - the envelope is the default boundary. */
+  building?: { override: boolean } | null,
 ): string {
   const id = escapeHtml(detail.id)
   if (activeEdit?.kind === 'isolate') {
@@ -623,8 +644,9 @@ function renderIsolateSectionHtml(
         </div>
       </div>`
   }
-  const status =
-    vertexCount === null
+  const status = building
+    ? `Isolate area: ${vertexCount ?? 0} vertices (${building.override ? 'custom boundary' : 'building envelope'}). Context only - points inside are not evidence.`
+    : vertexCount === null
       ? 'No isolate area yet. Draw a boundary to scope viewer focus around this feature.'
       : `Isolate area: ${vertexCount} vertices. Context only - points inside are not evidence.`
   const loadHtml =
@@ -645,12 +667,28 @@ function renderIsolateSectionHtml(
         }
         <button data-action="feature-isolate-load-stop">Stop full data</button>`
         : `<button data-action="feature-isolate-load" data-feature-id="${id}">Load all survey data in area</button>`
+  const drawLabel = building
+    ? building.override
+      ? 'Redraw custom boundary'
+      : 'Draw custom boundary'
+    : vertexCount === null
+      ? '+ Add isolate area'
+      : 'Redraw isolate area'
+  // Buildings can only reset the override back to the envelope; other
+  // families clear the optional area entirely.
+  const clearHtml = building
+    ? building.override
+      ? `<button data-action="feature-isolate-clear" data-feature-id="${id}">Reset to envelope</button>`
+      : ''
+    : vertexCount === null
+      ? ''
+      : `<button data-action="feature-isolate-clear" data-feature-id="${id}">Clear isolate area</button>`
   return `
       <div class="ws-section">
         <div class="ws-section-title">Isolate Area</div>
         <div class="ws-detail">${escapeHtml(status)}</div>
-        <button data-action="feature-isolate-start" data-feature-id="${id}">${vertexCount === null ? '+ Add isolate area' : 'Redraw isolate area'}</button>
-        ${vertexCount === null ? '' : `<button data-action="feature-isolate-clear" data-feature-id="${id}">Clear isolate area</button>`}
+        <button data-action="feature-isolate-start" data-feature-id="${id}">${drawLabel}</button>
+        ${clearHtml}
         ${loadHtml}
       </div>`
 }
@@ -829,6 +867,7 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
   function closeFeatureDetail(): void {
     simState.selectedFeatureId = null
     deps.features.cancelObjectEdit()
+    deps.features.cancelBuildingFaceFit()
     deps.features.setFocusedFeature(null)
   }
 
@@ -846,11 +885,18 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
   function buildBuildingsView(manifest: ProjectManifest): BuildingsTabView {
     const detail = simState.selectedFeatureId ? buildFeatureDetailModel(manifest, simState.selectedFeatureId) : null
     if (simState.selectedFeatureId && !detail) simState.selectedFeatureId = null // deleted elsewhere
+    const buildingFeature =
+      detail?.family === 'building' ? manifest.features.find((candidate) => candidate.id === detail.id) ?? null : null
     return {
       templates: deps.features.buildingTemplates(),
       authoring: deps.features.getBuildingAuthoring(),
-      list: buildBuildingListModel(manifest),
+      list: buildBuildingRowsModel(manifest),
       detail,
+      buildingEditor: buildingFeature
+        ? buildBuildingEditorModel(buildingFeature, deps.features.getBuildingFaceFit(), deps.features.getBuildingFitNote())
+        : null,
+      objectEdit: deps.features.getObjectEdit(),
+      isolateLoad: deps.features.getIsolateLoad(),
     }
   }
 
@@ -1101,6 +1147,47 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       void deps.features.clearEvidenceRefs(featureId)
       return
     }
+    if (action === 'building-face-fit' && featureId) {
+      const kind = target.dataset.faceKind
+      if (kind === 'wall' || kind === 'roof') deps.features.startBuildingFaceFit(featureId, kind)
+      return
+    }
+    if (action === 'building-face-accept') {
+      void deps.features.acceptBuildingFaceFit()
+      return
+    }
+    if (action === 'building-face-cancel') {
+      deps.features.cancelBuildingFaceFit()
+      return
+    }
+    if (action === 'building-face-visibility' && featureId && target.dataset.faceId) {
+      event.stopPropagation()
+      const visible = target.dataset.visible === 'true'
+      void deps.features.setBuildingFaceVisibility(featureId, target.dataset.faceId, !visible)
+      return
+    }
+    if (action === 'building-face-remove' && featureId && target.dataset.faceId) {
+      void deps.features.removeBuildingFace(featureId, target.dataset.faceId)
+      return
+    }
+    if (action === 'building-feature-add' && featureId) {
+      const faceSelect = mount.querySelector<HTMLSelectElement>('#building-feature-face-select')
+      const typeSelect = mount.querySelector<HTMLSelectElement>('#building-feature-type-select')
+      if (faceSelect?.value && typeSelect?.value) {
+        void deps.features.addBuildingFaceFeature(featureId, faceSelect.value, typeSelect.value)
+      }
+      return
+    }
+    if (action === 'building-feature-visibility' && featureId && target.dataset.componentId) {
+      event.stopPropagation()
+      const visible = target.dataset.visible === 'true'
+      void deps.features.setBuildingFeatureVisibility(featureId, target.dataset.componentId, !visible)
+      return
+    }
+    if (action === 'building-feature-remove' && featureId && target.dataset.componentId) {
+      void deps.features.removeBuildingFaceFeature(featureId, target.dataset.componentId)
+      return
+    }
   })
 
   mount.addEventListener('change', (event) => {
@@ -1143,6 +1230,25 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       if (axis === 'x' || axis === 'y' || axis === 'z') {
         void deps.features.updatePlacement(target.dataset.featureId, axis, (target as HTMLInputElement).value)
       }
+      return
+    }
+    if (target.dataset.action === 'building-face-rename' && target.dataset.featureId && target.dataset.faceId && target instanceof HTMLInputElement) {
+      void deps.features.renameBuildingFace(target.dataset.featureId, target.dataset.faceId, target.value)
+      return
+    }
+    if (
+      target.dataset.action === 'building-feature-param' &&
+      target.dataset.featureId &&
+      target.dataset.componentId &&
+      target.dataset.paramName &&
+      target instanceof HTMLInputElement
+    ) {
+      void deps.features.updateBuildingFeatureParam(target.dataset.featureId, target.dataset.componentId, target.dataset.paramName, target.value)
+      return
+    }
+    if (target.dataset.action === 'building-feature-type' && target.dataset.featureId && target.dataset.componentId && target instanceof HTMLSelectElement) {
+      void deps.features.updateBuildingFeatureType(target.dataset.featureId, target.dataset.componentId, target.value)
+      return
     }
   })
 

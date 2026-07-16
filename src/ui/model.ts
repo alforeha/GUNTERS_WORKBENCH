@@ -509,6 +509,10 @@ export interface BuildingListItem {
   footprintVertexCount: number
   snappedEvidenceCount: number
   freeEvidenceCount: number
+  /** Enriched by buildingModel.buildBuildingRowsModel; renderers fall back when absent. */
+  typeLabel?: string
+  summary?: string
+  visible?: boolean
 }
 
 export interface ObjectListItem {

@@ -17,6 +17,8 @@ import { mountLeftPanel, type LeftPanelApi } from './ui/leftPanel'
 import { mountRightPanel, type RightPanelApi } from './ui/rightPanel'
 import { LayerController, type WalkTargetOption } from './ui/layers'
 import { FeatureController } from './ui/features'
+import { BuildingComponentController } from './ui/buildingController'
+import type { BuildingFaceFeatureType, BuildingFaceKind } from './shared/building-catalog'
 import { projectDisplayName, projectUnitsLabel } from './ui/model'
 
 const app = document.querySelector<HTMLDivElement>('#app')
@@ -84,6 +86,16 @@ const featureController: FeatureController = new FeatureController({
   onAuthoringChanged() {
     rightPanel?.render()
     renderToolRail()
+  },
+})
+
+const buildingController = new BuildingComponentController({
+  getSession: () => controller.getSession(),
+  getViewer: () => controller.getViewer(),
+  persistManifest: (manifest) => controller.persistManifest(manifest),
+  isAuthoringBusy: () => featureController.isAuthoring(),
+  onChanged() {
+    rightPanel?.render()
   },
 })
 
@@ -525,6 +537,23 @@ rightPanel = mountRightPanel(frame.rightPanelMount, {
     startIsolateLoadAll: (featureId) => featureController.startIsolateLoadAll(featureId),
     stepIsolateSector: (delta) => featureController.stepIsolateSector(delta),
     stopIsolateLoadAll: () => featureController.stopIsolateLoadAll(),
+    getBuildingFaceFit: () => buildingController.getFaceFit(),
+    getBuildingFitNote: () => buildingController.getFitNote(),
+    startBuildingFaceFit: (featureId, kind) => buildingController.startFaceFit(featureId, kind as BuildingFaceKind),
+    acceptBuildingFaceFit: () => buildingController.acceptFaceFit(),
+    cancelBuildingFaceFit: () => buildingController.cancelFaceFit(),
+    renameBuildingFace: (featureId, faceId, name) => buildingController.renameFace(featureId, faceId, name),
+    setBuildingFaceVisibility: (featureId, faceId, visible) => buildingController.setFaceVisibility(featureId, faceId, visible),
+    removeBuildingFace: (featureId, faceId) => buildingController.removeFace(featureId, faceId),
+    addBuildingFaceFeature: (featureId, faceId, type) =>
+      buildingController.addFaceFeature(featureId, faceId, type as BuildingFaceFeatureType),
+    updateBuildingFeatureParam: (featureId, componentId, param, value) =>
+      buildingController.updateFaceFeatureParam(featureId, componentId, param, value),
+    updateBuildingFeatureType: (featureId, componentId, type) =>
+      buildingController.updateFaceFeatureType(featureId, componentId, type),
+    setBuildingFeatureVisibility: (featureId, componentId, visible) =>
+      buildingController.setFaceFeatureVisibility(featureId, componentId, visible),
+    removeBuildingFaceFeature: (featureId, componentId) => buildingController.removeFaceFeature(featureId, componentId),
   },
 })
 
