@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { FeatureController } from './features'
 import type { ProjectSession } from '../shared/ipc'
 import type { ProjectManifest } from '../shared/workbench-types'
+import { readRegionMetadata } from '../shared/regionMetadata'
 import type { AuthoringGeometryMode, AuthoringSnapshot } from '../viewer/authoring'
 import { AuthoringMachine } from '../viewer/authoring'
 import type { PlacementResolution } from '../viewer/snap'
@@ -10,6 +11,7 @@ import { makeManifest } from '../../tests/ui-fixtures'
 class FakeViewer {
   readonly machine = new AuthoringMachine()
   point = 0
+  nextPlacements: [number, number, number][] = []
   lastAllowSnap = true
   authoredEntries: Array<{ featureId: string; fill?: unknown; lines: unknown[] }> = []
   focusOverlay: { boundary: unknown; evidence: unknown[]; origin: unknown } | null = null
@@ -23,7 +25,8 @@ class FakeViewer {
 
   placeFeatureVertexAtPointer(_tolerancePx?: number, allowSnap = true): AuthoringSnapshot {
     this.lastAllowSnap = allowSnap
-    const placement: PlacementResolution = { snapped: false, world: [this.point++, 0, 0] }
+    const world = this.nextPlacements.shift() ?? [this.point++, 0, 0]
+    const placement: PlacementResolution = { snapped: false, world }
     this.machine.place(placement)
     return this.machine.snapshot()
   }
@@ -110,6 +113,54 @@ function makeObjectFeature(id: string, manifest: ProjectManifest): void {
     evidenceRefs: [{ kind: 'asset-point', coordinate: [10, 20, 5] }],
     display: { visible: true },
     metadata: {},
+  })
+}
+
+function makeRegionFeature(id: string, manifest: ProjectManifest): void {
+  manifest.features.push({
+    id,
+    simulationId: manifest.realitySimulation.id,
+    type: 'polyline',
+    name: 'Region 1 (generic)',
+    geometry: {
+      border: [
+        [0, 0, 10],
+        [10, 0, 11],
+        [10, 10, 12],
+        [0, 10, 13],
+      ],
+      closed: true,
+      breaklines: [],
+    },
+    createdAt: '2026-07-16T00:00:00.000Z',
+    modifiedAt: '2026-07-16T00:00:00.000Z',
+    family: 'region',
+    templateId: 'region.generic',
+    subtype: 'generic',
+    parameters: { heightBehavior: 'drape', verticalScale: 0, appearancePreset: 'default' },
+    evidenceRefs: [],
+    display: { visible: true },
+    metadata: {
+      region: {
+        edgeEvidence: [
+          { kind: 'asset-point', coordinate: [0, 0, 10] },
+          { kind: 'asset-point', coordinate: [10, 0, 11] },
+        ],
+        interiorEvidence: [],
+        surfacePoints: [],
+        surface: null,
+        visibility: {
+          boundary: true,
+          surface: true,
+          surfacePoints: true,
+          breaklines: true,
+          edgeEvidence: false,
+          interiorEvidence: false,
+          wireframe: true,
+        },
+        gridSpacing: 10,
+      },
+    },
   })
 }
 
@@ -277,6 +328,140 @@ describe('FeatureController isolate area', () => {
 
     const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-obj')
     expect(feature?.metadata?.isolateBoundary).toBeUndefined()
+  })
+})
+
+describe('FeatureController regions', () => {
+  it('stores the drawn boundary as authored geometry and edge evidence, not ordinary evidence refs', async () => {
+    const { controller, session } = makeController()
+    controller.startRegion('region.generic')
+    controller.handleViewerClick()
+    controller.handleViewerClick()
+    controller.handleViewerClick()
+    controller.closeBorder()
+
+    await controller.finishRegion()
+
+    const feature = session.manifest.features.at(-1)
+    expect(feature).toMatchObject({
+      family: 'region',
+      templateId: 'region.generic',
+      geometry: { border: [[0, 0, 0], [1, 0, 0], [2, 0, 0]], closed: true },
+      evidenceRefs: [],
+    })
+    const region = readRegionMetadata(feature!)
+    expect(region.edgeEvidence).toHaveLength(3)
+    expect(region.interiorEvidence).toHaveLength(0)
+  })
+
+  it('adds a manual surface point with preserved provenance', async () => {
+    const { controller, session } = makeController()
+    makeRegionFeature('feat-region', session.manifest)
+
+    controller.startRegionSurfacePoint('feat-region')
+    expect(controller.handleViewerClick()).toBe(true)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-region')!
+    const region = readRegionMetadata(feature)
+    expect(region.surfacePoints).toHaveLength(1)
+    expect(region.surfacePoints[0]).toMatchObject({ coordinate: [0, 0, 0], source: 'manual' })
+    expect(region.surfacePoints[0]?.evidence).toMatchObject({ kind: 'picked-coordinate', coordinate: [0, 0, 0] })
+  })
+
+  it('persists a region breakline separately from the boundary geometry', async () => {
+    const { controller, session, viewer } = makeController()
+    makeRegionFeature('feat-region', session.manifest)
+
+    controller.startRegionBreakline('feat-region')
+    viewer.nextPlacements = [
+      [3, 3, 10],
+      [7, 7, 12],
+    ]
+    controller.handleViewerClick()
+    controller.handleViewerClick()
+    await controller.finishRegionBreakline()
+
+    const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-region')!
+    expect(feature.geometry).toMatchObject({ breaklines: [[[3, 3, 10], [7, 7, 12]]] })
+    await controller.generateRegionSurface('feat-region')
+    const region = readRegionMetadata(session.manifest.features.find((candidate) => candidate.id === 'feat-region')!)
+    const surfacePositions = region.surface?.positions ?? []
+    expect(region.surface).not.toBeNull()
+    expect(surfacePositions).toContain(3)
+    expect(surfacePositions).toContain(7)
+  })
+
+  it('adds generated flat grid points inside the region boundary with source labeling', async () => {
+    const { controller, session } = makeController()
+    makeRegionFeature('feat-region', session.manifest)
+
+    await controller.addRegionGridPoints('feat-region', '5')
+
+    const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-region')!
+    const region = readRegionMetadata(feature)
+    expect(region.surfacePoints.length).toBeGreaterThan(0)
+    expect(region.gridMode).toBe('generated-flat')
+    expect(region.surfacePoints.every((point) => point.source === 'generated-grid')).toBe(true)
+    expect(region.surfacePoints.every((point) => point.coordinate[0] > 0 && point.coordinate[0] < 10)).toBe(true)
+    expect(region.surfacePoints.every((point) => point.coordinate[1] > 0 && point.coordinate[1] < 10)).toBe(true)
+  })
+
+  it('generates a stored surface mesh with triangle and elevation stats', async () => {
+    const { controller, session } = makeController()
+    makeRegionFeature('feat-region', session.manifest)
+    await controller.addRegionGridPoints('feat-region', '5')
+
+    await controller.generateRegionSurface('feat-region')
+
+    const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-region')!
+    const region = readRegionMetadata(feature)
+    expect(region.surface).not.toBeNull()
+    expect(region.surface?.triangleCount).toBeGreaterThan(0)
+    expect(region.surface?.positions.length).toBeGreaterThan(0)
+    expect(region.surface?.minElevation).not.toBeNull()
+  })
+
+  it('uses the region boundary as the default focus/isolate boundary', () => {
+    const { controller, session, viewer } = makeController()
+    makeRegionFeature('feat-region', session.manifest)
+
+    controller.setFocusedFeature('feat-region')
+
+    expect(viewer.focusOverlay).toMatchObject({
+      boundary: [[0, 0, 10], [10, 0, 11], [10, 10, 12], [0, 10, 13]],
+      evidence: [[0, 0, 10], [10, 0, 11]],
+      origin: null,
+    })
+    expect(viewer.isolateFocus).toEqual([[0, 0, 10], [10, 0, 11], [10, 10, 12], [0, 10, 13]])
+  })
+
+  it('supports Show All by clearing region focus while leaving the region record intact', () => {
+    const { controller, session, viewer } = makeController()
+    makeRegionFeature('feat-region', session.manifest)
+
+    controller.setFocusedFeature('feat-region')
+    controller.setFocusedFeature(null)
+
+    expect(viewer.focusOverlay).toBeNull()
+    expect(viewer.isolateFocus).toBeNull()
+  })
+
+  it('redraws the region boundary and refreshes edge provenance', async () => {
+    const { controller, session } = makeController()
+    makeRegionFeature('feat-region', session.manifest)
+
+    controller.startRegionBoundaryRedraw('feat-region')
+    controller.handleViewerClick()
+    controller.handleViewerClick()
+    controller.handleViewerClick()
+    await controller.finishRegionBoundaryRedraw()
+
+    const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-region')!
+    expect(feature.geometry).toMatchObject({ border: [[0, 0, 0], [1, 0, 0], [2, 0, 0]], closed: true })
+    const region = readRegionMetadata(feature)
+    expect(region.edgeEvidence).toHaveLength(3)
   })
 })
 

@@ -9,11 +9,21 @@
 import type { ProjectSession } from '../shared/ipc'
 import type { UtilitySystemId } from '../shared/utility-catalog'
 import type { ProjectManifest } from '../shared/workbench-types'
-import type { BuildingAuthoringView, IsolateLoadView, ObjectEditView, RegionAuthoringView, SimpleAuthoringView, SimpleFeatureFamily } from './features'
+import type {
+  BuildingAuthoringView,
+  IsolateLoadView,
+  ObjectEditView,
+  RegionAuthoringView,
+  RegionEditView,
+  SimpleAuthoringView,
+  SimpleFeatureFamily,
+} from './features'
 import type { BuildingFaceFitView } from './buildingController'
 import { buildBuildingEditorModel, buildBuildingRowsModel, type BuildingEditorModel } from './buildingModel'
 import { renderBuildingsListHtml, renderBuildingSectionsHtml } from './buildingsPanel'
 import { createObjectPreview3d, type ObjectPreview3d } from './objectPreview'
+import { buildRegionEditorModel } from './regionModel'
+import { renderRegionsTabHtml as renderRegionsTabContentHtml, type RegionDetailView, type RegionsTabView } from './regionsPanel'
 import { renderUtilitiesTabHtml } from './utilitiesPanel'
 import {
   buildUtilityAddModel,
@@ -38,7 +48,6 @@ import {
   type LineListItem,
   type MarkerListItem,
   type ObjectListItem,
-  type RegionListItem,
   type SimPanelModel,
   type WorkSurfaceModel,
 } from './model'
@@ -51,10 +60,22 @@ export interface RightPanelFeatureOps {
   lineTemplates(): { id: string; displayName: string }[]
   markerTemplates(): { id: string; displayName: string }[]
   getAuthoring(): RegionAuthoringView | null
+  getRegionEdit(): RegionEditView | null
+  getFocusedFeatureId(): string | null
   getBuildingAuthoring(): BuildingAuthoringView | null
   getSimpleAuthoring(): SimpleAuthoringView | null
   startObjectCreation(): void
   startRegion(templateId: string): void
+  startRegionSurfacePoint(featureId: string): void
+  startRegionBreakline(featureId: string): void
+  finishRegionBreakline(): Promise<void>
+  startRegionBoundaryRedraw(featureId: string): void
+  finishRegionBoundaryRedraw(): Promise<void>
+  cancelRegionEdit(): void
+  addRegionGridPoints(featureId: string, spacing: string): Promise<void>
+  generateRegionSurface(featureId: string): Promise<void>
+  updateRegionVisibility(featureId: string, key: string, visible: boolean): Promise<void>
+  updateRegionTemplate(featureId: string, templateId: string): Promise<void>
   startBuilding(templateId: string): void
   startObject(templateId: string): void
   startLine(templateId: string): void
@@ -118,14 +139,6 @@ export interface RightPanelDeps {
   buildIndex(assetId: string): Promise<void>
   generateSurfels(assetId: string): Promise<void>
   features: RightPanelFeatureOps
-}
-
-/** Everything the pure regions-tab renderer needs. */
-export interface RegionsTabView {
-  templates: { id: string; displayName: string }[]
-  authoring: RegionAuthoringView | null
-  list: RegionListItem[]
-  detail: FeatureDetailModel | null
 }
 
 /** Everything the pure buildings-tab renderer needs. */
@@ -202,7 +215,7 @@ export function renderSimPanelHtml(
   const activeTab = model.tabs.find((tab) => tab.id === state.activeTab) ?? model.tabs[0]
   const contentHtml =
     activeTab.id === 'regions' && regions
-      ? renderRegionsTabHtml(regions)
+      ? renderRegionsTabContentHtml(regions)
       : activeTab.id === 'buildings' && buildings
         ? renderBuildingsTabHtml(buildings)
         : activeTab.id === 'objects' && simpleTabs?.object
@@ -261,34 +274,7 @@ function renderStagedTabHtml(tabId: string, count: number, addLabel: string): st
 }
 
 export function renderRegionsTabHtml(view: RegionsTabView): string {
-  if (view.detail) return renderFeatureDetailHtml(view.detail)
-  if (view.authoring) return renderRegionAuthoringHtml(view.authoring)
-
-  const listHtml =
-    view.list.length === 0
-      ? `<div class="tab-placeholder">${escapeHtml(SIM_TAB_PLACEHOLDER.regions!)}</div>`
-      : view.list
-          .map(
-            (item) => `
-      <button class="feature-row" data-action="feature-select" data-feature-id="${escapeHtml(item.id)}">
-        <span class="feature-name">${escapeHtml(item.name)}</span>
-        <span class="feature-sub">${escapeHtml(item.subtype)} - ${item.borderVertexCount} border vertices, ${item.breaklineCount} breakline(s)</span>
-        <span class="evidence-badge" title="Evidence: snap-backed vs free-placed vertices">${item.snappedEvidenceCount} snapped / ${item.freeEvidenceCount} free</span>
-      </button>`,
-          )
-          .join('')
-
-  const optionsHtml = view.templates
-    .map((template) => `<option value="${escapeHtml(template.id)}">${escapeHtml(template.displayName)}</option>`)
-    .join('')
-
-  return `
-      <div class="feature-list">${listHtml}</div>
-      <div class="region-add-row">
-        <select id="region-template-select" title="Region subtype (from the template catalog)">${optionsHtml}</select>
-        <button class="sim-add-button" data-action="region-add">+ Add region</button>
-      </div>
-  `
+  return renderRegionsTabContentHtml(view)
 }
 
 export function renderBuildingsTabHtml(view: BuildingsTabView): string {
@@ -382,40 +368,6 @@ function renderObjectRowHtml(item: ObjectListItem): string {
           </button>
         </span>
       </div>`
-}
-
-function renderRegionAuthoringHtml(authoring: RegionAuthoringView): string {
-  const evidenceLine = `<div class="authoring-evidence">${authoring.snappedCount} snapped / ${authoring.freeCount} free placed</div>`
-  const cancelButton = `<button data-action="region-cancel">Cancel</button>`
-  if (authoring.phase === 'border') {
-    return `
-      <div class="authoring-rail" data-phase="border">
-        <div class="authoring-hint">Region (${escapeHtml(authoring.subtype)}): click in the viewer to place border vertices. ${authoring.activeVertexCount} placed.</div>
-        ${evidenceLine}
-        <button data-action="region-close-border"${authoring.canCloseBorder ? '' : ' disabled'}>Close border</button>
-        ${cancelButton}
-      </div>
-    `
-  }
-  if (authoring.phase === 'breakline') {
-    return `
-      <div class="authoring-rail" data-phase="breakline">
-        <div class="authoring-hint">Breakline: click in the viewer to place vertices. ${authoring.activeVertexCount} placed.</div>
-        ${evidenceLine}
-        <button data-action="region-finish-breakline"${authoring.canFinishBreakline ? '' : ' disabled'}>Finish breakline</button>
-        ${cancelButton}
-      </div>
-    `
-  }
-  return `
-      <div class="authoring-rail" data-phase="review">
-        <div class="authoring-hint">Border closed (${authoring.borderVertexCount} vertices, ${authoring.breaklineCount} breakline(s)). Add breaklines or finish.</div>
-        ${evidenceLine}
-        <button data-action="region-add-breakline">Add breakline</button>
-        <button data-action="region-finish">Finish region</button>
-        ${cancelButton}
-      </div>
-  `
 }
 
 function renderBuildingAuthoringHtml(authoring: BuildingAuthoringView): string {
@@ -866,6 +818,7 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
 
   function closeFeatureDetail(): void {
     simState.selectedFeatureId = null
+    deps.features.cancelRegionEdit()
     deps.features.cancelObjectEdit()
     deps.features.cancelBuildingFaceFit()
     deps.features.setFocusedFeature(null)
@@ -874,11 +827,27 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
   function buildRegionsView(manifest: ProjectManifest): RegionsTabView {
     const detail = simState.selectedFeatureId ? buildFeatureDetailModel(manifest, simState.selectedFeatureId) : null
     if (simState.selectedFeatureId && !detail) simState.selectedFeatureId = null // deleted elsewhere
+    const regionFeature =
+      detail?.family === 'region' ? manifest.features.find((candidate) => candidate.id === detail.id) ?? null : null
+    const regionEditor = regionFeature ? buildRegionEditorModel(regionFeature, deps.features.getFocusedFeatureId() === regionFeature.id) : null
+    const regionDetail: RegionDetailView | null =
+      detail?.family === 'region' && regionEditor
+        ? {
+            id: detail.id,
+            name: detail.name,
+            family: detail.family,
+            subtype: detail.subtype,
+            templateId: detail.templateId,
+            authorship: detail.authorship,
+            editor: regionEditor,
+          }
+        : null
     return {
       templates: deps.features.regionTemplates(),
       authoring: deps.features.getAuthoring(),
       list: buildRegionListModel(manifest),
-      detail,
+      detail: regionDetail,
+      edit: deps.features.getRegionEdit(),
     }
   }
 
@@ -1060,6 +1029,49 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
       void deps.features.finishRegion()
       return
     }
+    if (action === 'region-add-surface-point' && featureId) {
+      deps.features.startRegionSurfacePoint(featureId)
+      return
+    }
+    if (action === 'region-add-breakline-detail' && featureId) {
+      deps.features.startRegionBreakline(featureId)
+      return
+    }
+    if (action === 'region-redraw-boundary' && featureId) {
+      deps.features.startRegionBoundaryRedraw(featureId)
+      return
+    }
+    if (action === 'region-show-focus' && featureId) {
+      deps.features.setFocusedFeature(featureId)
+      render()
+      return
+    }
+    if (action === 'region-show-all') {
+      deps.features.setFocusedFeature(null)
+      render()
+      return
+    }
+    if (action === 'region-edit-finish-breakline') {
+      void deps.features.finishRegionBreakline()
+      return
+    }
+    if (action === 'region-edit-finish-boundary') {
+      void deps.features.finishRegionBoundaryRedraw()
+      return
+    }
+    if (action === 'region-edit-cancel') {
+      deps.features.cancelRegionEdit()
+      return
+    }
+    if (action === 'region-add-grid' && featureId) {
+      const input = mount.querySelector<HTMLInputElement>('#region-grid-spacing')
+      if (input) void deps.features.addRegionGridPoints(featureId, input.value)
+      return
+    }
+    if (action === 'region-generate-surface' && featureId) {
+      void deps.features.generateRegionSurface(featureId)
+      return
+    }
     if (action === 'building-finish') {
       void deps.features.finishBuilding()
       return
@@ -1204,6 +1216,14 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
     if (target.dataset.action === 'feature-param' && target.dataset.featureId && target.dataset.paramName) {
       const value = target instanceof HTMLInputElement && target.type === 'checkbox' ? String(target.checked) : (target as HTMLInputElement | HTMLSelectElement).value
       void deps.features.updateParam(target.dataset.featureId, target.dataset.paramName, value)
+      return
+    }
+    if (target.dataset.action === 'feature-region-type' && target.dataset.featureId && target instanceof HTMLSelectElement) {
+      void deps.features.updateRegionTemplate(target.dataset.featureId, target.value)
+      return
+    }
+    if (target.dataset.action === 'region-visibility' && target.dataset.featureId && target.dataset.visibilityKey && target instanceof HTMLInputElement) {
+      void deps.features.updateRegionVisibility(target.dataset.featureId, target.dataset.visibilityKey, target.checked)
       return
     }
     if (target.dataset.action === 'feature-object-type' && target.dataset.featureId && target instanceof HTMLSelectElement) {

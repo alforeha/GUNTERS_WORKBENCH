@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import type { FeatureRecord } from '../src/shared/workbench-types'
 import type { BuildingAuthoringView, RegionAuthoringView } from '../src/ui/features'
+import { buildRegionEditorModel } from '../src/ui/regionModel'
 import {
   buildBuildingListModel,
   buildFeatureDetailModel,
@@ -21,9 +22,9 @@ import {
   renderSimPanelHtml,
   renderWorkSurfaceHtml,
   type BuildingsTabView,
-  type RegionsTabView,
   type SimpleTabView,
 } from '../src/ui/rightPanel'
+import type { RegionsTabView } from '../src/ui/regionsPanel'
 import { SOURCE_ASSET_ID, deepFreeze, makeFeature, makeManifest } from './ui-fixtures'
 
 function makeRegionFeature(id = 'feat-region-1'): FeatureRecord {
@@ -48,13 +49,39 @@ function makeRegionFeature(id = 'feat-region-1'): FeatureRecord {
         ],
       ],
     },
-    evidenceRefs: [
-      { kind: 'asset-point', coordinate: [0, 0, 10], assetId: SOURCE_ASSET_ID },
-      { kind: 'asset-vertex', coordinate: [10, 0, 10], featureId: 'feat-other' },
-      { kind: 'picked-coordinate', coordinate: [10, 10, 10] },
-    ],
+    evidenceRefs: [],
     parameters: { heightBehavior: 'drape', verticalScale: 0.2 },
     representations: { cad: { layer: 'SURF-GRASS', hatch: 'GRASS' } },
+    metadata: {
+      region: {
+        edgeEvidence: [
+          { kind: 'asset-point', coordinate: [0, 0, 10], assetId: SOURCE_ASSET_ID },
+          { kind: 'asset-vertex', coordinate: [10, 0, 10], featureId: 'feat-other' },
+          { kind: 'picked-coordinate', coordinate: [10, 10, 10] },
+        ],
+        interiorEvidence: [],
+        surfacePoints: [{ id: 'rsp-1', coordinate: [5, 5, 11], source: 'manual' }],
+        surface: {
+          positions: [0, 0, 10, 10, 0, 10, 10, 10, 10, 5, 5, 11],
+          indices: [0, 1, 3, 1, 2, 3],
+          generatedAt: '2026-07-16T12:00:00.000Z',
+          triangleCount: 2,
+          minElevation: 10,
+          maxElevation: 11,
+          averageElevation: 10.25,
+        },
+        visibility: {
+          boundary: true,
+          surface: true,
+          surfacePoints: true,
+          breaklines: true,
+          edgeEvidence: false,
+          interiorEvidence: false,
+          wireframe: true,
+        },
+        gridSpacing: 5,
+      },
+    },
   }
 }
 
@@ -144,12 +171,14 @@ function makeMarkerFeature(id = 'feat-marker-1'): FeatureRecord {
 function makeRegionsView(overrides: Partial<RegionsTabView> = {}): RegionsTabView {
   return {
     templates: [
+      { id: 'region.generic', displayName: 'Generic' },
       { id: 'region.grass', displayName: 'Grass' },
-      { id: 'region.pavement', displayName: 'Pavement' },
+      { id: 'region.pavement', displayName: 'Asphalt / pavement' },
     ],
     authoring: null,
     list: [],
     detail: null,
+    edit: null,
     ...overrides,
   }
 }
@@ -251,7 +280,7 @@ describe('buildSimPanelModel', () => {
 })
 
 describe('region list + feature detail view-models', () => {
-  it('lists regions with geometry counts and the snapped/free evidence split', () => {
+  it('lists regions with geometry counts and separate edge/interior evidence counts', () => {
     const list = buildRegionListModel(makeManifest({ features: [makeRegionFeature()] }))
     expect(list).toHaveLength(1)
     expect(list[0]).toMatchObject({
@@ -260,21 +289,22 @@ describe('region list + feature detail view-models', () => {
       subtype: 'grass',
       borderVertexCount: 3,
       breaklineCount: 1,
-      snappedEvidenceCount: 2,
-      freeEvidenceCount: 1,
+      surfacePointCount: 1,
+      edgeEvidenceCount: 3,
+      interiorEvidenceCount: 0,
     })
   })
 
-  it('builds a detail model with params, cad reference names, and evidence summary', () => {
+  it('builds a generic region detail model with params and cad reference names', () => {
     const detail = buildFeatureDetailModel(makeManifest({ features: [makeRegionFeature()] }), 'feat-region-1')
     expect(detail).toMatchObject({
       family: 'region',
       subtype: 'grass',
       templateId: 'region.grass',
       authorship: 'authored',
-      evidenceTotal: 3,
-      evidenceSnapped: 2,
-      evidenceFree: 1,
+      evidenceTotal: 0,
+      evidenceSnapped: 0,
+      evidenceFree: 0,
     })
     expect(detail?.params.find((param) => param.name === 'heightBehavior')).toMatchObject({
       label: 'Height behavior',
@@ -282,7 +312,7 @@ describe('region list + feature detail view-models', () => {
       type: 'enum',
       editable: true,
     })
-    expect(detail?.evidenceBadges).toEqual(['authored', 'snapped-to-cloud', 'snapped-to-feature', 'free-placement'])
+    expect(detail?.evidenceBadges).toEqual(['authored'])
     expect(detail?.cadRefs).toContainEqual({ name: 'hatch', value: 'GRASS' })
     expect(buildFeatureDetailModel(makeManifest(), 'feat-missing')).toBeNull()
   })
@@ -504,10 +534,11 @@ describe('live regions tab', () => {
   it('renders a LIVE + Add region with the subtype dropdown from the catalog', () => {
     const html = renderSimPanelHtml(buildSimPanelModel(makeManifest()), state, makeRegionsView())
     expect(html).toContain('id="region-template-select"')
+    expect(html).toContain('<option value="region.generic">Generic</option>')
     expect(html).toContain('<option value="region.grass">Grass</option>')
     expect(html).toMatch(/<button class="sim-add-button" data-action="region-add">\+ Add region<\/button>/)
     expect(html).not.toContain('+ Add region (planned)')
-    expect(html).toContain('No regions yet. Pick a subtype')
+    expect(html).toContain('No regions yet. Pick a type below')
   })
 
   it('lists authored regions with selectable rows and the evidence badge', () => {
@@ -517,7 +548,8 @@ describe('live regions tab', () => {
     expect(html).toContain('data-action="feature-select"')
     expect(html).toContain('data-feature-id="feat-region-1"')
     expect(html).toContain('Region 1 (grass)')
-    expect(html).toContain('2 snapped / 1 free')
+    expect(html).toContain('1 point input(s), 1 breakline(s)')
+    expect(html).toContain('3 edge refs')
   })
 
   it('border phase: place hint + Close border gated on the 3-vertex minimum', () => {
@@ -526,7 +558,7 @@ describe('live regions tab', () => {
       state,
       makeRegionsView({ authoring: makeAuthoringView({ activeVertexCount: 2 }) }),
     )
-    expect(tooFew).toContain('click in the viewer to place border vertices')
+    expect(tooFew).toContain('click in the viewer to place the authored boundary edge')
     expect(tooFew).toMatch(/data-action="region-close-border" disabled/)
     expect(tooFew).toContain('data-action="region-cancel"')
 
@@ -535,7 +567,7 @@ describe('live regions tab', () => {
       state,
       makeRegionsView({ authoring: makeAuthoringView({ activeVertexCount: 3, canCloseBorder: true }) }),
     )
-    expect(enough).toMatch(/data-action="region-close-border">Close border/)
+    expect(enough).toMatch(/data-action="region-close-border">Close boundary/)
   })
 
   it('review phase: offers Add breakline / Finish region and discloses the evidence split', () => {
@@ -546,7 +578,7 @@ describe('live regions tab', () => {
         authoring: makeAuthoringView({ phase: 'review', borderVertexCount: 4, breaklineCount: 1, snappedCount: 3, freeCount: 3 }),
       }),
     )
-    expect(html).toContain('Border closed (4 vertices, 1 breakline(s))')
+    expect(html).toContain('Boundary closed (4 vertices, 1 breakline(s))')
     expect(html).toContain('data-action="region-add-breakline"')
     expect(html).toContain('data-action="region-finish"')
     expect(html).toContain('3 snapped / 3 free placed')
@@ -561,21 +593,42 @@ describe('live regions tab', () => {
     expect(html).toMatch(/data-action="region-finish-breakline" disabled/)
   })
 
-  it('feature detail: rename input, params, CAD reference names, evidence summary, delete', () => {
+  it('feature detail: region workflow sections, focus controls, generated-grid wording, and boundary redraw action', () => {
     const manifest = makeManifest({ features: [makeRegionFeature()] })
     const detail = buildFeatureDetailModel(manifest, 'feat-region-1')
     const html = renderSimPanelHtml(
       buildSimPanelModel(manifest),
       { ...state, selectedFeatureId: 'feat-region-1' },
-      makeRegionsView({ detail }),
+      makeRegionsView({
+        detail: detail
+          ? {
+              id: detail.id,
+              name: detail.name,
+              family: detail.family,
+              subtype: detail.subtype,
+              templateId: detail.templateId,
+              authorship: detail.authorship,
+              editor: buildRegionEditorModel(makeRegionFeature())!,
+            }
+          : null,
+      }),
     )
     expect(html).toContain('data-action="feature-rename"')
     expect(html).toContain('value="Region 1 (grass)"')
-    expect(html).toContain('data-action="feature-param"')
-    expect(html).toContain('data-param-name="heightBehavior"')
-    expect(html).toContain('GRASS')
-    expect(html).toContain('snapped-to-cloud')
-    expect(html).toContain('3 refs - 2 snapped, 1 free placed')
+    expect(html).toContain('Boundary / Edge')
+    expect(html).toContain('Surface Inputs')
+    expect(html).toContain('Generated Surface')
+    expect(html).toContain('Source / Provenance')
+    expect(html).toContain('data-action="region-show-all"')
+    expect(html).toContain('data-action="region-redraw-boundary"')
+    expect(html).toContain('data-action="feature-region-type"')
+    expect(html).toContain('data-action="region-add-surface-point"')
+    expect(html).toContain('data-action="region-add-grid"')
+    expect(html).toContain('data-action="region-generate-surface"')
+    expect(html).toContain('Add generated grid points')
+    expect(html).toContain('Surface wireframe')
+    expect(html).toContain('Boundary edge provenance refs: 3')
+    expect(html).toContain('Triangles')
     expect(html).toContain('data-action="feature-delete"')
     expect(html).toContain('data-action="feature-back"')
   })

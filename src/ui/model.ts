@@ -22,6 +22,7 @@ import {
   type ObjectCategoryId,
   type TemplateParamSpec,
 } from '../shared/template-catalog'
+import { readRegionMetadata } from '../shared/regionMetadata'
 import { isolateBoundaryFromFeature } from '../viewer/generators'
 
 // ---------------------------------------------------------------------------
@@ -498,8 +499,10 @@ export interface RegionListItem {
   subtype: string
   borderVertexCount: number
   breaklineCount: number
-  snappedEvidenceCount: number
-  freeEvidenceCount: number
+  surfacePointCount: number
+  edgeEvidenceCount: number
+  interiorEvidenceCount: number
+  visible: boolean
 }
 
 export interface BuildingListItem {
@@ -553,16 +556,17 @@ export function buildRegionListModel(manifest: ProjectManifest | null): RegionLi
       const geometry = feature.geometry as { border?: unknown; breaklines?: unknown }
       const border = Array.isArray(geometry.border) ? geometry.border : []
       const breaklines = Array.isArray(geometry.breaklines) ? geometry.breaklines : []
-      const evidence = feature.evidenceRefs ?? []
-      const snapped = evidence.filter((ref) => ref.kind !== 'picked-coordinate' && ref.kind !== 'manual-note').length
+      const metadata = readRegionMetadata(feature)
       return {
         id: feature.id,
         name: feature.name,
         subtype: feature.subtype ?? 'unknown',
         borderVertexCount: border.length,
         breaklineCount: breaklines.length,
-        snappedEvidenceCount: snapped,
-        freeEvidenceCount: evidence.length - snapped,
+        surfacePointCount: metadata.surfacePoints.length,
+        edgeEvidenceCount: metadata.edgeEvidence.length,
+        interiorEvidenceCount: metadata.interiorEvidence.length,
+        visible: feature.display?.visible !== false,
       }
     })
 }

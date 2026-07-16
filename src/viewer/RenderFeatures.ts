@@ -14,6 +14,8 @@ export interface FeatureDisplayEntry {
   fill?: { positions: Float64Array; indices: Uint32Array };
   /** Polylines (outline, breaklines) in survey coordinates. */
   lines: Vec3[][];
+  /** Point markers in survey coordinates (surface points, evidence cues). */
+  markers?: { points: Vec3[]; color: number; size: number; name: string }[];
   fillColor: number;
   lineColor: number;
 }
@@ -97,6 +99,10 @@ export class RenderFeatures {
           vertices.push({ featureId: entry.featureId, world: line[i]! });
           if (i > 0) edges.push({ featureId: entry.featureId, a: line[i - 1]!, b: line[i]! });
         }
+      }
+      for (const marker of entry.markers ?? []) {
+        if (marker.points.length === 0) continue;
+        this.featureRoot.add(buildScreenPoints(marker.points, this.origin, marker.color, marker.size, marker.name));
       }
     }
     this.snapGeometry = { vertices, edges };

@@ -14,6 +14,12 @@ import {
   type ObjectCategoryId,
   type TemplateParamSpec,
 } from '../shared/template-catalog'
+import {
+  defaultRegionMetadata,
+  readRegionMetadata,
+  writeRegionMetadata,
+  type RegionVisibilityKey,
+} from '../shared/regionMetadata'
 import { utilitySystemLabel, utilityTemplateGeometry } from '../shared/utility-catalog'
 import type { EvidenceRef, FeatureRecord, ProjectManifest } from '../shared/workbench-types'
 import type { ViewerEngine } from '../viewer'
@@ -24,13 +30,20 @@ import {
   buildBuildingDisplay,
   buildLineDisplay,
   buildPointPrimitiveDisplay,
-  buildRegionPatch,
   buildingGeometryFromFeature,
   lineGeometryFromFeature,
   pointPrimitiveGeometryFromFeature,
-  regionGeometryFromFeature,
   type BuildingRoofType,
 } from '../viewer/generators'
+import {
+  averageRegionElevation,
+  buildRegionPatch,
+  buildStoredRegionSurface,
+  buildSurfaceWireframeLines,
+  generateGridPointsInRegion,
+  regionBoundaryFromFeature,
+  regionGeometryFromFeature,
+} from '../viewer/regionGenerators'
 import { buildUtilityDisplayEntry, utilityOriginFromFeature } from '../viewer/utilityGenerators'
 import { buildBuildingComponentDisplayEntries, focusBoundaryFromFeature, isEnvelopeBuilding } from '../viewer/buildingGenerators'
 import { emptyBuildingComponents } from '../shared/building-catalog'
@@ -59,6 +72,15 @@ export interface RegionAuthoringView {
   canFinishBreakline: boolean
   snappedCount: number
   freeCount: number
+}
+
+export type RegionEditKind = 'surface-point' | 'breakline' | 'boundary'
+
+export interface RegionEditView {
+  featureId: string
+  kind: RegionEditKind
+  activeVertexCount: number
+  canFinish: boolean
 }
 
 export type BuildingAuthoringPhase = 'footprint' | 'review'
@@ -156,6 +178,7 @@ const DEFAULT_OBJECT_TEMPLATE_ID = 'object.box'
 
 /** Reality display tints per region subtype (display hint only, not persisted). */
 const REGION_FILL_COLOR: Record<string, number> = {
+  generic: 0x8fa3b6,
   grass: 0x4caf50,
   pavement: 0x757575,
   gravel: 0xbdb76b,
@@ -174,6 +197,7 @@ export class FeatureController {
   private readonly deps: FeatureControllerDeps
   private phase: RegionAuthoringPhase | null = null
   private pending: PendingRegion | null = null
+  private regionEdit: { featureId: string; kind: RegionEditKind } | null = null
   private buildingPhase: BuildingAuthoringPhase | null = null
   private pendingBuilding: PendingBuilding | null = null
   private simplePhase: SimpleAuthoringPhase | null = null
@@ -253,6 +277,22 @@ export class FeatureController {
     }
   }
 
+  getRegionEdit(): RegionEditView | null {
+    if (!this.regionEdit) return null
+    const draft = this.deps.getViewer()?.getFeatureAuthoringSnapshot().draft
+    const count = draft?.vertices.length ?? 0
+    return {
+      featureId: this.regionEdit.featureId,
+      kind: this.regionEdit.kind,
+      activeVertexCount: count,
+      canFinish: this.regionEdit.kind === 'breakline' ? count >= 2 : this.regionEdit.kind === 'boundary' ? count >= 3 : count >= 1,
+    }
+  }
+
+  getFocusedFeatureId(): string | null {
+    return this.focusedFeatureId
+  }
+
   getSimpleAuthoring(): SimpleAuthoringView | null {
     if (!this.simplePhase || !this.pendingSimple) return null
     const viewer = this.deps.getViewer()
@@ -275,7 +315,7 @@ export class FeatureController {
   }
 
   isAuthoring(): boolean {
-    return this.phase !== null || this.buildingPhase !== null || this.simplePhase !== null || this.objectEdit !== null
+    return this.phase !== null || this.regionEdit !== null || this.buildingPhase !== null || this.simplePhase !== null || this.objectEdit !== null
   }
 
   getObjectEdit(): ObjectEditView | null {
@@ -504,7 +544,7 @@ export class FeatureController {
     const feature = this.focusedFeatureId
       ? this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === this.focusedFeatureId)
       : null
-    if (!feature || !isRefinableFamily(feature)) {
+    if (!feature || (!isRefinableFamily(feature) && !isRegionFocusFamily(feature))) {
       viewer.setFeatureFocusOverlay(null)
       viewer.setIsolateFocus(null)
       return
@@ -515,14 +555,17 @@ export class FeatureController {
       : feature.family === 'utility'
         ? utilityOriginFromFeature(feature)
         : null
-    const boundary = focusBoundaryFromFeature(feature)
+    const boundary = isRegionFocusFamily(feature) ? regionBoundaryFromFeature(feature) : focusBoundaryFromFeature(feature)
+    const region = isRegionFocusFamily(feature) ? readRegionMetadata(feature) : null
     // The active load-all sector renders as a rect only when the area actually
     // split - a single full-area sector would just retrace the boundary bbox.
     const load = this.isolateLoad?.featureId === feature.id ? this.isolateLoad : null
     const sector = load && load.sectors.length > 1 ? load.sectors[load.active]! : null
     viewer.setFeatureFocusOverlay({
       boundary,
-      evidence: (feature.evidenceRefs ?? []).map((ref) => [...ref.coordinate] as Vec3),
+      evidence: region
+        ? [...region.edgeEvidence, ...region.interiorEvidence].map((ref) => [...ref.coordinate] as Vec3)
+        : (feature.evidenceRefs ?? []).map((ref) => [...ref.coordinate] as Vec3),
       origin,
       sectorRect: sector && boundary ? { ...sector, z: boundary[0]![2] } : null,
     })
@@ -670,6 +713,18 @@ export class FeatureController {
 
   /** Routed from the viewer-host click handler; true when the click was consumed. */
   handleViewerClick(): boolean {
+    if (this.regionEdit) {
+      const viewer = this.deps.getViewer()
+      if (!viewer) return false
+      const snapshot = viewer.placeFeatureVertexAtPointer(undefined, true)
+      if (this.regionEdit.kind === 'surface-point') {
+        void this.persistRegionSurfacePoint(snapshot)
+      } else {
+        this.refreshRegionEditDraftPreview()
+        this.deps.onAuthoringChanged()
+      }
+      return true
+    }
     if (this.objectEdit?.kind === 'evidence') {
       void this.addEvidenceAtPointer()
       return true
@@ -801,17 +856,20 @@ export class FeatureController {
       subtype: this.pending.subtype,
       authorship: 'authored',
       lifecycleStatus: 'authored',
-      evidenceRefs: [
-        ...this.pending.border.map((vertex) => vertex.evidence),
-        ...this.pending.breaklines.flat().map((vertex) => vertex.evidence),
-      ],
+      evidenceRefs: [],
       parameters: Object.fromEntries((template?.paramSchema ?? []).map((param) => [param.name, param.default])),
       representations: {
         ...(template?.cad ? { cad: { ...template.cad } } : {}),
         ...(template?.report ? { report: { ...template.report } } : {}),
       },
       display: { visible: true },
-      metadata: {},
+      metadata: writeRegionMetadata(
+        { metadata: {} } as FeatureRecord,
+        {
+          ...defaultRegionMetadata(),
+          edgeEvidence: this.pending.border.map((vertex) => vertex.evidence),
+        },
+      ),
     }
     manifest.features.push(record)
     this.clearAuthoring()
@@ -946,6 +1004,169 @@ export class FeatureController {
   cancel(): void {
     this.clearAuthoring()
     this.deps.onAuthoringChanged()
+  }
+
+  startRegionSurfacePoint(featureId: string): void {
+    const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature || feature.family !== 'region' || this.isAuthoring()) return
+    const viewer = this.deps.ensureViewer()
+    viewer.startFeatureAuthoring('region', feature.templateId ?? null, 'point')
+    this.regionEdit = { featureId, kind: 'surface-point' }
+    this.deps.onAuthoringChanged()
+  }
+
+  startRegionBreakline(featureId: string): void {
+    const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature || feature.family !== 'region' || this.isAuthoring()) return
+    const viewer = this.deps.ensureViewer()
+    viewer.startFeatureAuthoring('line', feature.templateId ?? null, 'polyline')
+    this.regionEdit = { featureId, kind: 'breakline' }
+    this.refreshRegionEditDraftPreview()
+    this.deps.onAuthoringChanged()
+  }
+
+  startRegionBoundaryRedraw(featureId: string): void {
+    const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature || feature.family !== 'region' || this.isAuthoring()) return
+    const viewer = this.deps.ensureViewer()
+    viewer.startFeatureAuthoring('region', feature.templateId ?? null, 'polygon')
+    this.regionEdit = { featureId, kind: 'boundary' }
+    this.refreshRegionEditDraftPreview()
+    this.deps.onAuthoringChanged()
+  }
+
+  async finishRegionBreakline(): Promise<void> {
+    const session = this.deps.getSession()
+    const viewer = this.deps.getViewer()
+    if (!session || !viewer || this.regionEdit?.kind !== 'breakline') return
+    viewer.requestCloseFeatureAuthoring()
+    const snapshot = viewer.confirmFeatureAuthoring()
+    if (snapshot.state !== 'complete' || !snapshot.draft || snapshot.draft.vertices.length < 2) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === this.regionEdit!.featureId)
+    const geometry = feature ? regionGeometryFromFeature(feature) : null
+    if (!feature || feature.family !== 'region' || !geometry) return
+    const region = readRegionMetadata(feature)
+    geometry.breaklines.push(snapshot.draft.vertices.map((vertex) => [...vertex.world] as Vec3))
+    feature.geometry = { ...feature.geometry, breaklines: geometry.breaklines }
+    region.surface = null
+    feature.metadata = writeRegionMetadata(feature, region)
+    feature.modifiedAt = new Date().toISOString()
+    this.clearAuthoring()
+    await this.deps.persistManifest(manifest)
+  }
+
+  async finishRegionBoundaryRedraw(): Promise<void> {
+    const session = this.deps.getSession()
+    const viewer = this.deps.getViewer()
+    if (!session || !viewer || this.regionEdit?.kind !== 'boundary') return
+    viewer.requestCloseFeatureAuthoring()
+    const snapshot = viewer.confirmFeatureAuthoring()
+    if (snapshot.state !== 'complete' || !snapshot.draft || snapshot.draft.vertices.length < 3) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === this.regionEdit!.featureId)
+    if (!feature || feature.family !== 'region') return
+    const region = readRegionMetadata(feature)
+    feature.geometry = {
+      ...feature.geometry,
+      border: snapshot.draft.vertices.map((vertex) => [...vertex.world] as Vec3),
+      closed: true,
+    }
+    region.edgeEvidence = snapshot.draft.vertices.map((vertex) => vertex.evidence)
+    region.surface = null
+    feature.metadata = writeRegionMetadata(feature, region)
+    feature.modifiedAt = new Date().toISOString()
+    this.clearAuthoring()
+    await this.deps.persistManifest(manifest)
+  }
+
+  async addRegionGridPoints(featureId: string, rawSpacing: string): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const spacing = Number(rawSpacing)
+    if (!Number.isFinite(spacing) || spacing <= 0) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    const geometry = feature ? regionGeometryFromFeature(feature) : null
+    if (!feature || feature.family !== 'region' || !geometry) return
+    const region = readRegionMetadata(feature)
+    const elevation = averageRegionElevation(geometry.border, region.surfacePoints)
+    const generated = generateGridPointsInRegion(geometry.border, spacing, elevation)
+    const seen = new Set(region.surfacePoints.map((point) => point.coordinate.join(',')))
+    for (const point of generated) {
+      const key = point.join(',')
+      if (seen.has(key)) continue
+      seen.add(key)
+      region.surfacePoints.push({
+        id: `rsp-${crypto.randomUUID()}`,
+        coordinate: [...point] as [number, number, number],
+        source: 'generated-grid',
+      })
+    }
+    region.gridSpacing = spacing
+    region.gridMode = 'generated-flat'
+    region.surface = null
+    feature.metadata = writeRegionMetadata(feature, region)
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  async generateRegionSurface(featureId: string): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    const geometry = feature ? regionGeometryFromFeature(feature) : null
+    if (!feature || feature.family !== 'region' || !geometry) return
+    const region = readRegionMetadata(feature)
+    const patch = buildRegionPatch({
+      border: geometry.border,
+      closed: geometry.closed,
+      breaklines: geometry.breaklines,
+      surfacePoints: region.surfacePoints.map((point) => point.coordinate as Vec3),
+    })
+    region.surface = buildStoredRegionSurface(patch, new Date().toISOString())
+    feature.metadata = writeRegionMetadata(feature, region)
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  cancelRegionEdit(): void {
+    if (!this.regionEdit) return
+    this.clearAuthoring()
+    this.deps.onAuthoringChanged()
+  }
+
+  async updateRegionVisibility(featureId: string, key: RegionVisibilityKey, visible: boolean): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    if (!feature || feature.family !== 'region') return
+    const region = readRegionMetadata(feature)
+    region.visibility[key] = visible
+    feature.metadata = writeRegionMetadata(feature, region)
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
+  async updateRegionTemplate(featureId: string, templateId: string): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    const nextTemplate = getTemplate(templateId)
+    if (!feature || feature.family !== 'region' || !nextTemplate || nextTemplate.family !== 'region') return
+    const previousTemplate = feature.templateId ? getTemplate(feature.templateId) : null
+    feature.templateId = nextTemplate.id
+    feature.subtype = nextTemplate.subtype
+    feature.parameters = remapTemplateParameters(feature.parameters ?? {}, previousTemplate, nextTemplate)
+    feature.representations = {
+      ...(nextTemplate.cad ? { cad: { ...nextTemplate.cad } } : {}),
+      ...(nextTemplate.report ? { report: { ...nextTemplate.report } } : {}),
+    }
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
   }
 
   async renameFeature(featureId: string, name: string): Promise<void> {
@@ -1105,15 +1326,48 @@ export class FeatureController {
       if (feature.family === 'region') {
         const geometry = regionGeometryFromFeature(feature)
         if (!geometry) continue
-        const patch = buildRegionPatch(geometry)
+        const region = readRegionMetadata(feature)
         const color = regionFillColor(feature.subtype)
-        entries.push({
-          featureId: feature.id,
-          ...(patch.indices.length > 0 ? { fill: { positions: patch.positions, indices: patch.indices } } : {}),
-          lines: [patch.outline, ...patch.breaklines],
-          fillColor: color,
-          lineColor: color,
-        })
+        if (region.visibility.surface && region.surface) {
+          entries.push({
+            featureId: feature.id,
+            fill: { positions: Float64Array.from(region.surface.positions), indices: Uint32Array.from(region.surface.indices) },
+            lines: region.visibility.wireframe ? buildSurfaceWireframeLines(region.surface) : [],
+            fillColor: color,
+            lineColor: 0x34495e,
+          })
+        }
+        const lines: Vec3[][] = []
+        if (region.visibility.boundary) lines.push([...geometry.border, geometry.border[0]!])
+        if (region.visibility.breaklines) lines.push(...geometry.breaklines)
+        const markers: NonNullable<FeatureDisplayEntry['markers']> = []
+        if (region.visibility.surfacePoints) {
+          markers.push({
+            points: region.surfacePoints.map((point) => [...point.coordinate] as Vec3),
+            color: 0xffc857,
+            size: 8,
+            name: `region-surface-points:${feature.id}`,
+          })
+        }
+        if (region.visibility.edgeEvidence) {
+          markers.push({
+            points: region.edgeEvidence.map((ref) => [...ref.coordinate] as Vec3),
+            color: 0x53c7ff,
+            size: 7,
+            name: `region-edge-evidence:${feature.id}`,
+          })
+        }
+        if (region.visibility.interiorEvidence) {
+          markers.push({
+            points: region.interiorEvidence.map((ref) => [...ref.coordinate] as Vec3),
+            color: 0x7ce0ff,
+            size: 7,
+            name: `region-interior-evidence:${feature.id}`,
+          })
+        }
+        if (lines.length > 0 || markers.length > 0) {
+          entries.push({ featureId: feature.id, lines, markers, fillColor: color, lineColor: color })
+        }
         continue
       }
       if (isEnvelopeBuilding(feature)) {
@@ -1206,6 +1460,15 @@ export class FeatureController {
     viewer.setAuthoringDraftPreview({ lines, activeVertices })
   }
 
+  private refreshRegionEditDraftPreview(): void {
+    const viewer = this.deps.getViewer()
+    if (!viewer || !this.regionEdit || (this.regionEdit.kind !== 'breakline' && this.regionEdit.kind !== 'boundary')) return
+    const draft = viewer.getFeatureAuthoringSnapshot().draft
+    const activeVertices = draft?.vertices.map((vertex) => vertex.world) ?? []
+    const lines: Vec3[][] = activeVertices.length >= 2 ? [activeVertices] : []
+    viewer.setAuthoringDraftPreview({ lines, activeVertices })
+  }
+
   private refreshBuildingDraftPreview(): void {
     const viewer = this.deps.getViewer()
     if (!viewer || !this.pendingBuilding) return
@@ -1251,6 +1514,7 @@ export class FeatureController {
     viewer?.setSnapPreview(null)
     this.phase = null
     this.pending = null
+    this.regionEdit = null
     this.buildingPhase = null
     this.pendingBuilding = null
     this.simplePhase = null
@@ -1258,6 +1522,29 @@ export class FeatureController {
     if (this.objectEdit?.kind === 'evidence') viewer?.setEvidencePickActive(false)
     this.objectEdit = null
     this.objectEditNote = null
+  }
+
+  private async persistRegionSurfacePoint(snapshot?: ReturnType<ViewerEngine['getFeatureAuthoringSnapshot']>): Promise<void> {
+    const resolved = snapshot ?? this.deps.getViewer()?.getFeatureAuthoringSnapshot()
+    const session = this.deps.getSession()
+    if (!session || this.regionEdit?.kind !== 'surface-point' || resolved?.state !== 'complete' || !resolved.draft) return
+    const vertex = resolved.draft.vertices[0]
+    if (!vertex) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === this.regionEdit!.featureId)
+    if (!feature || feature.family !== 'region') return
+    const region = readRegionMetadata(feature)
+    region.surfacePoints.push({
+      id: `rsp-${crypto.randomUUID()}`,
+      coordinate: [...vertex.world] as [number, number, number],
+      source: 'manual',
+      evidence: vertex.evidence,
+    })
+    region.surface = null
+    feature.metadata = writeRegionMetadata(feature, region)
+    feature.modifiedAt = new Date().toISOString()
+    this.clearAuthoring()
+    await this.deps.persistManifest(manifest)
   }
 
   private objectTemplatesByCategory(): Array<[ObjectCategoryId, FeatureTemplate[]]> {
@@ -1303,6 +1590,10 @@ function simpleFeatureMetadata(pending: PendingSimpleFeature, template: FeatureT
 /** Families whose detail supports isolate areas + explicit evidence refinement. */
 function isRefinableFamily(feature: FeatureRecord): feature is FeatureRecord & { family: 'object' | 'utility' | 'building' } {
   return feature.family === 'object' || feature.family === 'utility' || feature.family === 'building'
+}
+
+function isRegionFocusFamily(feature: FeatureRecord): feature is FeatureRecord & { family: 'region' } {
+  return feature.family === 'region'
 }
 
 function coerceParamValue(param: TemplateParamSpec, rawValue: string): number | string | boolean | undefined {

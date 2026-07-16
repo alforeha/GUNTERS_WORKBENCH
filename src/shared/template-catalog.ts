@@ -167,12 +167,13 @@ const yawParam = num('rotationYaw', 'Rotation / yaw', 0, { min: -180, max: 180 }
 
 const catalog: FeatureTemplate[] = [
   // Regions: the region patch is the surface-patch input; hatch is a reference name only.
+  region('generic', 'Generic', { hatch: 'ANSI31' }),
   region('grass', 'Grass', {
     hatch: 'GRASS',
     params: [],
     bind: { bladeHeight: 'verticalScale' },
   }),
-  region('pavement', 'Pavement', { hatch: 'AR-HBONE', params: [decayParam], bind: { patchiness: 'decay' } }),
+  region('pavement', 'Asphalt / pavement', { hatch: 'AR-HBONE', params: [decayParam], bind: { patchiness: 'decay' } }),
   region('gravel', 'Gravel', { hatch: 'GRAVEL' }),
   region('dirt', 'Dirt', { hatch: 'EARTH' }),
   region('concrete', 'Concrete', { hatch: 'AR-CONC', params: [decayParam], bind: { patchiness: 'decay' } }),

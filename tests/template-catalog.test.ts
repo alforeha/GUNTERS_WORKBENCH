@@ -23,7 +23,7 @@ describe('catalog coverage', () => {
 
   it('seeds exactly the handoff subtype lists per family', () => {
     expect(subtypes('region')).toEqual(
-      ['grass', 'pavement', 'gravel', 'dirt', 'concrete', 'landscape', 'water', 'unknown'].sort(),
+      ['generic', 'grass', 'pavement', 'gravel', 'dirt', 'concrete', 'landscape', 'water', 'unknown'].sort(),
     )
     expect(subtypes('object')).toEqual(
       ['box', 'cylinder', 'pine', 'simple-tree', 'shrub', 'sign', 'post'].sort(),
