@@ -7,9 +7,19 @@
 // back-to-sim control; the viewer is untouched.
 
 import type { ProjectSession } from '../shared/ipc'
+import type { UtilitySystemId } from '../shared/utility-catalog'
 import type { ProjectManifest } from '../shared/workbench-types'
 import type { BuildingAuthoringView, IsolateLoadView, ObjectEditView, RegionAuthoringView, SimpleAuthoringView, SimpleFeatureFamily } from './features'
 import { createObjectPreview3d, type ObjectPreview3d } from './objectPreview'
+import { renderUtilitiesTabHtml } from './utilitiesPanel'
+import {
+  buildUtilityAddModel,
+  buildUtilityEditorModel,
+  buildUtilityListModel,
+  type UtilityAddModel,
+  type UtilityEditorModel,
+  type UtilityListItem,
+} from './utilityModel'
 import {
   buildBuildingListModel,
   buildFeatureDetailModel,
@@ -47,6 +57,7 @@ export interface RightPanelFeatureOps {
   startObject(templateId: string): void
   startLine(templateId: string): void
   startMarker(templateId: string): void
+  startUtility(templateId: string): void
   closeBorder(): void
   closeBuildingFootprint(): void
   reviewSimpleFeature(): void
@@ -60,6 +71,7 @@ export interface RightPanelFeatureOps {
   updateParam(featureId: string, paramName: string, value: string): Promise<void>
   updateObjectCategory(featureId: string, categoryId: string): Promise<void>
   updateObjectTemplate(featureId: string, templateId: string): Promise<void>
+  updateUtilityTemplate(featureId: string, templateId: string): Promise<void>
   updatePlacement(featureId: string, axis: 'x' | 'y' | 'z', value: string): Promise<void>
   updateVisibility(featureId: string, visible: boolean): Promise<void>
   remove(featureId: string): Promise<void>
@@ -112,12 +124,16 @@ export interface SimpleTabView {
   family: SimpleFeatureFamily
   templates: { id: string; displayName: string }[]
   authoring: SimpleAuthoringView | null
-  list: Array<ObjectListItem | LineListItem | MarkerListItem>
+  list: Array<ObjectListItem | LineListItem | MarkerListItem | UtilityListItem>
   detail: FeatureDetailModel | null
-  /** In-flight isolate/evidence edit for the open object detail, if any. */
+  /** In-flight isolate/evidence edit for the open object/utility detail, if any. */
   objectEdit?: ObjectEditView | null
-  /** Active isolate load-all state for the open object detail, if any. */
+  /** Active isolate load-all state for the open object/utility detail, if any. */
   isolateLoad?: IsolateLoadView | null
+  /** Utilities tab only: system/class add-picker state. */
+  utilityAdd?: UtilityAddModel
+  /** Utilities tab only: detail editor extras for the open utility. */
+  utilityEditor?: UtilityEditorModel | null
 }
 
 export interface RightPanelApi {
@@ -136,7 +152,7 @@ const SIM_TAB_PLACEHOLDER: Record<string, string> = {
   regions: 'No regions yet. Pick a subtype below and draw the first border in the viewer.',
   objects: 'No objects yet. Use + Add Object to open the placement toolbar in the viewer.',
   buildings: 'No buildings yet. Building massing arrives with the Create Sim phase.',
-  utilities: 'No utilities yet. Utility features arrive with the Create Sim phase.',
+  utilities: 'No utilities yet. Pick a system and type below, then place it in the viewer.',
   lines: 'No lines or breaklines yet.',
   notes: 'No notes or flags yet.',
   measurements: 'No measurements yet.',
@@ -169,11 +185,13 @@ export function renderSimPanelHtml(
         ? renderBuildingsTabHtml(buildings)
         : activeTab.id === 'objects' && simpleTabs?.object
           ? renderObjectsTabHtml(simpleTabs.object)
-          : activeTab.id === 'lines' && simpleTabs?.line
-            ? renderSimpleTabHtml(simpleTabs.line)
-            : activeTab.id === 'notes' && simpleTabs?.marker
-              ? renderSimpleTabHtml(simpleTabs.marker)
-              : renderStagedTabHtml(activeTab.id, activeTab.count, activeTab.addLabel)
+          : activeTab.id === 'utilities' && simpleTabs?.utility
+            ? renderUtilitiesTabContentHtml(simpleTabs.utility)
+            : activeTab.id === 'lines' && simpleTabs?.line
+              ? renderSimpleTabHtml(simpleTabs.line)
+              : activeTab.id === 'notes' && simpleTabs?.marker
+                ? renderSimpleTabHtml(simpleTabs.marker)
+                : renderStagedTabHtml(activeTab.id, activeTab.count, activeTab.addLabel)
 
   return `
     <div class="panel-header">
@@ -328,6 +346,16 @@ export function renderObjectsTabHtml(view: SimpleTabView): string {
   `
 }
 
+/** Utilities tab: shared detail machinery here, list + rail in utilitiesPanel.ts. */
+export function renderUtilitiesTabContentHtml(view: SimpleTabView): string {
+  if (view.detail) return renderFeatureDetailHtml(view.detail, view.objectEdit, view.isolateLoad, view.utilityEditor)
+  return renderUtilitiesTabHtml({
+    authoring: view.authoring,
+    list: view.list as UtilityListItem[],
+    add: view.utilityAdd ?? buildUtilityAddModel('generic'),
+  })
+}
+
 function renderSimpleRowHtml(family: SimpleFeatureFamily, item: ObjectListItem | LineListItem | MarkerListItem): string {
   const evidence = `${item.snappedEvidenceCount} snapped / ${item.freeEvidenceCount} free`
   let sub = item.subtype
@@ -445,9 +473,13 @@ export function renderFeatureDetailHtml(
   detail: FeatureDetailModel,
   objectEdit?: ObjectEditView | null,
   isolateLoad?: IsolateLoadView | null,
+  utilityEditor?: UtilityEditorModel | null,
 ): string {
   const activeEdit = objectEdit && objectEdit.featureId === detail.id ? objectEdit : null
   const activeLoad = isolateLoad && isolateLoad.featureId === detail.id ? isolateLoad : null
+  // Objects and utilities share the refinement machinery (preview, isolate,
+  // explicit evidence); this is the one gate for those sections.
+  const refine = detail.objectEditor ?? utilityEditor ?? null
   const objectSelectorsHtml = detail.objectEditor
     ? `
       <div class="ws-section">
@@ -477,19 +509,54 @@ export function renderFeatureDetailHtml(
         <label class="ws-meta-row"><span class="ws-meta-label">Rotation</span><span class="ws-meta-value"><input type="number" value="${escapeHtml(detail.objectEditor.rotationYaw)}" data-action="feature-param" data-feature-id="${escapeHtml(detail.id)}" data-param-name="rotationYaw" /></span></label>
       </div>`
     : ''
-  const previewHtml = detail.objectEditor
+  const previewLabel = detail.objectEditor
+    ? `${detail.objectEditor.categoryId} / ${detail.objectEditor.typeLabel}`
+    : utilityEditor
+      ? `${utilityEditor.systemLabel} / ${utilityEditor.classLabel}`
+      : ''
+  const previewHtml = refine
     ? `
       <div class="ws-section">
-        <div class="ws-section-title">Object Preview</div>
+        <div class="ws-section-title">${detail.objectEditor ? 'Object Preview' : 'Utility Preview'}</div>
         <div class="object-preview-card">
-          <div class="object-preview-label">${escapeHtml(detail.objectEditor.categoryId)} / ${escapeHtml(detail.objectEditor.typeLabel)}</div>
-          <div class="object-preview-3d-mount object-preview-${escapeHtml(detail.objectEditor.previewKind)}" data-preview-feature-id="${escapeHtml(detail.id)}"></div>
+          <div class="object-preview-label">${escapeHtml(previewLabel)}</div>
+          <div class="object-preview-3d-mount object-preview-${escapeHtml(refine.previewKind)}" data-preview-feature-id="${escapeHtml(detail.id)}"></div>
           <div class="object-preview-hint">Drag to rotate, wheel to zoom. Origin amber, evidence blue.</div>
-          <div class="ws-detail">${escapeHtml(detail.objectEditor.summary)}</div>
+          <div class="ws-detail">${escapeHtml(refine.summary)}</div>
         </div>
       </div>`
     : ''
-  const isolateHtml = detail.objectEditor ? renderIsolateSectionHtml(detail, activeEdit, activeLoad) : ''
+  const utilitySelectorsHtml = utilityEditor
+    ? `
+      <div class="ws-section">
+        <div class="ws-section-title">Utility</div>
+        <label class="ws-meta-row"><span class="ws-meta-label">Type</span><span class="ws-meta-value"><select data-action="feature-utility-type" data-feature-id="${escapeHtml(detail.id)}">${utilityEditor.typeOptions
+          .map(
+            (type) =>
+              `<option value="${escapeHtml(type.templateId)}"${type.templateId === utilityEditor.typeTemplateId ? ' selected' : ''}>${escapeHtml(type.label)}</option>`,
+          )
+          .join('')}</select></span></label>
+        <div class="ws-detail">${escapeHtml(utilityEditor.originLabel)}</div>
+        <div class="ws-detail">${escapeHtml(utilityEditor.summary)}</div>
+      </div>`
+    : ''
+  const utilityPlacementHtml = utilityEditor
+    ? utilityEditor.placement
+      ? `
+      <div class="ws-section">
+        <div class="ws-section-title">Placement</div>
+        <label class="ws-meta-row"><span class="ws-meta-label">X</span><span class="ws-meta-value"><input type="number" value="${escapeHtml(utilityEditor.placement.x)}" data-action="feature-placement" data-feature-id="${escapeHtml(detail.id)}" data-axis="x" /></span></label>
+        <label class="ws-meta-row"><span class="ws-meta-label">Y</span><span class="ws-meta-value"><input type="number" value="${escapeHtml(utilityEditor.placement.y)}" data-action="feature-placement" data-feature-id="${escapeHtml(detail.id)}" data-axis="y" /></span></label>
+        <label class="ws-meta-row"><span class="ws-meta-label">Z</span><span class="ws-meta-value"><input type="number" value="${escapeHtml(utilityEditor.placement.z)}" data-action="feature-placement" data-feature-id="${escapeHtml(detail.id)}" data-axis="z" /></span></label>
+      </div>`
+      : `
+      <div class="ws-section">
+        <div class="ws-section-title">Alignment</div>
+        <div class="ws-detail">${utilityEditor.vertexCount ?? 0} points - ${escapeHtml(utilityEditor.lengthLabel ?? '--')}</div>
+        <div class="ws-detail">Alignment points are fixed after placement in beta; delete and re-place the run to change them.</div>
+      </div>`
+    : ''
+  const isolateHtml = refine ? renderIsolateSectionHtml(detail, refine.isolateVertexCount, activeEdit, activeLoad) : ''
   const paramsHtml =
     detail.params.length === 0
       ? '<div class="ws-detail">No parameters.</div>'
@@ -516,8 +583,10 @@ export function renderFeatureDetailHtml(
           ${detail.templateId ? `<div class="ws-meta-row"><span class="ws-meta-label">Template</span><span class="ws-meta-value">${escapeHtml(detail.templateId)}</span></div>` : ''}
         </div>
         ${objectSelectorsHtml}
+        ${utilitySelectorsHtml}
         ${previewHtml}
         ${placementHtml}
+        ${utilityPlacementHtml}
         ${isolateHtml}
         <div class="ws-section">
           <div class="ws-section-title">Parameters</div>
@@ -528,7 +597,7 @@ export function renderFeatureDetailHtml(
           <div class="ws-section-title">Evidence</div>
           ${badgesHtml ? `<div class="ws-detail">${badgesHtml}</div>` : ''}
           <div class="ws-detail">${detail.evidenceTotal} refs - ${detail.evidenceSnapped} snapped, ${detail.evidenceFree} free placed</div>
-          ${detail.objectEditor ? renderEvidenceEditorHtml(detail, activeEdit) : ''}
+          ${refine ? renderEvidenceEditorHtml(detail, refine, activeEdit) : ''}
         </div>
         <button class="feature-delete" data-action="feature-delete" data-feature-id="${escapeHtml(detail.id)}">Delete feature</button>
       </div>
@@ -538,6 +607,7 @@ export function renderFeatureDetailHtml(
 /** Isolate Area section: draw rail while active, status + actions otherwise. */
 function renderIsolateSectionHtml(
   detail: FeatureDetailModel,
+  vertexCount: number | null,
   activeEdit: ObjectEditView | null,
   activeLoad: IsolateLoadView | null,
 ): string {
@@ -553,10 +623,9 @@ function renderIsolateSectionHtml(
         </div>
       </div>`
   }
-  const vertexCount = detail.objectEditor?.isolateVertexCount ?? null
   const status =
     vertexCount === null
-      ? 'No isolate area yet. Draw a boundary to scope viewer focus around this object.'
+      ? 'No isolate area yet. Draw a boundary to scope viewer focus around this feature.'
       : `Isolate area: ${vertexCount} vertices. Context only - points inside are not evidence.`
   const loadHtml =
     vertexCount === null
@@ -586,11 +655,15 @@ function renderIsolateSectionHtml(
       </div>`
 }
 
-/** Explicit evidence list + add/remove controls (objects only). */
-function renderEvidenceEditorHtml(detail: FeatureDetailModel, activeEdit: ObjectEditView | null): string {
+/** Explicit evidence list + add/remove controls (objects and utilities). */
+function renderEvidenceEditorHtml(
+  detail: FeatureDetailModel,
+  refine: { evidenceItems: { index: number; kindLabel: string; coordLabel: string }[]; evidenceOverflow: number },
+  activeEdit: ObjectEditView | null,
+): string {
   const id = escapeHtml(detail.id)
-  const items = detail.objectEditor?.evidenceItems ?? []
-  const overflow = detail.objectEditor?.evidenceOverflow ?? 0
+  const items = refine.evidenceItems
+  const overflow = refine.evidenceOverflow
   const overflowHtml =
     overflow > 0
       ? `<div class="ws-detail">+ ${overflow} more refs (window selections)</div>`
@@ -723,6 +796,8 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
   let mode: 'sim' | 'asset' = 'sim'
   let openedAssetId: string | null = null
   const simState: SimPanelViewState = { activeTab: 'regions', simVisible: true, selectedFeatureId: null }
+  // Utilities add-picker: the system select filters the class select (session-only UI state).
+  let utilityAddSystem: UtilitySystemId = 'generic'
   // One persistent 3D preview widget: innerHTML re-renders replace the mount
   // placeholder, so the canvas is re-parented (not recreated) to keep the
   // WebGL context and the user's orbit pose alive across panel updates.
@@ -783,6 +858,8 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
     const detail = simState.selectedFeatureId ? buildFeatureDetailModel(manifest, simState.selectedFeatureId) : null
     if (simState.selectedFeatureId && !detail) simState.selectedFeatureId = null
     const authoring = deps.features.getSimpleAuthoring()
+    const utilityFeature =
+      detail?.family === 'utility' ? manifest.features.find((candidate) => candidate.id === detail.id) ?? null : null
     return {
       object: {
         family: 'object',
@@ -792,6 +869,17 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
         detail: detail?.family === 'object' ? detail : null,
         objectEdit: deps.features.getObjectEdit(),
         isolateLoad: deps.features.getIsolateLoad(),
+      },
+      utility: {
+        family: 'utility',
+        templates: [],
+        authoring,
+        list: buildUtilityListModel(manifest),
+        detail: detail?.family === 'utility' ? detail : null,
+        objectEdit: deps.features.getObjectEdit(),
+        isolateLoad: deps.features.getIsolateLoad(),
+        utilityAdd: buildUtilityAddModel(utilityAddSystem),
+        utilityEditor: utilityFeature ? buildUtilityEditorModel(utilityFeature) : null,
       },
       line: {
         family: 'line',
@@ -895,6 +983,11 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
     if (action === 'marker-add') {
       const select = mount.querySelector<HTMLSelectElement>('#marker-template-select')
       if (select?.value) deps.features.startMarker(select.value)
+      return
+    }
+    if (action === 'utility-add') {
+      const select = mount.querySelector<HTMLSelectElement>('#utility-class-select')
+      if (select?.value) deps.features.startUtility(select.value)
       return
     }
     if (action === 'region-close-border') {
@@ -1032,6 +1125,17 @@ export function mountRightPanel(mount: HTMLElement, deps: RightPanelDeps): Right
     }
     if (target.dataset.action === 'feature-object-category' && target.dataset.featureId && target instanceof HTMLSelectElement) {
       void deps.features.updateObjectCategory(target.dataset.featureId, target.value)
+      return
+    }
+    if (target.dataset.action === 'feature-utility-type' && target.dataset.featureId && target instanceof HTMLSelectElement) {
+      void deps.features.updateUtilityTemplate(target.dataset.featureId, target.value)
+      return
+    }
+    if (target.dataset.action === 'utility-add-system' && target instanceof HTMLSelectElement) {
+      if (target.value === 'generic' || target.value === 'storm') {
+        utilityAddSystem = target.value
+        render()
+      }
       return
     }
     if (target.dataset.action === 'feature-placement' && target.dataset.featureId && target.dataset.axis) {

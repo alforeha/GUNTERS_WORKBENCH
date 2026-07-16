@@ -11,6 +11,7 @@ import { getTemplate } from '../shared/template-catalog'
 import type { FeatureRecord } from '../shared/workbench-types'
 import type { Vec3 } from '../viewer/geometry'
 import { buildObjectDisplay, isolateBoundaryFromFeature } from '../viewer/generators'
+import { buildUtilityDisplay, utilityDisplayColor, utilityOriginFromFeature } from '../viewer/utilityGenerators'
 
 const PREVIEW_WIDTH = 280
 const PREVIEW_HEIGHT = 210
@@ -26,6 +27,7 @@ export interface ObjectPreview3d {
 }
 
 function objectPreviewColor(feature: FeatureRecord): number {
+  if (feature.family === 'utility') return utilityDisplayColor(feature).fill
   const template = feature.templateId ? getTemplate(feature.templateId) : null
   if (template?.objectCategory === 'foliage') return 0x6ea05a
   if (template?.objectCategory === 'site-fixture') return 0xa0aab8
@@ -86,9 +88,15 @@ export function createObjectPreview3d(): ObjectPreview3d {
 
   function update(feature: FeatureRecord): void {
     clearContent()
-    const display = buildObjectDisplay(feature)
+    // Utilities share the preview: same generator output as the main viewer,
+    // origin at the pin (or the start of a line run).
+    const display = feature.family === 'utility' ? buildUtilityDisplay(feature) : buildObjectDisplay(feature)
     const geometry = feature.geometry as { point?: unknown }
-    const origin = isVec3(geometry.point) ? geometry.point : null
+    const origin = isVec3(geometry.point)
+      ? geometry.point
+      : feature.family === 'utility'
+        ? utilityOriginFromFeature(feature)
+        : null
     if (!display || !origin) {
       renderFrame()
       return

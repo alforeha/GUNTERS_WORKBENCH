@@ -685,9 +685,9 @@ export interface FeatureDetailModel {
 }
 
 /** DOM-safety cap for the scrollable detail evidence list; the rest is summarized as a count. */
-const EVIDENCE_DETAIL_ROWS = 200
+export const EVIDENCE_DETAIL_ROWS = 200
 
-const EVIDENCE_KIND_LABEL: Record<string, string> = {
+export const EVIDENCE_KIND_LABEL: Record<string, string> = {
   'picked-coordinate': 'free pick',
   'asset-point': 'cloud point',
   'asset-vertex': 'feature vertex',

@@ -35,9 +35,38 @@ describe('catalog coverage', () => {
     expect(subtypes('marker')).toEqual(['generic', 'spot-elevation', 'control-point', 'note'].sort())
   })
 
-  it('seeds no utility or measurement templates in v1', () => {
-    expect(templatesForFamily('utility')).toEqual([])
+  it('seeds beta Generic + Storm utility templates and no measurement templates', () => {
+    expect(subtypes('utility')).toEqual(
+      [
+        'generic-structure',
+        'generic-box',
+        'generic-vault',
+        'generic-lid',
+        'generic-manhole',
+        'generic-pole',
+        'generic-pipe',
+        'generic-stub',
+        'storm-manhole',
+        'storm-inlet',
+        'storm-structure',
+        'storm-culvert',
+        'storm-pipe',
+        'storm-stub',
+      ].sort(),
+    )
     expect(templatesForFamily('measurement')).toEqual([])
+  })
+
+  it('gives every utility template a system, class, and geometry-matched quantity', () => {
+    for (const template of templatesForFamily('utility')) {
+      expect(template.utilitySystem, template.id).toBeDefined()
+      expect(template.utilityClass, template.id).toBeDefined()
+      expect(template.subtype, template.id).toBe(`${template.utilitySystem}-${template.utilityClass}`)
+      const linear = template.utilityClass === 'pipe' || template.utilityClass === 'stub' || template.utilityClass === 'culvert'
+      expect(template.report?.quantityKind, template.id).toBe(linear ? 'length' : 'count')
+      // Point classes must declare their pin: above-ground bottom or below-ground top.
+      if (!linear) expect(template.utilityOrigin, template.id).toMatch(/^(bottom|top)$/)
+    }
   })
 })
 

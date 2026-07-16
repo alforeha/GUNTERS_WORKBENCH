@@ -5,6 +5,7 @@
 // code) and no template editor exists: the catalog is code, not project data.
 
 import type { FeatureFamily } from './workbench-types';
+import { UTILITY_TEMPLATES, type UtilityClassId, type UtilitySystemId } from './utility-catalog';
 
 export const TEMPLATE_CATALOG_VERSION = 1;
 
@@ -58,6 +59,12 @@ export interface FeatureTemplate {
   subtype: string;
   displayName: string;
   objectCategory?: ObjectCategoryId;
+  /** Utility family only: network/group the component belongs to. */
+  utilitySystem?: UtilitySystemId;
+  /** Utility family only: the physical object class. */
+  utilityClass?: UtilityClassId;
+  /** Utility point classes only: pin at center 'bottom' (above-ground) or center 'top' (below-ground). */
+  utilityOrigin?: 'bottom' | 'top';
   paramSchema: TemplateParamSpec[];
   reality?: TemplateRealityRefs;
   cad?: TemplateCadRefs;
@@ -274,6 +281,10 @@ const catalog: FeatureTemplate[] = [
   line('wall-bottom', 'Wall bottom', { breakline: true, layer: 'LINE-WALLB' }),
   line('edge-of-pavement', 'Edge of pavement', { breakline: true, layer: 'LINE-EOP' }),
   line('fence', 'Fence', { breakline: false, layer: 'LINE-FENCE' }),
+
+  // Utilities: system x class templates (beta Generic + Storm); definitions
+  // live in utility-catalog.ts, display geometry in viewer/utilityGenerators.ts.
+  ...UTILITY_TEMPLATES,
 
   // Markers: spot elevations double as surface constraints for the region patch.
   marker('generic', 'Marker', { pointCode: 'MARK' }),

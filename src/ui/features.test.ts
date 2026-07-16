@@ -428,6 +428,175 @@ describe('FeatureController isolate load-all', () => {
   })
 })
 
+function makeUtilityFeature(id: string, manifest: ProjectManifest, templateId = 'utility.storm-manhole'): void {
+  manifest.features.push({
+    id,
+    simulationId: manifest.realitySimulation.id,
+    type: 'marker',
+    name: 'Storm Manhole 1',
+    geometry: { point: [10, 20, 5] },
+    createdAt: '2026-07-13T00:00:00.000Z',
+    modifiedAt: '2026-07-13T00:00:00.000Z',
+    family: 'utility',
+    templateId,
+    subtype: templateId.split('.')[1]!,
+    parameters: { diameter: 4, depth: 8 },
+    evidenceRefs: [{ kind: 'asset-point', coordinate: [10, 20, 5] }],
+    display: { visible: true },
+    metadata: { utilitySystem: 'storm', utilityClass: 'manhole' },
+  })
+}
+
+describe('FeatureController utility authoring', () => {
+  it('persists a point utility immediately after placement with system/class metadata', async () => {
+    const { controller, session } = makeController()
+    controller.startUtility('utility.storm-manhole')
+    expect(controller.getSimpleAuthoring()).toMatchObject({ family: 'utility', geometry: 'point' })
+
+    expect(controller.handleViewerClick()).toBe(true)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(controller.getSimpleAuthoring()).toBeNull()
+    const record = session.manifest.features.at(-1)
+    expect(record).toMatchObject({
+      family: 'utility',
+      templateId: 'utility.storm-manhole',
+      subtype: 'storm-manhole',
+      type: 'marker',
+      name: 'Storm Manhole 1',
+      geometry: { point: [0, 0, 0] },
+      metadata: { utilitySystem: 'storm', utilityClass: 'manhole' },
+    })
+    expect(record?.parameters).toMatchObject({ diameter: 4, depth: 8, lidType: 'solid' })
+    expect(record?.evidenceRefs).toHaveLength(1)
+  })
+
+  it('collects a line utility as a 2+ point run through review and finish', async () => {
+    const { controller, session } = makeController()
+    controller.startUtility('utility.storm-pipe')
+    expect(controller.getSimpleAuthoring()).toMatchObject({ family: 'utility', geometry: 'polyline', canReview: false })
+
+    expect(controller.handleViewerClick()).toBe(true)
+    expect(controller.getSimpleAuthoring()).toMatchObject({ activeVertexCount: 1, canReview: false })
+    expect(controller.handleViewerClick()).toBe(true)
+    expect(controller.getSimpleAuthoring()).toMatchObject({ activeVertexCount: 2, canReview: true })
+
+    controller.reviewSimpleFeature()
+    expect(controller.getSimpleAuthoring()).toMatchObject({ phase: 'review', vertexCount: 2 })
+
+    await controller.finishSimpleFeature()
+    const record = session.manifest.features.at(-1)
+    expect(record).toMatchObject({
+      family: 'utility',
+      templateId: 'utility.storm-pipe',
+      type: 'polyline',
+      name: 'Storm Pipe/Line 1',
+      geometry: { vertices: [[0, 0, 0], [1, 0, 0]] },
+      metadata: { utilitySystem: 'storm', utilityClass: 'pipe' },
+    })
+    expect(record?.evidenceRefs).toHaveLength(2)
+  })
+
+  it('stores a stub run the same way (partial line, endpoint assumed by class)', async () => {
+    const { controller, session } = makeController()
+    controller.startUtility('utility.generic-stub')
+    controller.handleViewerClick()
+    controller.handleViewerClick()
+    controller.reviewSimpleFeature()
+    await controller.finishSimpleFeature()
+
+    expect(session.manifest.features.at(-1)).toMatchObject({
+      family: 'utility',
+      templateId: 'utility.generic-stub',
+      type: 'polyline',
+      metadata: { utilitySystem: 'generic', utilityClass: 'stub' },
+    })
+  })
+
+  it('regenerates visible utility display entries and skips hidden ones', () => {
+    const { controller, session, viewer } = makeController()
+    makeUtilityFeature('feat-util-visible', session.manifest)
+    makeUtilityFeature('feat-util-hidden', session.manifest)
+    session.manifest.features.at(-1)!.display = { visible: false }
+
+    controller.refreshDisplays()
+
+    expect(viewer.authoredEntries).toHaveLength(1)
+    expect(viewer.authoredEntries[0]).toMatchObject({ featureId: 'feat-util-visible' })
+    expect(viewer.authoredEntries[0]?.fill).toBeDefined()
+  })
+
+  it('re-types a utility only within the same geometry kind', async () => {
+    const { controller, session } = makeController()
+    makeUtilityFeature('feat-util', session.manifest)
+
+    // Point -> line refused; the stored record is untouched.
+    await controller.updateUtilityTemplate('feat-util', 'utility.storm-pipe')
+    expect(session.manifest.features.at(-1)).toMatchObject({ templateId: 'utility.storm-manhole' })
+
+    // Point -> point re-types and remaps shared params by name.
+    await controller.updateUtilityTemplate('feat-util', 'utility.generic-manhole')
+    const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-util')
+    expect(feature).toMatchObject({
+      templateId: 'utility.generic-manhole',
+      subtype: 'generic-manhole',
+      metadata: { utilitySystem: 'generic', utilityClass: 'manhole' },
+    })
+    expect(feature?.parameters).toMatchObject({ diameter: 4, depth: 8 })
+  })
+})
+
+describe('FeatureController utility isolate + evidence', () => {
+  it('stores an isolate boundary on a utility without adding evidence', async () => {
+    const { controller, session } = makeController()
+    makeUtilityFeature('feat-util', session.manifest)
+
+    controller.startIsolateBoundary('feat-util')
+    expect(controller.getObjectEdit()).toMatchObject({ featureId: 'feat-util', kind: 'isolate' })
+    controller.handleViewerClick()
+    controller.handleViewerClick()
+    controller.handleViewerClick()
+    await controller.finishIsolateBoundary()
+
+    const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-util')
+    expect(feature?.metadata?.isolateBoundary).toEqual({
+      polygon: [
+        [0, 0, 0],
+        [1, 0, 0],
+        [2, 0, 0],
+      ],
+    })
+    expect(feature?.evidenceRefs).toHaveLength(1)
+  })
+
+  it('adds explicit evidence picks to a utility', async () => {
+    const { controller, session, viewer } = makeController()
+    makeUtilityFeature('feat-util', session.manifest)
+
+    controller.startEvidencePick('feat-util')
+    viewer.nextEvidence = { world: [3, 4, 5], evidence: { kind: 'asset-point', coordinate: [3, 4, 5] } }
+    expect(controller.handleViewerClick()).toBe(true)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const feature = session.manifest.features.find((candidate) => candidate.id === 'feat-util')
+    expect(feature?.evidenceRefs).toHaveLength(2)
+    expect(feature?.evidenceRefs?.at(-1)).toMatchObject({ kind: 'asset-point', coordinate: [3, 4, 5] })
+  })
+
+  it('publishes the focus overlay for a focused utility (origin at the pin)', () => {
+    const { controller, session, viewer } = makeController()
+    makeUtilityFeature('feat-util', session.manifest)
+
+    controller.setFocusedFeature('feat-util')
+    expect(viewer.focusOverlay).toMatchObject({ origin: [10, 20, 5], evidence: [[10, 20, 5]] })
+
+    controller.setFocusedFeature(null)
+    expect(viewer.focusOverlay).toBeNull()
+  })
+})
+
 describe('FeatureController focus overlay', () => {
   it('publishes boundary, evidence, and origin for the focused object', () => {
     const { controller, session, viewer } = makeController()

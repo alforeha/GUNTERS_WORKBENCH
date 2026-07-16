@@ -581,19 +581,19 @@ function objectNumberParam(feature: FeatureRecord, name: string, fallback: numbe
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
-interface PrimitiveBuffers {
+export interface PrimitiveBuffers {
   positions: number[];
   indices: number[];
   lines: Vec3[][];
 }
 
-type VerticalOrigin = 'center' | 'base';
+export type VerticalOrigin = 'center' | 'base' | 'top';
 
-function createBuffers(): PrimitiveBuffers {
+export function createBuffers(): PrimitiveBuffers {
   return { positions: [], indices: [], lines: [] };
 }
 
-function toDisplay(buffers: PrimitiveBuffers): SolidPrimitiveDisplay {
+export function toDisplay(buffers: PrimitiveBuffers): SolidPrimitiveDisplay {
   return {
     ...(buffers.indices.length > 0
       ? {
@@ -607,7 +607,7 @@ function toDisplay(buffers: PrimitiveBuffers): SolidPrimitiveDisplay {
   };
 }
 
-function mergePrimitive(into: PrimitiveBuffers, next: SolidPrimitiveDisplay): void {
+export function mergePrimitive(into: PrimitiveBuffers, next: SolidPrimitiveDisplay): void {
   if (next.fill) {
     const base = into.positions.length / 3;
     into.positions.push(...next.fill.positions);
@@ -622,7 +622,7 @@ function rotateXY(x: number, y: number, yawRad: number): [number, number] {
   return [x * c - y * s, x * s + y * c];
 }
 
-function worldPoint(anchor: Vec3, localX: number, localY: number, localZ: number, yawRad: number): Vec3 {
+export function worldPoint(anchor: Vec3, localX: number, localY: number, localZ: number, yawRad: number): Vec3 {
   const [rx, ry] = rotateXY(localX, localY, yawRad);
   return [anchor[0] + rx, anchor[1] + ry, anchor[2] + localZ];
 }
@@ -632,16 +632,17 @@ function pushPoint(positions: number[], point: Vec3): number {
   return positions.length / 3 - 1;
 }
 
-function ringLine(points: Vec3[]): Vec3[] {
+export function ringLine(points: Vec3[]): Vec3[] {
   return points.length === 0 ? [] : [...points.map(cloneVec3), cloneVec3(points[0]!)];
 }
 
 function zRange(anchorZ: number, height: number, origin: VerticalOrigin): { bottom: number; top: number } {
   if (origin === 'center') return { bottom: anchorZ - height / 2, top: anchorZ + height / 2 };
+  if (origin === 'top') return { bottom: anchorZ - height, top: anchorZ };
   return { bottom: anchorZ, top: anchorZ + height };
 }
 
-function buildBoxPrimitive(input: {
+export function buildBoxPrimitive(input: {
   point: Vec3;
   width: number;
   depth: number;
@@ -681,7 +682,7 @@ function buildBoxPrimitive(input: {
   };
 }
 
-function buildCylinderPrimitive(input: {
+export function buildCylinderPrimitive(input: {
   point: Vec3;
   radius: number;
   height: number;

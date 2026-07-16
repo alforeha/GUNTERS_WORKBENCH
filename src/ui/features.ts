@@ -14,6 +14,7 @@ import {
   type ObjectCategoryId,
   type TemplateParamSpec,
 } from '../shared/template-catalog'
+import { utilitySystemLabel, utilityTemplateGeometry } from '../shared/utility-catalog'
 import type { EvidenceRef, FeatureRecord, ProjectManifest } from '../shared/workbench-types'
 import type { ViewerEngine } from '../viewer'
 import type { Vec3 } from '../viewer/geometry'
@@ -31,6 +32,7 @@ import {
   regionGeometryFromFeature,
   type BuildingRoofType,
 } from '../viewer/generators'
+import { buildUtilityDisplayEntry, utilityOriginFromFeature } from '../viewer/utilityGenerators'
 import type { FeatureDisplayEntry } from '../viewer/RenderFeatures'
 
 export interface FeatureControllerDeps {
@@ -72,15 +74,18 @@ export interface BuildingAuthoringView {
   freeCount: number
 }
 
-export type SimpleFeatureFamily = 'object' | 'line' | 'marker'
+export type SimpleFeatureFamily = 'object' | 'line' | 'marker' | 'utility'
 export type SimpleAuthoringPhase = 'placing' | 'review'
 export type ObjectPlacementMode = 'snap' | 'manual'
+export type SimpleGeometryMode = 'point' | 'polyline'
 
 export interface SimpleAuthoringView {
   family: SimpleFeatureFamily
   phase: SimpleAuthoringPhase
   templateId: string
   subtype: string
+  /** Point features pin once; polyline features collect 2+ vertices. */
+  geometry: SimpleGeometryMode
   activeVertexCount: number
   vertexCount: number
   canReview: boolean
@@ -119,6 +124,7 @@ interface PendingSimpleFeature {
   family: SimpleFeatureFamily
   templateId: string
   subtype: string
+  geometry: SimpleGeometryMode
   vertices: AuthoredVertexRecord[]
   placementMode: ObjectPlacementMode
 }
@@ -199,6 +205,10 @@ export class FeatureController {
     return templatesForFamily('marker')
   }
 
+  utilityTemplates(): FeatureTemplate[] {
+    return templatesForFamily('utility')
+  }
+
   getAuthoring(): RegionAuthoringView | null {
     if (!this.phase || !this.pending) return null
     const viewer = this.deps.getViewer()
@@ -253,9 +263,10 @@ export class FeatureController {
       phase: this.simplePhase,
       templateId: this.pendingSimple.templateId,
       subtype: this.pendingSimple.subtype,
+      geometry: this.pendingSimple.geometry,
       activeVertexCount: activeVertices.length,
       vertexCount: this.pendingSimple.vertices.length,
-      canReview: this.pendingSimple.family === 'line' ? activeVertices.length >= 2 : activeVertices.length >= 1,
+      canReview: this.pendingSimple.geometry === 'polyline' ? activeVertices.length >= 2 : activeVertices.length >= 1,
       snappedCount: all.filter((vertex) => vertex.snapped).length,
       freeCount: all.filter((vertex) => !vertex.snapped).length,
     }
@@ -287,9 +298,9 @@ export class FeatureController {
    */
   startIsolateBoundary(featureId: string): void {
     const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
-    if (!feature || feature.family !== 'object' || this.isAuthoring()) return
+    if (!feature || !isRefinableFamily(feature) || this.isAuthoring()) return
     const viewer = this.deps.ensureViewer()
-    viewer.startFeatureAuthoring('object', feature.templateId ?? null, 'polygon')
+    viewer.startFeatureAuthoring(feature.family, feature.templateId ?? null, 'polygon')
     this.objectEdit = { featureId, kind: 'isolate' }
     this.deps.onAuthoringChanged()
   }
@@ -343,7 +354,7 @@ export class FeatureController {
    */
   startIsolateLoadAll(featureId: string): void {
     const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
-    if (!feature || feature.family !== 'object') return
+    if (!feature || !isRefinableFamily(feature)) return
     const boundary = isolateBoundaryFromFeature(feature)
     if (!boundary) return
     const viewer = this.deps.ensureViewer()
@@ -381,7 +392,7 @@ export class FeatureController {
   /** Enters evidence-pick mode: each snapped viewer click adds one explicit ref. */
   startEvidencePick(featureId: string): void {
     const feature = this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === featureId)
-    if (!feature || feature.family !== 'object' || this.isAuthoring()) return
+    if (!feature || !isRefinableFamily(feature) || this.isAuthoring()) return
     this.objectEdit = { featureId, kind: 'evidence' }
     this.objectEditNote = null
     this.deps.ensureViewer().setEvidencePickActive(true)
@@ -491,12 +502,17 @@ export class FeatureController {
     const feature = this.focusedFeatureId
       ? this.deps.getSession()?.manifest.features.find((candidate) => candidate.id === this.focusedFeatureId)
       : null
-    if (!feature || feature.family !== 'object') {
+    if (!feature || !isRefinableFamily(feature)) {
       viewer.setFeatureFocusOverlay(null)
       viewer.setIsolateFocus(null)
       return
     }
     const geometry = feature.geometry as { point?: unknown }
+    const origin = isVec3(geometry.point)
+      ? ([...geometry.point] as Vec3)
+      : feature.family === 'utility'
+        ? utilityOriginFromFeature(feature)
+        : null
     const boundary = isolateBoundaryFromFeature(feature)
     // The active load-all sector renders as a rect only when the area actually
     // split - a single full-area sector would just retrace the boundary bbox.
@@ -505,7 +521,7 @@ export class FeatureController {
     viewer.setFeatureFocusOverlay({
       boundary,
       evidence: (feature.evidenceRefs ?? []).map((ref) => [...ref.coordinate] as Vec3),
-      origin: isVec3(geometry.point) ? [...geometry.point] : null,
+      origin,
       sectorRect: sector && boundary ? { ...sector, z: boundary[0]![2] } : null,
     })
     // Focus mode proper: the viewer isolates cloud display to the boundary
@@ -586,6 +602,11 @@ export class FeatureController {
     this.startSimpleFeature('marker', templateId, 'snap')
   }
 
+  /** Utilities ride the simple rail: point classes pin once, line classes collect a run. */
+  startUtility(templateId: string): void {
+    this.startSimpleFeature('utility', templateId, 'snap')
+  }
+
   getObjectCreationToolbar(): ObjectCreationToolbarView | null {
     if (this.simplePhase !== 'placing' || this.pendingSimple?.family !== 'object') return null
     const currentTemplate = getTemplate(this.pendingSimple.templateId)
@@ -626,10 +647,12 @@ export class FeatureController {
   ): void {
     const template = getTemplate(templateId)
     if (!template || template.family !== family || !this.deps.getSession() || this.isAuthoring()) return
+    const geometry: SimpleGeometryMode =
+      family === 'line' || (family === 'utility' && utilityTemplateGeometry(template) === 'line') ? 'polyline' : 'point'
     const viewer = this.deps.ensureViewer()
-    viewer.startFeatureAuthoring(family, templateId, family === 'line' ? 'polyline' : 'point')
+    viewer.startFeatureAuthoring(family, templateId, geometry)
     this.simplePhase = 'placing'
-    this.pendingSimple = { family, templateId, subtype: template.subtype, vertices: [], placementMode }
+    this.pendingSimple = { family, templateId, subtype: template.subtype, geometry, vertices: [], placementMode }
     this.deps.onAuthoringChanged()
   }
 
@@ -671,7 +694,7 @@ export class FeatureController {
   }
 
   private captureCompletedPointDraft(snapshot?: ReturnType<ViewerEngine['getFeatureAuthoringSnapshot']>): void {
-    if (!this.pendingSimple || this.pendingSimple.family === 'line' || this.simplePhase !== 'placing') return
+    if (!this.pendingSimple || this.pendingSimple.geometry === 'polyline' || this.simplePhase !== 'placing') return
     const resolved = snapshot ?? this.deps.getViewer()?.getFeatureAuthoringSnapshot()
     if (resolved?.state !== 'complete' || !resolved.draft) return
     this.pendingSimple.vertices = resolved.draft.vertices.map((vertex) => ({
@@ -679,7 +702,9 @@ export class FeatureController {
       snapped: vertex.snapped,
       evidence: vertex.evidence,
     }))
-    if (this.pendingSimple.family === 'object') {
+    // Point objects and point utilities persist on the placement click; markers
+    // keep the explicit review step.
+    if (this.pendingSimple.family === 'object' || this.pendingSimple.family === 'utility') {
       this.simplePhase = 'review'
       void this.finishSimpleFeature()
       return
@@ -846,7 +871,7 @@ export class FeatureController {
 
   reviewSimpleFeature(): void {
     const viewer = this.deps.getViewer()
-    if (!viewer || this.simplePhase !== 'placing' || !this.pendingSimple || this.pendingSimple.family !== 'line') return
+    if (!viewer || this.simplePhase !== 'placing' || !this.pendingSimple || this.pendingSimple.geometry !== 'polyline') return
     viewer.requestCloseFeatureAuthoring()
     const snapshot = viewer.confirmFeatureAuthoring()
     if (snapshot.state !== 'complete' || !snapshot.draft) return
@@ -863,7 +888,7 @@ export class FeatureController {
   async finishSimpleFeature(): Promise<void> {
     const session = this.deps.getSession()
     if (!session || this.simplePhase !== 'review' || !this.pendingSimple || this.pendingSimple.vertices.length === 0) return
-    if (this.pendingSimple.family === 'line' && this.pendingSimple.vertices.length < 2) return
+    if (this.pendingSimple.geometry === 'polyline' && this.pendingSimple.vertices.length < 2) return
     const manifest = structuredClone(session.manifest) as ProjectManifest
     const pending = this.pendingSimple
     const template = getTemplate(pending.templateId)
@@ -871,18 +896,15 @@ export class FeatureController {
     if (pending.family === 'line') params.breaklineType = pending.subtype
     const now = new Date().toISOString()
     const familyCount = manifest.features.filter((feature) => feature.family === pending.family).length
-    const type = pending.family === 'line' ? 'polyline' : 'marker'
+    const type = pending.geometry === 'polyline' ? 'polyline' : 'marker'
     const point = pending.vertices[0]?.world ?? [0, 0, 0]
     const record: FeatureRecord = {
       id: `feat-${crypto.randomUUID()}`,
       simulationId: manifest.realitySimulation.id,
       type,
-      name:
-        pending.family === 'object'
-          ? `${template?.displayName ?? 'Object'} ${familyCount + 1}`
-          : `${featureFamilyLabel(pending.family)} ${familyCount + 1} (${pending.subtype})`,
+      name: simpleFeatureName(pending, template, familyCount),
       geometry:
-        pending.family === 'line'
+        pending.geometry === 'polyline'
           ? { vertices: pending.vertices.map((vertex) => vertex.world) }
           : { point },
       createdAt: now,
@@ -899,7 +921,7 @@ export class FeatureController {
         ...(template?.report ? { report: { ...template.report } } : {}),
       },
       display: { visible: true },
-      metadata: pending.family === 'object' && template?.objectCategory ? { objectCategory: template.objectCategory } : {},
+      metadata: simpleFeatureMetadata(pending, template),
     }
     manifest.features.push(record)
     this.clearAuthoring()
@@ -965,6 +987,42 @@ export class FeatureController {
     await this.updateObjectTemplate(featureId, template.id)
   }
 
+  /**
+   * Re-types a utility to another system/class combo. Only same-geometry
+   * targets are legal (a pinned manhole cannot become a pipe run); parameters
+   * remap by name so shared fields survive the switch.
+   */
+  async updateUtilityTemplate(featureId: string, templateId: string): Promise<void> {
+    const session = this.deps.getSession()
+    if (!session) return
+    const manifest = structuredClone(session.manifest) as ProjectManifest
+    const feature = manifest.features.find((candidate) => candidate.id === featureId)
+    const nextTemplate = getTemplate(templateId)
+    if (!feature || feature.family !== 'utility' || !nextTemplate || nextTemplate.family !== 'utility') return
+    const previousTemplate = feature.templateId ? getTemplate(feature.templateId) : null
+    if (
+      previousTemplate &&
+      utilityTemplateGeometry(previousTemplate) !== utilityTemplateGeometry(nextTemplate)
+    ) {
+      return
+    }
+    feature.templateId = nextTemplate.id
+    feature.subtype = nextTemplate.subtype
+    feature.parameters = remapTemplateParameters(feature.parameters ?? {}, previousTemplate, nextTemplate)
+    feature.representations = {
+      ...(nextTemplate.cad ? { cad: { ...nextTemplate.cad } } : {}),
+      ...(nextTemplate.report ? { report: { ...nextTemplate.report } } : {}),
+    }
+    feature.metadata = {
+      ...(feature.metadata ?? {}),
+      ...(nextTemplate.utilitySystem && nextTemplate.utilityClass
+        ? { utilitySystem: nextTemplate.utilitySystem, utilityClass: nextTemplate.utilityClass }
+        : {}),
+    }
+    feature.modifiedAt = new Date().toISOString()
+    await this.deps.persistManifest(manifest)
+  }
+
   async updateFeaturePlacement(featureId: string, axis: 'x' | 'y' | 'z', rawValue: string): Promise<void> {
     const session = this.deps.getSession()
     if (!session) return
@@ -972,7 +1030,8 @@ export class FeatureController {
     if (!Number.isFinite(value)) return
     const manifest = structuredClone(session.manifest) as ProjectManifest
     const feature = manifest.features.find((candidate) => candidate.id === featureId)
-    if (!feature || (feature.family !== 'object' && feature.family !== 'marker')) return
+    if (!feature || (feature.family !== 'object' && feature.family !== 'marker' && feature.family !== 'utility')) return
+    // Point-pinned features only; line utilities keep their placed alignment (beta).
     const geometry = feature.geometry as { point?: unknown }
     if (!isVec3(geometry.point)) return
     const point: Vec3 = [geometry.point[0], geometry.point[1], geometry.point[2]]
@@ -1020,6 +1079,7 @@ export class FeatureController {
         (feature.family === 'region' ||
           feature.family === 'building' ||
           feature.family === 'object' ||
+          feature.family === 'utility' ||
           feature.family === 'line' ||
           feature.family === 'marker'),
     )
@@ -1073,6 +1133,11 @@ export class FeatureController {
         if (!display) continue
         const color = objectDisplayColor(feature)
         entries.push({ featureId: feature.id, ...display, fillColor: color.fill, lineColor: color.line })
+        continue
+      }
+      if (feature.family === 'utility') {
+        const entry = buildUtilityDisplayEntry(feature)
+        if (entry) entries.push({ featureId: feature.id, ...entry })
         continue
       }
       if (feature.family === 'marker') {
@@ -1147,7 +1212,7 @@ export class FeatureController {
     const viewer = this.deps.getViewer()
     if (!viewer || !this.pendingSimple) return
     const lines: Vec3[][] = []
-    if (this.pendingSimple.family === 'line' && this.pendingSimple.vertices.length >= 2) {
+    if (this.pendingSimple.geometry === 'polyline' && this.pendingSimple.vertices.length >= 2) {
       lines.push(this.pendingSimple.vertices.map((vertex) => vertex.world))
     }
     const draft = viewer.getFeatureAuthoringSnapshot().draft
@@ -1192,7 +1257,29 @@ function numberParam(feature: FeatureRecord, name: string, fallback: number): nu
 function featureFamilyLabel(family: SimpleFeatureFamily): string {
   if (family === 'object') return 'Object'
   if (family === 'line') return 'Line'
+  if (family === 'utility') return 'Utility'
   return 'Marker'
+}
+
+function simpleFeatureName(pending: PendingSimpleFeature, template: FeatureTemplate | null, familyCount: number): string {
+  if (pending.family === 'object') return `${template?.displayName ?? 'Object'} ${familyCount + 1}`
+  if (pending.family === 'utility') {
+    return `${utilitySystemLabel(template?.utilitySystem)} ${template?.displayName ?? 'Utility'} ${familyCount + 1}`
+  }
+  return `${featureFamilyLabel(pending.family)} ${familyCount + 1} (${pending.subtype})`
+}
+
+function simpleFeatureMetadata(pending: PendingSimpleFeature, template: FeatureTemplate | null): Record<string, unknown> {
+  if (pending.family === 'object' && template?.objectCategory) return { objectCategory: template.objectCategory }
+  if (pending.family === 'utility' && template?.utilitySystem && template.utilityClass) {
+    return { utilitySystem: template.utilitySystem, utilityClass: template.utilityClass }
+  }
+  return {}
+}
+
+/** Families whose detail supports isolate areas + explicit evidence refinement. */
+function isRefinableFamily(feature: FeatureRecord): feature is FeatureRecord & { family: 'object' | 'utility' } {
+  return feature.family === 'object' || feature.family === 'utility'
 }
 
 function coerceParamValue(param: TemplateParamSpec, rawValue: string): number | string | boolean | undefined {
