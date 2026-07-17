@@ -54,11 +54,10 @@ export interface WpiIndexNode {
 }
 
 export interface WpiIndexManifest {
-  wpiIndexVersion: 1 | 2;
+  wpiIndexVersion: 1;
   indexType: 'wpi-octree';
   generator: { name: 'workbench'; version: string };
   generatedAt: string;
-  ownership?: 'file-order' | 'strided';
   source: {
     headerSha256: string;
     fileSize: number;
@@ -66,7 +65,6 @@ export interface WpiIndexManifest {
     pointCount: number;
     pointFormat: number;
     pointRecordLength: number;
-    rgbEncoding?: 'u16' | 'u8-in-u16';
   };
   bounds: PointCloudBounds;
   scale: [number, number, number];
@@ -158,10 +156,6 @@ class BuildNode {
   ownCount = 0;
   seen = 0;
   written = 0;
-  traversed = 0;
-  strideK = 1;
-  routedSeen = 0;
-  routedOwned = 0;
   children: (BuildNode | null)[] | null = null;
 
   constructor(
@@ -196,7 +190,6 @@ function childNode(parent: BuildNode, idx: number): BuildNode {
 function insertPoint(root: BuildNode, wx: number, wy: number, wz: number, capacity: number, maxDepth: number): void {
   let cur = root;
   for (;;) {
-    cur.traversed++;
     if (cur.children) {
       const idx = childIndex(cur.bounds, wx, wy, wz);
       let child = cur.children[idx];
@@ -225,17 +218,13 @@ function routePoint(root: BuildNode, wx: number, wy: number, wz: number): BuildN
   let cur = root;
   for (;;) {
     if (!cur.children) return cur; // leaf owns everything routed to it
-    cur.routedSeen++;
-    if (cur.routedSeen % cur.strideK === 0 && cur.routedOwned < cur.ownCount) {
-      cur.routedOwned++;
-      return cur;
+    if (cur.seen < cur.ownCount) {
+      cur.seen++;
+      return cur; // among the first `ownCount` arrivals — owned here, as in pass 1
     }
     const idx = childIndex(cur.bounds, wx, wy, wz);
-    let child = cur.children[idx];
-    if (!child) {
-      child = childNode(cur, idx);
-      cur.children[idx] = child;
-    }
+    const child = cur.children[idx];
+    if (!child) return cur; // defensive: never seen in practice; keeps the point in a real tile
     cur = child;
   }
 }
@@ -250,18 +239,13 @@ interface SourceMetaLite {
   offset: [number, number, number];
   bounds: PointCloudBounds;
   units: string;
-  rgbEncoding: 'u16' | 'u8-in-u16' | null;
 }
 
 async function readSourceMeta(source: ChunkSource, fileName: string): Promise<SourceMetaLite> {
   const header = await source.read(0, Math.min(LAS_HEADER_BYTES, source.size));
   const offsetToPointData = new DataView(header).getUint32(96, true);
   const preamble = await source.read(0, Math.min(offsetToPointData, source.size));
-  const pointRecordLength = new DataView(header).getUint16(105, true);
-  const pointCount = Number(new DataView(header).getBigUint64(247, true) || BigInt(new DataView(header).getUint32(107, true)));
-  const sampleEnd = Math.min(source.size, offsetToPointData + Math.min(pointCount, 4096) * Math.max(pointRecordLength, 1));
-  const sample = sampleEnd > offsetToPointData ? await source.read(offsetToPointData, sampleEnd) : undefined;
-  const dataset = parseLasMetadata({ fileName, fileSize: source.size, header, preamble, sample });
+  const dataset = parseLasMetadata({ fileName, fileSize: source.size, header, preamble });
   return {
     offsetToPointData: dataset.offsetToPointData,
     pointRecordLength: dataset.pointRecordLength,
@@ -271,7 +255,6 @@ async function readSourceMeta(source: ChunkSource, fileName: string): Promise<So
     offset: dataset.offset,
     bounds: dataset.bounds,
     units: dataset.meta.units.linear,
-    rgbEncoding: dataset.attributes.rgbEncoding,
   };
 }
 
@@ -441,9 +424,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
     shouldCancel,
   );
 
-  for (const node of collectNodes(root)) {
-    node.strideK = Math.max(1, Math.floor(node.traversed / nodeCapacity));
-  }
+  const nodes = collectNodes(root);
   const stride = wpiRecordStride(hasRgb);
   const spooler = new TileSpooler(tilesDir, hasRgb, stride);
 
@@ -482,8 +463,6 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
     shouldCancel,
   );
   await spooler.flushAll();
-
-  const nodes = collectNodes(root);
 
   // Finalize — gzip each node's raw records into a tile.
   const manifestNodes: WpiIndexNode[] = [];
@@ -538,11 +517,10 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
   }
 
   const manifest: WpiIndexManifest = {
-    wpiIndexVersion: 2,
+    wpiIndexVersion: 1,
     indexType: 'wpi-octree',
     generator: { name: 'workbench', version: input.generatorVersion },
     generatedAt: new Date().toISOString(),
-    ownership: 'strided',
     source: {
       headerSha256: input.sourceFingerprint.headerSha256,
       fileSize: input.sourceFingerprint.fileSize,
@@ -550,7 +528,6 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
       pointCount: meta.pointCount,
       pointFormat: meta.pointFormat,
       pointRecordLength: meta.pointRecordLength,
-      rgbEncoding: meta.rgbEncoding ?? undefined,
     },
     bounds: meta.bounds,
     scale: meta.scale,

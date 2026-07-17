@@ -44,7 +44,6 @@ import {
   POINT_CLOUD_INDEX_BUILDER_VERSION,
   POINT_CLOUD_INDEX_WARNING_PREFIX,
   detectIndexStaleness,
-  formatOutdatedIndexWarning,
   formatStaleIndexWarning,
   hasValidIndexForStreaming,
   isManagedIndexWarning,
@@ -497,12 +496,10 @@ export class ProjectService {
         sourceAssetId: sourceAsset.id,
         indexType: 'wpi-octree',
         indexVersion: built.wpiIndexVersion,
-        ownership: built.ownership,
         source: {
           headerSha256,
           fileSize: sourceStats.size,
           mtimeMs: sourceStats.mtimeMs,
-          rgbEncoding: built.source.rgbEncoding,
         },
         pointCount: built.source.pointCount,
         bounds: built.bounds,
@@ -572,6 +569,16 @@ export class ProjectService {
 
     const controller = new AbortController();
     this.surfelBuilds.set(sourceAsset.id, controller);
+    const compatibleIndex = (asset: AssetRecord): boolean => {
+      const metadata = asset.pointCloudIndex;
+      return Boolean(metadata && metadata.indexVersion === 1 && metadata.ownership !== 'strided');
+    };
+    const incompatibleIndexAsset = (this.currentManifest as ProjectManifest).assets.find(
+      (candidate) => candidate.pointCloudIndex?.sourceAssetId === sourceAsset.id && !compatibleIndex(candidate),
+    );
+    if (incompatibleIndexAsset?.pointCloudIndex) {
+      throw new Error('Point-cloud index uses the newer strided ownership format. Rebuild the index before generating surfels for the restored a13 path.');
+    }
     const indexAsset = (this.currentManifest as ProjectManifest).assets.find(
       (candidate) => candidate.pointCloudIndex?.sourceAssetId === sourceAsset.id && hasValidIndexForStreaming(candidate),
     );
@@ -584,10 +591,6 @@ export class ProjectService {
           outDir: stageDir,
           sourceAssetId: sourceAsset.id,
           indexAssetId: indexAsset.id,
-          rgbEncoding: sourceAsset.pointCloud.rgbEncoding ?? null,
-          surfelCellScale: input.surfelCellScale,
-          bbox: input.bbox ?? null,
-          maxPoints: input.maxPoints ?? null,
           sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
           indexDir,
           indexManifest,
@@ -600,8 +603,6 @@ export class ProjectService {
           outDir: stageDir,
           sourceAssetId: sourceAsset.id,
           indexAssetId: null,
-          rgbEncoding: sourceAsset.pointCloud.rgbEncoding ?? null,
-          surfelCellScale: input.surfelCellScale,
           sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
           dataset: preview.dataset,
           onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
@@ -639,7 +640,6 @@ export class ProjectService {
         indexAssetId: result.manifest.indexAssetId,
         surfelType: result.manifest.surfelType,
         surfelVersion: result.manifest.surfelVersion,
-        surfelCellScale: result.manifest.surfelCellScale,
         source: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
         surfelCount: result.manifest.totalSurfels,
         bounds: result.manifest.bounds,
@@ -714,7 +714,7 @@ export class ProjectService {
       const node = nodeByKey.get(key);
       if (!node) continue;
       const decoded = await decodeWpiTileFile(indexDir, node.tile);
-      const rgbEncoding = manifest.source.rgbEncoding ?? sourceAsset?.pointCloud?.rgbEncoding ?? 'u16';
+      const rgbEncoding = sourceAsset?.pointCloud?.rgbEncoding ?? 'u16';
       const count = decoded.pointCount;
       const positions = new Float32Array(count * 3);
       const colors = new Uint8Array(count * 3);
@@ -797,7 +797,6 @@ export class ProjectService {
           normals: decoded.normals,
           confidence: decoded.confidence,
           flags: decoded.flags,
-          eigenvalues: decoded.eigenvalues,
         },
       });
     }
@@ -1013,8 +1012,6 @@ export class ProjectService {
       } catch {
         asset.warnings.push(`${POINT_CLOUD_INDEX_WARNING_PREFIX} freshness could not be verified from the current source.`);
       }
-      const outdated = formatOutdatedIndexWarning(asset.pointCloudIndex.indexVersion);
-      if (outdated) asset.warnings.push(outdated);
     }
 
     for (const asset of next.assets) {

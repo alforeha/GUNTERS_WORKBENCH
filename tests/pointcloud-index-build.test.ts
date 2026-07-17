@@ -160,8 +160,6 @@ describe('buildPointCloudIndex', () => {
     expect(result.metrics.storedPointCount).toBe(points.length);
     expect(result.manifest.tileCount).toBe(1);
     expect(result.manifest.hasRgb).toBe(true);
-    expect(result.manifest.wpiIndexVersion).toBe(2);
-    expect(result.manifest.ownership).toBe('strided');
 
     const decoded = (await collectDecodedPoints(outDir)).sort();
     const source = points.map(canonical).sort();
@@ -202,28 +200,6 @@ describe('buildPointCloudIndex', () => {
       for (const child of byKey.get(key)?.childKeys ?? []) stack.push(child);
     }
     for (const node of result.manifest.nodes) expect(reachable.has(node.key)).toBe(true);
-  });
-
-  it('samples the root tile by stride instead of taking the file-order prefix', async () => {
-    const points = makeSourcePoints(100);
-    const las = buildLas(points);
-    const outDir = await tempOutDir();
-    const result = await buildPointCloudIndex({
-      source: chunkSource(las),
-      outDir,
-      fileName: 'fixture.las',
-      sourceFingerprint: FINGERPRINT(las),
-      generatorVersion: '2.0.0',
-      nodeCapacity: 10,
-      maxDepth: 8,
-    });
-
-    const root = result.manifest.nodes.find((node) => node.key === result.manifest.root)!;
-    const decoded = await decodeWpiTileFile(outDir, root.tile);
-    const rootXs = Array.from(decoded.x);
-    const firstTen = points.slice(0, root.pointCount).map((point) => point.x);
-    expect(rootXs).not.toEqual(firstTen);
-    expect(rootXs.some((x) => x >= points[90]!.x)).toBe(true);
   });
 
   it('writes the completion marker last and validates it', async () => {

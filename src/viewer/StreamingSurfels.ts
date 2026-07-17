@@ -49,8 +49,8 @@ export class StreamingSurfels {
   private readonly loaded = new Map<string, LoadedSurfelNode>();
   private readonly inFlight = new Set<string>();
   private readonly dropped = new Set<string>();
-  private sizeScale = 1;
   private visibleAll = true;
+  private sizeScale = 1;
   private tick = 0;
   private sseThreshold = DEFAULT_SURFEL_SSE_THRESHOLD;
   private budgetMax = 2_500_000;
@@ -94,9 +94,11 @@ export class StreamingSurfels {
         attribute vec3 instanceNormal;
         attribute vec3 instanceColor;
         attribute float instanceRadius;
+        attribute float instanceConfidence;
         attribute float instanceFlags;
         varying vec2 vCorner;
         varying vec3 vColor;
+        varying float vConfidence;
         void main() {
           vec2 corner = position.xy;
           bool screenAligned = mod(instanceFlags, 2.0) >= 1.0;
@@ -116,20 +118,22 @@ export class StreamingSurfels {
           gl_Position = projectionMatrix * mvPosition;
           vCorner = corner;
           vColor = instanceColor;
+          vConfidence = instanceConfidence;
         }
       `,
       fragmentShader: `
         varying vec2 vCorner;
         varying vec3 vColor;
+        varying float vConfidence;
         void main() {
           float dist = dot(vCorner, vCorner);
           if (dist > 1.0) discard;
-          float alpha = 1.0 - smoothstep(0.7, 1.0, dist);
-          if (alpha < 0.5) discard;
-          gl_FragColor = vec4(vColor, 1.0);
+          float radialFade = 1.0 - smoothstep(0.7, 1.0, dist);
+          float alpha = mix(0.55, 0.95, clamp(vConfidence, 0.0, 1.0)) * radialFade;
+          gl_FragColor = vec4(vColor, alpha);
         }
       `,
-      transparent: false,
+      transparent: true,
       alphaTest: 0.12,
       depthWrite: true,
       toneMapped: false,
@@ -257,10 +261,7 @@ export class StreamingSurfels {
     try {
       tiles = await this.fetchTiles(keys);
     } catch {
-      for (const key of keys) {
-        this.inFlight.delete(key);
-        this.dropped.delete(key);
-      }
+      for (const key of keys) this.inFlight.delete(key);
       return;
     }
     let built = false;
@@ -286,6 +287,7 @@ export class StreamingSurfels {
     geometry.setAttribute('instanceNormal', new THREE.InstancedBufferAttribute(payload.normals, 3));
     geometry.setAttribute('instanceColor', new THREE.InstancedBufferAttribute(payload.colors, 3, true));
     geometry.setAttribute('instanceRadius', new THREE.InstancedBufferAttribute(payload.radii, 1));
+    geometry.setAttribute('instanceConfidence', new THREE.InstancedBufferAttribute(payload.confidence, 1));
     geometry.setAttribute('instanceFlags', new THREE.InstancedBufferAttribute(payload.flags, 1));
     geometry.instanceCount = payload.surfelCount;
     geometry.computeBoundingSphere();

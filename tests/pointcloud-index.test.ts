@@ -7,7 +7,6 @@ import { projectManifestSchema } from '../src/shared/manifest-schema';
 import {
   POINT_CLOUD_INDEX_ASSET_KIND,
   detectIndexStaleness,
-  formatOutdatedIndexWarning,
   formatStaleIndexWarning,
   hasValidIndexForStreaming,
   isStaleIndexWarning,
@@ -89,8 +88,7 @@ function indexAssetFor(sourceAsset: AssetRecord, fingerprint: PointCloudIndexSou
     pointCloudIndex: {
       sourceAssetId: sourceAsset.id,
       indexType: 'wpi-octree',
-      indexVersion: 2,
-      ownership: 'strided',
+      indexVersion: 1,
       source: { ...fingerprint, rgbEncoding: sourceAsset.pointCloud?.rgbEncoding },
       pointCount: pc.pointCount,
       bounds: pc.bounds,
@@ -175,11 +173,6 @@ describe('detectIndexStaleness', () => {
     expect(result.stale).toBe(false);
     expect(result.sourceMissing).toBe(true);
     expect(formatStaleIndexWarning(result)).toMatch(/missing/i);
-  });
-
-  it('formats a non-gating outdated warning for older index versions', () => {
-    expect(formatOutdatedIndexWarning(1)).toMatch(/format is outdated/i);
-    expect(formatOutdatedIndexWarning(2)).toBeNull();
   });
 });
 

@@ -415,10 +415,10 @@ export interface AnalyticSurfelProgress {
 export interface AnalyticSurfelMetricsSummary {
   surfelCount: number;
   nodeCount: number;
-  inputPointCount: number;
+  inputPointCount?: number;
   outputSizeBytes: number;
   wallTimeMs: number;
-  mergeMetrics?: import('../core/pointcloud/analytic-surfels').MergeMetrics;
+  mergeMetrics?: unknown;
 }
 
 export interface AnalyticSurfelHierarchyNode {
@@ -448,7 +448,7 @@ export interface AnalyticSurfelTilePayload {
   normals: Float32Array;
   confidence: Float32Array;
   flags: Uint8Array;
-  eigenvalues: Float32Array;
+  eigenvalues?: Float32Array;
 }
 
 export interface LoadAnalyticSurfelHierarchyInput {

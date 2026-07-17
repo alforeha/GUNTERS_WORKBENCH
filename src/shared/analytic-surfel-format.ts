@@ -17,11 +17,10 @@ export interface AnalyticSurfelManifestNode {
 }
 
 export interface AnalyticSurfelManifest {
-  surfelVersion: 1 | 2;
+  surfelVersion: 1;
   surfelType: 'analytic-surfel-octree';
   generator: { name: 'workbench'; version: string };
   generatedAt: string;
-  surfelCellScale: number;
   sourceAssetId: string;
   indexAssetId: string | null;
   source: {
@@ -44,7 +43,6 @@ export interface EncodedAnalyticSurfelTile {
   normals: Float32Array;
   confidence: Float32Array;
   flags: Uint8Array;
-  eigenvalues: Float32Array;
 }
 
 export async function writeAnalyticSurfelTile(
@@ -59,16 +57,14 @@ export async function writeAnalyticSurfelTile(
   const normalBytes = tile.normals.byteLength;
   const confidenceBytes = tile.confidence.byteLength;
   const flagBytes = tile.flags.byteLength;
-  const eigenBytes = tile.eigenvalues.byteLength;
-  const layoutCount = 7;
-  const layoutBytes = layoutCount * 4;
+  const layoutBytes = 6 * 4;
   const buffer = Buffer.allocUnsafe(
-    headerBytes + layoutBytes + positionBytes + colorBytes + radiusBytes + normalBytes + confidenceBytes + flagBytes + eigenBytes,
+    headerBytes + layoutBytes + positionBytes + colorBytes + radiusBytes + normalBytes + confidenceBytes + flagBytes,
   );
   let offset = 0;
   buffer.writeUInt32LE(tile.surfelCount, offset);
   offset += 4;
-  for (const size of [positionBytes, colorBytes, radiusBytes, normalBytes, confidenceBytes, flagBytes, eigenBytes]) {
+  for (const size of [positionBytes, colorBytes, radiusBytes, normalBytes, confidenceBytes, flagBytes]) {
     buffer.writeUInt32LE(size, offset);
     offset += 4;
   }
@@ -77,8 +73,7 @@ export async function writeAnalyticSurfelTile(
   offset += copyTyped(buffer, offset, tile.radii);
   offset += copyTyped(buffer, offset, tile.normals);
   offset += copyTyped(buffer, offset, tile.confidence);
-  offset += copyTyped(buffer, offset, tile.flags);
-  copyTyped(buffer, offset, tile.eigenvalues);
+  copyTyped(buffer, offset, tile.flags);
   await writeFile(path.join(tilesDir, tileName), gzipSync(buffer));
 }
 
@@ -99,15 +94,6 @@ export async function readAnalyticSurfelTile(tilesDir: string, tileName: string)
   offset += 4;
   const flagBytes = raw.readUInt32LE(offset);
   offset += 4;
-
-  const v1Total = 4 + 6 * 4 + positionBytes + colorBytes + radiusBytes + normalBytes + confidenceBytes + flagBytes;
-  const isV2 = raw.length > v1Total;
-  let eigenBytes = 0;
-  if (isV2) {
-    eigenBytes = raw.readUInt32LE(offset);
-    offset += 4;
-  }
-
   const positions = sliceFloat32(raw, offset, positionBytes);
   offset += positionBytes;
   const colors = sliceUint8(raw, offset, colorBytes);
@@ -119,16 +105,7 @@ export async function readAnalyticSurfelTile(tilesDir: string, tileName: string)
   const confidence = sliceFloat32(raw, offset, confidenceBytes);
   offset += confidenceBytes;
   const flags = sliceUint8(raw, offset, flagBytes);
-  offset += flagBytes;
-
-  const eigenvalues = (isV2 && eigenBytes > 0)
-    ? sliceFloat32(raw, offset, eigenBytes)
-    : new Float32Array(0);
-  if (isV2 && eigenBytes > 0) {
-    offset += eigenBytes;
-  }
-
-  return { surfelCount, positions, colors, radii, normals, confidence, flags, eigenvalues };
+  return { surfelCount, positions, colors, radii, normals, confidence, flags };
 }
 
 function copyTyped(buffer: Buffer, offset: number, array: Float32Array | Uint8Array): number {
@@ -137,11 +114,7 @@ function copyTyped(buffer: Buffer, offset: number, array: Float32Array | Uint8Ar
 }
 
 function sliceFloat32(buffer: Buffer, offset: number, byteLength: number): Float32Array {
-  const src = buffer.subarray(offset, offset + byteLength);
-  const ab = new ArrayBuffer(byteLength);
-  const dst = new Uint8Array(ab);
-  dst.set(src);
-  return new Float32Array(ab);
+  return new Float32Array(buffer.buffer.slice(buffer.byteOffset + offset, buffer.byteOffset + offset + byteLength));
 }
 
 function sliceUint8(buffer: Buffer, offset: number, byteLength: number): Uint8Array {

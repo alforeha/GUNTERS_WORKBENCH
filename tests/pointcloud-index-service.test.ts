@@ -143,8 +143,7 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(indexAsset.truthStatus).toBe('indexed-full');
     expect(indexAsset.pointCloudIndex?.sourceAssetId).toBe(assetId);
     expect(indexAsset.pointCloudIndex?.indexType).toBe('wpi-octree');
-    expect(indexAsset.pointCloudIndex?.indexVersion).toBe(2);
-    expect(indexAsset.pointCloudIndex?.ownership).toBe('strided');
+    expect(indexAsset.pointCloudIndex?.indexVersion).toBe(1);
 
     expect(existsSync(path.join(projectFolder, 'derived', assetId, 'index', 'index.json'))).toBe(true);
     expect(existsSync(path.join(projectFolder, 'derived', assetId, 'index', 'COMPLETE'))).toBe(true);
@@ -275,7 +274,7 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(tiles[0]!.payload.radii.length).toBe(tiles[0]!.payload.surfelCount);
   });
 
-  it('exposes surfel cell scale as a generation control', async () => {
+  it('still generates surfels when current API passes an unused scale override', async () => {
     const parent = await mkdtemp(path.join(tmpdir(), 'wb-scale-'));
     const fixtureDir = await mkdtemp(path.join(tmpdir(), 'las-scale-'));
     const sourceFile = await writeClusteredLasFile(fixtureDir, 'scale-fixture.las', 24);
@@ -285,7 +284,8 @@ describe('ProjectService.generatePointCloudIndex', () => {
     const assetId = imported.manifest.assets.find((asset) => asset.kind === 'point-cloud')!.id;
     const generated = await svc.generateAnalyticSurfels({ assetId, surfelCellScale: 0.5 });
     const surfelAsset = generated.session.manifest.assets.find((asset) => asset.id === generated.surfelAssetId)!;
-    expect(surfelAsset.analyticSurfel?.surfelCellScale).toBe(0.5);
+    expect(surfelAsset.analyticSurfel?.sourceAssetId).toBe(assetId);
+    expect(generated.metrics.surfelCount).toBeGreaterThan(0);
   });
 
   it('builds analytic surfels from an index and survives reopen', async () => {
@@ -303,21 +303,17 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(reopenedAsset?.warnings ?? []).toEqual([]);
   });
 
-  it('treats a v1 index as streamable but warns that the format is outdated', async () => {
-    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+  it('rejects surfel generation from an incompatible strided index and asks for rebuild', async () => {
+    const { svc, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
     const generated = await svc.generatePointCloudIndex({ assetId });
     const manifest = structuredClone(generated.session.manifest);
     const indexAsset = manifest.assets.find((a) => a.id === generated.indexAssetId)!;
     if (!indexAsset.pointCloudIndex) throw new Error('missing pointCloudIndex metadata');
-    indexAsset.pointCloudIndex.indexVersion = 1;
-    delete indexAsset.pointCloudIndex.ownership;
+    indexAsset.pointCloudIndex.indexVersion = 2;
+    indexAsset.pointCloudIndex.ownership = 'strided';
     await svc.saveProject(manifest);
-    await svc.closeProject();
 
-    const reopened = await svc.openProject({ projectFolder });
-    const reopenedIndex = reopened.manifest.assets.find((a) => a.id === generated.indexAssetId)!;
-    expect(reopenedIndex.warnings.some((warning) => /format is outdated/i.test(warning))).toBe(true);
-    expect(reopenedIndex.warnings.some((warning) => /out of date/i.test(warning))).toBe(false);
+    await expect(svc.generateAnalyticSurfels({ assetId })).rejects.toThrow(/rebuild the index/i);
   });
 
   it('keeps 8-bit RGB stored in u16 bright in both preview and indexed paths', async () => {
