@@ -41,6 +41,7 @@ import {
   buildRegionListModel,
   buildSimPanelModel,
   buildWorkSurfaceModel,
+  compactCount,
   escapeHtml,
   type BuildingListItem,
   type DerivedStatusModel,
@@ -609,7 +610,11 @@ function renderIsolateSectionHtml(
         <div class="ws-detail">${
           activeLoad.sectorCount > 1
             ? `Full survey data: sector ${activeLoad.activeSector + 1} of ${activeLoad.sectorCount} (area exceeds display budget; amber rect marks the active sector).`
-            : 'Full survey data loaded for the whole area.'
+            : 'Full survey data streaming for the whole area.'
+        }${
+          activeLoad.estimatedSectorPoints !== null
+            ? ` ~${compactCount(activeLoad.estimatedSectorPoints)} indexed points in this ${activeLoad.sectorCount > 1 ? 'sector' : 'area'}; live count in the viewer banner.`
+            : ''
         }</div>
         ${
           activeLoad.sectorCount > 1

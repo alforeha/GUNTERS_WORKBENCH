@@ -18,6 +18,7 @@ import {
   buildIndexDisclosureLine,
   buildPointCloudCards,
   buildPreviewDisclosureLine,
+  cloneLayerAppearance,
   compactCount,
   computeMasterToggleUpdates,
   findLayerAsset,
@@ -29,6 +30,12 @@ import {
   type LayerVisibilityUpdate,
   type ProjectStatusLines,
 } from './model'
+import {
+  applyRadiusScaleStep,
+  formatAppearanceDisclosure,
+  formatGlobalShowWithinDisclosure,
+  type DetailPreset,
+} from '../viewer/pointCloudAppearance'
 
 export type { ProjectStatusLines }
 
@@ -144,7 +151,7 @@ export class LayerController {
   private readonly masterMemory = new Map<string, Map<string, boolean>>()
 
   private edlEnabled = true
-  private fogEnabled = false
+  private showWithinFt: number | null = null
 
   private status: ProjectStatusLines = { projectLine: 'No project loaded', recoveryLine: '' }
 
@@ -239,7 +246,7 @@ export class LayerController {
         void this.requestNearCameraDensification(handle, nodeIds)
       })
       this.viewer.setPointCloudEdl(this.edlEnabled)
-      this.viewer.setPointCloudFog(this.fogEnabled)
+      this.viewer.setGlobalShowWithin(this.showWithinFt)
       this.events.onViewerCreated(this.viewer)
     }
     return this.viewer
@@ -254,17 +261,20 @@ export class LayerController {
     this.ensureViewer().setPointCloudEdl(on)
   }
 
-  setFog(on: boolean): void {
-    this.fogEnabled = on
-    this.ensureViewer().setPointCloudFog(on)
+  setShowWithin(distanceFt: number | null): void {
+    this.showWithinFt = distanceFt
+    if (this.viewer) this.viewer.setGlobalShowWithin(distanceFt)
+    for (const layerId of this.previewLayers.keys()) this.pushPointAppearance(layerId)
+    for (const layerId of this.indexLayers.keys()) this.pushPointAppearance(layerId)
+    this.updatePointCloudDisclosure()
   }
 
   isEdlEnabled(): boolean {
     return this.edlEnabled
   }
 
-  isFogEnabled(): boolean {
-    return this.fogEnabled
+  getShowWithin(): number | null {
+    return this.showWithinFt
   }
 
   // -------------------------------------------------------------------------
@@ -272,13 +282,13 @@ export class LayerController {
   // -------------------------------------------------------------------------
 
   getLayerAppearance(layerId: string): LayerAppearance {
-    return { ...(this.appearance.get(layerId) ?? DEFAULT_LAYER_APPEARANCE) }
+    return cloneLayerAppearance(this.appearance.get(layerId) ?? DEFAULT_LAYER_APPEARANCE)
   }
 
   private appearanceFor(layerId: string): LayerAppearance {
     let entry = this.appearance.get(layerId)
     if (!entry) {
-      entry = { ...DEFAULT_LAYER_APPEARANCE }
+      entry = cloneLayerAppearance(DEFAULT_LAYER_APPEARANCE)
       this.appearance.set(layerId, entry)
     }
     return entry
@@ -311,6 +321,56 @@ export class LayerController {
       const active = this.findLayer(layerId)?.status === 'active'
       this.viewer.setAnalyticSurfelsDisplay(surfelEntry.handle, active, scale)
     }
+  }
+
+  /** Point radius: 'auto' keeps renderer sizing; a number is a fixed radius in feet. */
+  setLayerPointRadius(layerId: string, radius: 'auto' | number): void {
+    const look = this.appearanceFor(layerId)
+    if (radius === 'auto') {
+      look.pointAppearance.radiusMode = 'auto'
+    } else {
+      look.pointAppearance.radiusMode = 'fixed'
+      look.pointAppearance.fixedRadiusFt = radius
+    }
+    this.pushPointAppearance(layerId)
+  }
+
+  /** One ÷10/÷2/×2/×10 quick step over the current auto or fixed radius. */
+  stepLayerRadiusScale(layerId: string, factor: number): void {
+    const look = this.appearanceFor(layerId)
+    look.pointAppearance.radiusScale = applyRadiusScaleStep(look.pointAppearance.radiusScale, factor)
+    this.pushPointAppearance(layerId)
+  }
+
+  /** The quick-row Auto button: back to auto radius at ×1. */
+  resetLayerRadiusAuto(layerId: string): void {
+    const look = this.appearanceFor(layerId)
+    look.pointAppearance.radiusMode = 'auto'
+    look.pointAppearance.radiusScale = 1
+    this.pushPointAppearance(layerId)
+  }
+
+  /** Indexed-cloud detail preset over the SSE threshold / point budget. */
+  setLayerDetail(layerId: string, preset: DetailPreset): void {
+    this.appearanceFor(layerId).detail = preset
+    const indexEntry = this.indexLayers.get(layerId)
+    if (indexEntry) this.viewer?.setPointCloudIndexDetail(indexEntry.handle, preset)
+    this.updatePointCloudDisclosure()
+  }
+
+  private pointAppearanceForViewer(layerId: string) {
+    const look = this.appearanceFor(layerId)
+    return { ...look.pointAppearance, rangeClipFt: this.showWithinFt }
+  }
+
+  private pushPointAppearance(layerId: string): void {
+    if (!this.viewer) return
+    const appearance = this.pointAppearanceForViewer(layerId)
+    const previewEntry = this.previewLayers.get(layerId)
+    if (previewEntry) this.viewer.setPointCloudAppearance(previewEntry.handle, appearance)
+    const indexEntry = this.indexLayers.get(layerId)
+    if (indexEntry) this.viewer.setPointCloudIndexAppearance(indexEntry.handle, appearance)
+    this.updatePointCloudDisclosure()
   }
 
   // -------------------------------------------------------------------------
@@ -352,6 +412,9 @@ export class LayerController {
       if (!layer || layer.status !== 'active') continue
       const densifiedCount = this.viewer ? this.viewer.getPointCloudDensifiedPointCount(entry.handle) : 0
       lines.push(buildPreviewDisclosureLine(entry.preview, densifiedCount))
+      const look = this.appearanceFor(entry.layerId)
+      const appearanceText = formatAppearanceDisclosure(look.pointAppearance, null, false)
+      if (appearanceText) lines.push(appearanceText)
     }
 
     if (this.viewer) {
@@ -360,6 +423,15 @@ export class LayerController {
         if (!layer || layer.status !== 'active') continue
         const text = this.viewer.getPointCloudIndexDisclosure(entry.handle)
         if (text) lines.push(buildIndexDisclosureLine(text))
+        // Isolate-area accounting gets its own line so the budget-pinned
+        // global count never masquerades as the isolate count.
+        const isolateText = this.viewer.getPointCloudIndexIsolateDisclosure(entry.handle)
+        if (isolateText) lines.push(isolateText)
+        // Non-default appearance is disclosed so a sparse-looking cloud is
+        // never mistaken for sparse data when a display setting caused it.
+        const look = this.appearanceFor(entry.layerId)
+        const appearanceText = formatAppearanceDisclosure(look.pointAppearance, look.detail, false)
+        if (appearanceText) lines.push(appearanceText)
       }
       for (const entry of this.derivedSurfelLayers.values()) {
         const layer = this.findLayer(entry.layerId)
@@ -368,6 +440,9 @@ export class LayerController {
         if (text) lines.push(text)
       }
     }
+
+    const globalShowWithinText = formatGlobalShowWithinDisclosure(this.showWithinFt)
+    if (globalShowWithinText) lines.push(globalShowWithinText)
 
     this.events.onViewStateLines(lines)
   }
@@ -450,6 +525,7 @@ export class LayerController {
     const existing = this.previewLayers.get(layer.id)
     if (existing) {
       engine.setPointCloudDisplay(existing.handle, layer.status === 'active', look.pointSize)
+      engine.setPointCloudAppearance(existing.handle, this.pointAppearanceForViewer(layer.id))
       this.updatePointCloudDisclosure()
       return
     }
@@ -473,6 +549,7 @@ export class LayerController {
     engine.setPointCloudDisplay(handle, layer.status === 'active', look.pointSize)
     engine.setPointCloudDensifiedPointBudget(handle, 1_500_000)
     engine.setPointCloudDisplayMode(handle, look.colorMode)
+    engine.setPointCloudAppearance(handle, this.pointAppearanceForViewer(layer.id))
     this.updatePointCloudDisclosure()
   }
 
@@ -487,6 +564,8 @@ export class LayerController {
       this.indexLayers.delete(layer.id)
     } else if (existing) {
       engine.setPointCloudIndexDisplay(existing.handle, layer.status === 'active', look.pointSize)
+      engine.setPointCloudIndexAppearance(existing.handle, this.pointAppearanceForViewer(layer.id))
+      engine.setPointCloudIndexDetail(existing.handle, look.detail)
       this.updatePointCloudDisclosure()
       return
     }
@@ -499,6 +578,8 @@ export class LayerController {
     this.selectedPointCloudSourceAssetId = sourceAssetId
     engine.setPointCloudIndexDisplay(handle, layer.status === 'active', look.pointSize)
     engine.setPointCloudIndexDisplayMode(handle, look.colorMode)
+    engine.setPointCloudIndexAppearance(handle, this.pointAppearanceForViewer(layer.id))
+    engine.setPointCloudIndexDetail(handle, look.detail)
     this.syncDisclosureRefreshLoop()
     this.updatePointCloudDisclosure()
   }

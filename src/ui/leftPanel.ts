@@ -8,6 +8,12 @@
 import type { ProjectSession } from '../shared/ipc'
 import type { ProjectManifest } from '../shared/workbench-types'
 import {
+  DETAIL_PRESETS,
+  FIXED_RADIUS_PRESETS_FT,
+  formatRadiusScale,
+  type DetailPreset,
+} from '../viewer/pointCloudAppearance'
+import {
   buildPointCloudCards,
   buildSurfaceCards,
   escapeHtml,
@@ -61,7 +67,10 @@ export interface LeftPanelDeps {
   toggleAssetMaster(assetId: string, on: boolean): Promise<void>
   removeAsset(assetId: string): Promise<void>
   setLayerColorMode(layerId: string, mode: ColorMode): void
-  setLayerPointSize(layerId: string, size: number): void
+  setLayerPointRadius(layerId: string, radius: 'auto' | number): void
+  stepLayerRadiusScale(layerId: string, factor: number): void
+  resetLayerRadiusAuto(layerId: string): void
+  setLayerDetail(layerId: string, preset: DetailPreset): void
   setLayerSurfelScale(layerId: string, scale: number): void
   importPointCloud(): Promise<void>
   openAsset(assetId: string): void
@@ -90,16 +99,53 @@ function renderColorModeSelect(layerId: string, look: LayerAppearance): string {
   `
 }
 
+/** Point radius select: Auto (renderer-derived) or a fixed real-world radius in feet. */
+function renderPointRadiusControls(layerId: string, look: LayerAppearance): string {
+  const appearance = look.pointAppearance
+  const id = escapeHtml(layerId)
+  const radiusOptions = [
+    `<option value="auto"${appearance.radiusMode === 'auto' ? ' selected' : ''}>Auto</option>`,
+    ...FIXED_RADIUS_PRESETS_FT.map(
+      (radiusFt) =>
+        `<option value="${radiusFt}"${
+          appearance.radiusMode === 'fixed' && appearance.fixedRadiusFt === radiusFt ? ' selected' : ''
+        }>${radiusFt} ft</option>`,
+    ),
+  ].join('')
+  const scaleButton = (factor: number, label: string): string =>
+    `<button data-action="radius-scale" data-layer-id="${id}" data-factor="${factor}" title="Scale the current point radius">${label}</button>`
+  return `
+    <label class="view-control">Point radius
+      <select data-action="point-radius" data-layer-id="${id}">${radiusOptions}</select>
+    </label>
+    <div class="view-control radius-scale-row">
+      ${scaleButton(0.1, '÷10')}
+      ${scaleButton(0.5, '÷2')}
+      <button data-action="radius-auto" data-layer-id="${id}" title="Back to auto radius at ×1">Auto</button>
+      ${scaleButton(2, '×2')}
+      ${scaleButton(10, '×10')}
+      <span class="radius-scale-label" title="Current radius scale">${escapeHtml(formatRadiusScale(appearance.radiusScale))}</span>
+    </div>
+  `
+}
+
+function renderDetailSelect(layerId: string, look: LayerAppearance): string {
+  const options = DETAIL_PRESETS.map(
+    (preset) => `<option value="${preset.id}"${look.detail === preset.id ? ' selected' : ''}>${preset.label}</option>`,
+  ).join('')
+  return `
+    <label class="view-control" title="Refinement preset: streaming detail vs load/render pressure">Detail
+      <select data-action="detail-preset" data-layer-id="${escapeHtml(layerId)}">${options}</select>
+    </label>
+  `
+}
+
 function renderViewRowControls(view: PointCloudCardModel['views'][number], look: LayerAppearance): string {
   const parts: string[] = []
   if (view.supportsColorMode) parts.push(renderColorModeSelect(view.layerId, look))
   if (view.supportsPointSize) {
-    parts.push(`
-      <label class="view-control">Point size
-        <input type="range" min="1" max="5" step="1" value="${look.pointSize}"
-          data-action="point-size" data-layer-id="${escapeHtml(view.layerId)}" />
-      </label>
-    `)
+    parts.push(renderPointRadiusControls(view.layerId, look))
+    if (view.viewKind === 'index') parts.push(renderDetailSelect(view.layerId, look))
   }
   if (view.supportsSurfelScale) {
     parts.push(`
@@ -353,6 +399,18 @@ export function mountLeftPanel(mount: HTMLElement, deps: LeftPanelDeps): LeftPan
       void deps.importPointCloud()
       return
     }
+    const layerId = target.dataset.layerId ?? null
+    if (action === 'radius-scale' && layerId) {
+      const factor = Number(target.dataset.factor)
+      if (Number.isFinite(factor) && factor > 0) deps.stepLayerRadiusScale(layerId, factor)
+      render() // reflect the new scale label
+      return
+    }
+    if (action === 'radius-auto' && layerId) {
+      deps.resetLayerRadiusAuto(layerId)
+      render()
+      return
+    }
   })
 
   mount.addEventListener('change', (event) => {
@@ -364,6 +422,11 @@ export function mountLeftPanel(mount: HTMLElement, deps: LeftPanelDeps): LeftPan
       void deps.setLayerVisibility(layerId, target.checked)
     } else if (action === 'color-mode' && target instanceof HTMLSelectElement) {
       deps.setLayerColorMode(layerId, target.value as ColorMode)
+    } else if (action === 'point-radius' && target instanceof HTMLSelectElement) {
+      deps.setLayerPointRadius(layerId, target.value === 'auto' ? 'auto' : Number(target.value))
+      render()
+    } else if (action === 'detail-preset' && target instanceof HTMLSelectElement) {
+      deps.setLayerDetail(layerId, target.value as DetailPreset)
     }
   })
 
@@ -372,8 +435,7 @@ export function mountLeftPanel(mount: HTMLElement, deps: LeftPanelDeps): LeftPan
     const action = target.dataset.action
     const layerId = target.dataset.layerId
     if (!action || !layerId || !(target instanceof HTMLInputElement)) return
-    if (action === 'point-size') deps.setLayerPointSize(layerId, Number(target.value))
-    else if (action === 'surfel-scale') deps.setLayerSurfelScale(layerId, Number(target.value))
+    if (action === 'surfel-scale') deps.setLayerSurfelScale(layerId, Number(target.value))
   })
 
   render()

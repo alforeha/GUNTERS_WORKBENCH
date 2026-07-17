@@ -1,7 +1,13 @@
 import * as THREE from 'three';
 import type { PointCloudDataset, PointCloudNodePayload, PointCloudOctreeNode } from '../core/contract';
 import type { Vec3 } from './geometry';
-import { applyIsolateClip, createIsolateClipUniforms, setIsolateClipPolygon } from './isolateClip';
+import { applyIsolateClip, createIsolateClipUniforms, setIsolateClipPolygon, setRangeClipDistance } from './isolateClip';
+import {
+  DEFAULT_POINT_APPEARANCE,
+  effectivePointDiameter,
+  rangeClipWorld,
+  type PointAppearance,
+} from './pointCloudAppearance';
 import {
   GeotiffOverviewSampler,
   POINT_BUDGET_MAX,
@@ -43,6 +49,7 @@ export class RenderPointCloud {
   private readonly isolateClip = createIsolateClipUniforms();
   private visibleAll = true;
   private pointSize = 2;
+  private appearance: PointAppearance = DEFAULT_POINT_APPEARANCE;
   private density = 1;
   private originDelta: Vec3;
   private origin: Vec3;
@@ -67,7 +74,7 @@ export class RenderPointCloud {
     this.group.name = `point-cloud:${handle}`;
     this.group.position.set(this.originDelta[0], this.originDelta[1], this.originDelta[2]);
     this.material = new THREE.PointsMaterial({
-      size: this.worldPointSize(this.pointSize),
+      size: this.effectivePointSize(),
       sizeAttenuation: true,
       vertexColors: true,
       toneMapped: false,
@@ -104,8 +111,30 @@ export class RenderPointCloud {
     this.visibleAll = visible;
     this.pointSize = THREE.MathUtils.clamp(pointSize, 1, 5);
     this.group.visible = visible;
-    this.material.size = this.worldPointSize(this.pointSize);
+    this.material.size = this.effectivePointSize();
     this.material.needsUpdate = true;
+  }
+
+  /** Shared appearance model: fixed/auto radius, quick scale, and range clip. */
+  setAppearance(appearance: PointAppearance): void {
+    this.appearance = appearance;
+    setRangeClipDistance(this.isolateClip, rangeClipWorld(appearance, this.dataset.meta.units.linear));
+    this.material.size = this.effectivePointSize();
+    this.material.needsUpdate = true;
+  }
+
+  /** Active camera-range clip in world units (null = off); picking parity uses this. */
+  getRangeClipWorld(): number | null {
+    return this.isolateClip.rangeClip.value > 0 ? this.isolateClip.rangeClip.value : null;
+  }
+
+  /** Current world-space point diameter (PointsMaterial.size); exposed for tests. */
+  get pointDiameterWorld(): number {
+    return this.material.size;
+  }
+
+  private effectivePointSize(): number {
+    return effectivePointDiameter(this.appearance, this.dataset.meta.units.linear, this.worldPointSize(this.pointSize));
   }
 
   setDensity(density: number): void {
@@ -460,7 +489,8 @@ export class RenderPointCloud {
     return THREE.MathUtils.lerp(0.04, 0.18, (THREE.MathUtils.clamp(multiplier, 1, 5) - 1) / 4);
   }
 
-  private static getDiskTexture(): THREE.Texture {
+  private static getDiskTexture(): THREE.Texture | null {
+    if (typeof document === 'undefined') return null; // headless (tests): no canvas texture
     if (RenderPointCloud.diskTexture) return RenderPointCloud.diskTexture;
     const canvas = document.createElement('canvas');
     canvas.width = 64;

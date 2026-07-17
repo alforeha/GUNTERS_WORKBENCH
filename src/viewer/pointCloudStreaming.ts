@@ -392,12 +392,12 @@ export function isSettled(selectedKeys: Set<string>, loadedKeys: Set<string>): b
 }
 
 /** Compact number formatter for disclosure banners (e.g. 1.2M). */
-function compact(n: number): string {
+export function compactPoints(n: number): string {
   return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
 }
 
 /** Disclosure text for the indexed-full streaming state, distinct from preview/densification. */
 export function formatIndexedFullDisclosure(loadedPoints: number, totalPoints: number, settled: boolean): string {
   const state = settled ? 'settled' : 'refining';
-  return `Indexed-full — streaming ${compact(loadedPoints)} of ${compact(totalPoints)} points · ${state}`;
+  return `Indexed-full — streaming ${compactPoints(loadedPoints)} of ${compactPoints(totalPoints)} points · ${state}`;
 }

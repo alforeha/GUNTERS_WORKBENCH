@@ -125,8 +125,28 @@ describe('renderLeftPanelHtml', () => {
     expect(html).toContain('truth-indexed-full')
     expect(html).toContain('truth-derived')
     expect(html).toContain('data-action="color-mode"')
-    expect(html).toContain('data-action="point-size"')
+    expect(html).toContain('data-action="point-radius"')
     expect(html).toContain('data-action="surfel-scale"')
+  })
+
+  it('renders point radius presets in feet with the quick scale row and no per-layer Show Within control', () => {
+    const html = renderLeftPanelHtml(renderModel({ expandedAssetId: SOURCE_ASSET_ID }))
+    expect(html).toContain('Point radius')
+    expect(html).toContain('>0.12 ft</option>')
+    expect(html).toContain('>0.03 ft</option>')
+    expect(html).toContain('>0.25 ft</option>')
+    expect(html).toContain('data-action="radius-scale"')
+    expect(html).toContain('÷10')
+    expect(html).toContain('×10')
+    expect(html).toContain('data-action="radius-auto"')
+    expect(html).not.toContain('data-action="range-clip"')
+  })
+
+  it('offers the detail preset only on the indexed view row', () => {
+    const html = renderLeftPanelHtml(renderModel({ expandedAssetId: SOURCE_ASSET_ID }))
+    const detailCount = (html.match(/data-action="detail-preset"/g) ?? []).length
+    expect(detailCount).toBe(1) // index row only; preview row gets no detail select
+    expect(html).toContain('>Inspect</option>')
   })
 
   it('renders classification as a disabled planned option, never functional', () => {

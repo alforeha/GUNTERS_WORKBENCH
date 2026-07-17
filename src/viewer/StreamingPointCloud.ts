@@ -12,6 +12,7 @@ import {
 } from './pointCloudLod';
 import {
   deriveFinestVisibleLevels,
+  estimateRegionPoints,
   formatIndexedFullDisclosure,
   isSettled,
   planEviction,
@@ -25,7 +26,21 @@ import {
   type StreamCameraView,
   type StreamNode,
 } from './pointCloudStreaming';
-import { applyIsolateClip, createIsolateClipUniforms, setIsolateClipPolygon } from './isolateClip';
+import {
+  countPayloadPointsInPolygon,
+  polygonBoundsXY,
+  regionToRenderPolygon,
+  renderPolygonToSurveyRegion,
+  type IsolateAccounting,
+  type PolygonVertexXY,
+} from './isolateAccounting';
+import { applyIsolateClip, createIsolateClipUniforms, setIsolateClipPolygon, setRangeClipDistance } from './isolateClip';
+import {
+  DEFAULT_POINT_APPEARANCE,
+  effectivePointDiameter,
+  rangeClipWorld,
+  type PointAppearance,
+} from './pointCloudAppearance';
 import { estimateLowPercentileGroundZ, type GroundEstimate } from './walkSurface';
 
 /** Fetches decoded, origin-relative tile payloads for the given node keys (IPC-backed in-app). */
@@ -57,6 +72,8 @@ interface LoadedStreamNode {
   colorEpoch: number;
   builtStride: number;
   materialLevel: number;
+  /** Cached inside-isolate counts, valid for one (isolateEpoch, colorEpoch) pair. */
+  areaCount?: { isolateEpoch: number; colorEpoch: number; inside: number; insideFiltered: number };
 }
 
 /**
@@ -92,7 +109,11 @@ export class StreamingPointCloud {
 
   private visibleAll = true;
   private pointSize = 2;
+  private appearance: PointAppearance = DEFAULT_POINT_APPEARANCE;
   private focusRegion: RegionXY | null = null;
+  private isolatePolygon: PolygonVertexXY[] | null = null;
+  /** Bumped whenever the effective isolate area changes; invalidates areaCount caches. */
+  private isolateEpoch = 0;
   private displayMode: PointDisplayMode;
   private filter: FilterState = defaultFilterState();
   private overviewSampler: GeotiffOverviewSampler | null = null;
@@ -173,6 +194,22 @@ export class StreamingPointCloud {
     this.visibleAll = visible;
     this.pointSize = THREE.MathUtils.clamp(pointSize, 1, 5);
     this.group.visible = visible;
+    this.refreshMaterialSizes();
+  }
+
+  /** Shared appearance model: fixed/auto radius, quick scale, and range clip. */
+  setAppearance(appearance: PointAppearance): void {
+    this.appearance = appearance;
+    setRangeClipDistance(this.isolateClip, rangeClipWorld(appearance, this.units));
+    this.refreshMaterialSizes();
+  }
+
+  /** Active camera-range clip in world units (null = off); picking parity uses this. */
+  getRangeClipWorld(): number | null {
+    return this.isolateClip.rangeClip.value > 0 ? this.isolateClip.rangeClip.value : null;
+  }
+
+  private refreshMaterialSizes(): void {
     for (const [level, material] of this.levelMaterials) {
       material.size = this.materialSizeForLevel(level);
       material.needsUpdate = true;
@@ -188,6 +225,8 @@ export class StreamingPointCloud {
   /** Isolate focus: render-local XY polygon outside which points are hidden; null restores all. */
   setIsolateClip(polygonXY: { x: number; y: number }[] | null): void {
     setIsolateClipPolygon(this.isolateClip, polygonXY);
+    this.isolatePolygon = polygonXY && polygonXY.length >= 3 ? polygonXY : null;
+    this.isolateEpoch++;
   }
 
   /**
@@ -197,6 +236,7 @@ export class StreamingPointCloud {
    */
   setFocusLoadRegion(region: RegionXY | null): void {
     this.focusRegion = region;
+    this.isolateEpoch++;
   }
 
   /** Sector plan for a region that may exceed the render budget (survey XY). */
@@ -238,6 +278,83 @@ export class StreamingPointCloud {
 
   getDisclosure(): string {
     return formatIndexedFullDisclosure(this.loadedPointCount, this.totalPoints, this.settled);
+  }
+
+  /** Index-metadata estimate of points in a survey XY region (no loading involved). */
+  estimateRegionPointsIn(region: RegionXY): number {
+    return estimateRegionPoints(this.nodesByKey, this.rootKey, region);
+  }
+
+  /**
+   * Isolate-area accounting for the disclosure: null while no isolate focus or
+   * load region is active. Counted in the same render-local space the GPU clip
+   * discards in, so "drawn in area" is exactly what the tech sees.
+   */
+  getIsolateAccounting(): IsolateAccounting | null {
+    const polygon = this.isolatePolygon ?? (this.focusRegion ? regionToRenderPolygon(this.focusRegion, this.sceneOrigin) : null);
+    if (!polygon) return null;
+    const surveyRegion = this.focusRegion ?? renderPolygonToSurveyRegion(polygon, this.sceneOrigin);
+    const regionSelection = this.focusRegion
+      ? selectRegionNodes(this.nodesByKey, this.rootKey, this.focusRegion, this.budgetMax)
+      : null;
+    let regionLoadedPoints = 0;
+    if (regionSelection) {
+      for (const key of regionSelection.keys) {
+        if (this.loaded.has(key)) regionLoadedPoints += this.nodesByKey.get(key)?.pointCount ?? 0;
+      }
+    }
+    const counts = this.countAreaPoints(polygon);
+    return {
+      focusActive: this.isolatePolygon !== null,
+      regionActive: this.focusRegion !== null,
+      estimatedAreaPoints: estimateRegionPoints(this.nodesByKey, this.rootKey, surveyRegion),
+      regionSelectedPoints: regionSelection?.estimatedPoints ?? 0,
+      regionLoadedPoints,
+      regionBudgetLimited: regionSelection?.budgetLimited ?? false,
+      loadedInArea: counts.loaded,
+      drawnInArea: counts.drawn,
+    };
+  }
+
+  /**
+   * Sums loaded/drawn points inside the isolate polygon. Per-node counts are
+   * cached against (isolateEpoch, colorEpoch) so the steady-state cost per
+   * disclosure tick is one map walk, not a 5M-point recount.
+   */
+  private countAreaPoints(polygon: PolygonVertexXY[]): { loaded: number; drawn: number } {
+    const areaBounds = polygonBoundsXY(polygon);
+    const [ox, oy] = this.sceneOrigin;
+    let loaded = 0;
+    let drawn = 0;
+    for (const ln of this.loaded.values()) {
+      const { bounds } = ln.node; // survey space; polygon is render-local (survey - sceneOrigin)
+      if (
+        bounds.maxX - ox < areaBounds.minX ||
+        bounds.minX - ox > areaBounds.maxX ||
+        bounds.maxY - oy < areaBounds.minY ||
+        bounds.minY - oy > areaBounds.maxY
+      ) {
+        continue;
+      }
+      if (!ln.areaCount || ln.areaCount.isolateEpoch !== this.isolateEpoch || ln.areaCount.colorEpoch !== this.colorEpoch) {
+        const counts = countPayloadPointsInPolygon(
+          ln.payload,
+          this.group.position.x,
+          this.group.position.y,
+          polygon,
+          this.filter,
+        );
+        ln.areaCount = {
+          isolateEpoch: this.isolateEpoch,
+          colorEpoch: this.colorEpoch,
+          inside: counts.inside,
+          insideFiltered: counts.insideFiltered,
+        };
+      }
+      loaded += ln.areaCount.inside;
+      if (ln.points.visible) drawn += ln.areaCount.insideFiltered;
+    }
+    return { loaded, drawn };
   }
 
   walkGroundRadius(): number {
@@ -559,6 +676,11 @@ export class StreamingPointCloud {
   }
 
   private materialSizeForLevel(level: number): number {
+    return effectivePointDiameter(this.appearance, this.units, this.autoDiameterForLevel(level));
+  }
+
+  /** Auto-mode world diameter: fill the level's average point spacing, floored by the slider. */
+  private autoDiameterForLevel(level: number): number {
     const stat = this.levelStats.get(level);
     if (!stat) return this.worldPointDiameter(1);
     const minRadius = THREE.MathUtils.lerp(this.inchesToUnits(1), this.inchesToUnits(2), (this.pointSize - 1) / 4);

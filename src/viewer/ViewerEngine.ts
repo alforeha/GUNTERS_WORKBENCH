@@ -20,6 +20,8 @@ import { RenderFeatures, type FeatureDisplayEntry, type FeatureFocusOverlay, typ
 import type { EvidenceRef, FeatureFamily } from '../shared/workbench-types';
 import type { FilterState, PointDisplayMode } from './pointCloudLod';
 import { buildNorthGizmo, projectGizmoNorth, GIZMO_SIZE, GIZMO_MARGIN } from './gizmo';
+import { formatIsolateDisclosure, type IsolateAccounting, type IsolateSectorInfo } from './isolateAccounting';
+import { detailPresetParams, feetToUnits, type DetailPreset, type PointAppearance } from './pointCloudAppearance';
 import { pointInPolygonXY } from './isolateClip';
 import { smoothGroundZ } from './walkSurface';
 
@@ -30,6 +32,7 @@ import { smoothGroundZ } from './walkSurface';
  * to the user, never silent.
  */
 const EVIDENCE_WINDOW_MAX = 20000;
+const AUTHORED_FEATURES_HANDLE = '__authored-features__';
 
 export type CameraMode = 'orbit' | 'top' | 'hover';
 export type CursorCallback = (pos: { e: number; n: number; z: number } | null) => void;
@@ -88,6 +91,7 @@ export class ViewerEngine {
   private sceneOrigin: Vec3 | null = null;
   /** Radius of current content (rebased units) — drives dynamic near/far + zoom limits. */
   private sceneRadius = 0;
+  private projectUnitsLinear = 'foot';
 
   private surfaces = new Map<string, RenderSurface>();
   private dxfs = new Map<string, RenderDxf>();
@@ -123,6 +127,8 @@ export class ViewerEngine {
   private evidencePickActive = false;
   /** Render-local XY isolate polygon applied to clouds added while focus is active. */
   private isolateFocusXY: { x: number; y: number }[] | null = null;
+  /** Active load-all sector position (from the sector plan) for isolate disclosure. */
+  private isolateSectorInfo: IsolateSectorInfo | null = null;
   /** Cancels the armed one-shot evidence window drag, resolving it null. */
   private evidenceWindowCancel: (() => void) | null = null;
   private pointerDirty = false;
@@ -151,6 +157,8 @@ export class ViewerEngine {
   private authoringMachine = new AuthoringMachine();
   private snapAssetIdByHandle = new Map<string, string>();
   private renderFeatures: RenderFeatures | null = null;
+  private authoredFeaturesVisible = true;
+  private baseVisibility = new Map<string, boolean>();
 
   private statsCb: FrameStatsCallback | null = null;
   private labelStatusCb: LabelStatusCallback | null = null;
@@ -175,6 +183,7 @@ export class ViewerEngine {
   private hoverGroundZ: number | null = null;
   private zoomSensitivity3D = 1.0;
   private fogEnabled = false;
+  private globalShowWithinFt: number | null = null;
   private edlEnabled = true;
   private postScene = new THREE.Scene();
   private postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -568,6 +577,7 @@ uniform float edlOrtho;
     const handle = `s${++this.handleCounter}`;
     const surface = new RenderSurface(handle, model, this.sceneOrigin);
     this.surfaces.set(handle, surface);
+    this.baseVisibility.set(handle, true);
     this.contentGroup.add(surface.group);
     this.updateSceneMetrics();
     this.resetView(); // reframe on add (C5)
@@ -580,6 +590,7 @@ uniform float edlOrtho;
     if (!surface) return;
     surface.dispose();
     this.surfaces.delete(handle);
+    this.baseVisibility.delete(handle);
     if (this.activeHandle === handle) this.activeHandle = null;
     if (this.surfaces.size === 0 && this.dxfs.size === 0 && this.geotiffs.size === 0 && this.pdfs.size === 0 && this.pointClouds.size === 0 && this.pointCloudIndexes.size === 0 && this.analyticSurfels.size === 0) {
       this.sceneOrigin = null; // next dataset re-anchors the SceneOrigin (R1)
@@ -608,6 +619,7 @@ uniform float edlOrtho;
     const handle = `d${++this.handleCounter}`;
     const dxf = new RenderDxf(handle, dataset, this.sceneOrigin, densify);
     this.dxfs.set(handle, dxf);
+    this.baseVisibility.set(handle, true);
     this.contentGroup.add(dxf.group);
     this.updateSceneMetrics();
     this.resetView();
@@ -620,6 +632,7 @@ uniform float edlOrtho;
     if (!dxf) return;
     dxf.dispose();
     this.dxfs.delete(handle);
+    this.baseVisibility.delete(handle);
     if (this.surfaces.size === 0 && this.dxfs.size === 0 && this.geotiffs.size === 0 && this.pdfs.size === 0 && this.pointClouds.size === 0) {
       this.sceneOrigin = null;
       this.sceneRadius = 0;
@@ -677,6 +690,7 @@ uniform float edlOrtho;
       this.requestRender,
       () => this.updateSceneMetrics(),
     );
+    this.baseVisibility.set(handle, true);
     const target = surfaceHandle ? this.surfaces.get(surfaceHandle) ?? null : null;
     geotiff.setTarget(target);
     this.geotiffs.set(handle, geotiff);
@@ -692,6 +706,7 @@ uniform float edlOrtho;
     if (!geotiff) return;
     geotiff.dispose();
     this.geotiffs.delete(handle);
+    this.baseVisibility.delete(handle);
     if (this.surfaces.size === 0 && this.dxfs.size === 0 && this.geotiffs.size === 0 && this.pdfs.size === 0 && this.pointClouds.size === 0) {
       this.sceneOrigin = null;
       this.sceneRadius = 0;
@@ -704,6 +719,7 @@ uniform float edlOrtho;
 
   setGeotiffDisplay(handle: string, visible: boolean, opacity: number): void {
     this.geotiffs.get(handle)?.setDisplay(visible, opacity);
+    this.baseVisibility.set(handle, visible);
     this.updateSceneMetrics();
     this.requestRender();
   }
@@ -733,6 +749,7 @@ uniform float edlOrtho;
       this.requestRender,
       () => this.updateSceneMetrics(),
     );
+    this.baseVisibility.set(sheet.handle, sheet.visible);
     this.pdfs.set(sheet.handle, pdf);
     this.pdfFootprints.set(sheet.handle, JSON.stringify({
       calibration: sheet.calibration,
@@ -754,6 +771,7 @@ uniform float edlOrtho;
     if (!pdf) return;
     pdf.dispose();
     this.pdfs.delete(handle);
+    this.baseVisibility.delete(handle);
     this.pdfFootprints.delete(handle);
     if (this.surfaces.size === 0 && this.dxfs.size === 0 && this.geotiffs.size === 0 && this.pdfs.size === 0 && this.pointClouds.size === 0) {
       this.sceneOrigin = null;
@@ -767,6 +785,7 @@ uniform float edlOrtho;
 
   setPdfDisplay(handle: string, visible: boolean, opacityPct: number): void {
     this.pdfs.get(handle)?.setDisplay(visible, opacityPct);
+    this.baseVisibility.set(handle, visible);
     this.updateSceneMetrics();
     this.requestRender();
   }
@@ -794,6 +813,7 @@ uniform float edlOrtho;
     const footprintChanged = this.pdfFootprints.get(sheet.handle) !== footprintKey;
     this.pdfFootprints.set(sheet.handle, footprintKey);
     this.pdfs.get(sheet.handle)?.updateSheet(sheet);
+    this.baseVisibility.set(sheet.handle, sheet.visible);
     this.updateSceneMetrics();
     if (footprintChanged) this.resetView();
     this.requestRender();
@@ -828,6 +848,7 @@ uniform float edlOrtho;
     if (!dataset.octree) throw new Error('ViewerEngine: point cloud has no octree');
     const wasNull = !this.sceneOrigin;
     if (!this.sceneOrigin) this.sceneOrigin = dataset.octree.origin;
+    this.projectUnitsLinear = dataset.meta.units.linear;
     if (wasNull) {
       for (const pdf of this.pdfs.values()) pdf.setOrigin(this.sceneOrigin);
     }
@@ -835,6 +856,7 @@ uniform float edlOrtho;
     const pointCloud = new RenderPointCloud(handle, dataset, this.sceneOrigin);
     pointCloud.setIsolateClip(this.isolateFocusXY);
     this.pointClouds.set(handle, pointCloud);
+    this.baseVisibility.set(handle, true);
     this.contentGroup.add(pointCloud.group);
     this.updateSceneMetrics();
     this.resetView();
@@ -847,6 +869,7 @@ uniform float edlOrtho;
     if (!pointCloud) return;
     pointCloud.dispose();
     this.pointClouds.delete(handle);
+    this.baseVisibility.delete(handle);
     if (this.surfaces.size === 0 && this.dxfs.size === 0 && this.geotiffs.size === 0 && this.pdfs.size === 0 && this.pointClouds.size === 0) {
       this.sceneOrigin = null;
       this.sceneRadius = 0;
@@ -859,7 +882,14 @@ uniform float edlOrtho;
 
   setPointCloudDisplay(handle: string, visible: boolean, pointSize: number): void {
     this.pointClouds.get(handle)?.setDisplay(visible, pointSize);
+    this.baseVisibility.set(handle, visible);
     this.updateSceneMetrics();
+    this.requestRender();
+  }
+
+  /** Shared point appearance (radius mode/scale + range clip) for a preview cloud. */
+  setPointCloudAppearance(handle: string, appearance: PointAppearance): void {
+    this.pointClouds.get(handle)?.setAppearance(appearance);
     this.requestRender();
   }
 
@@ -889,6 +919,7 @@ uniform float edlOrtho;
     if (this.disposed) throw new Error('ViewerEngine: addPointCloudIndex after dispose');
     const wasNull = !this.sceneOrigin;
     if (!this.sceneOrigin) this.sceneOrigin = hierarchy.origin;
+    this.projectUnitsLinear = hierarchy.units;
     if (wasNull) {
       for (const pdf of this.pdfs.values()) pdf.setOrigin(this.sceneOrigin);
     }
@@ -896,6 +927,7 @@ uniform float edlOrtho;
     const streaming = new StreamingPointCloud(handle, hierarchy, this.sceneOrigin, fetchTiles, () => this.requestRender());
     streaming.setIsolateClip(this.isolateFocusXY);
     this.pointCloudIndexes.set(handle, streaming);
+    this.baseVisibility.set(handle, true);
     this.contentGroup.add(streaming.group);
     this.updateSceneMetrics();
     this.resetView();
@@ -908,12 +940,15 @@ uniform float edlOrtho;
     if (!streaming) return;
     streaming.dispose();
     this.pointCloudIndexes.delete(handle);
+    this.baseVisibility.delete(handle);
     this.updateSceneMetrics();
     this.requestRender();
   }
 
   setPointCloudIndexDisplay(handle: string, visible: boolean, pointSize: number): void {
     this.pointCloudIndexes.get(handle)?.setDisplay(visible, pointSize);
+    this.baseVisibility.set(handle, visible);
+    this.applyGlobalShowWithinVisibility();
     this.requestRender();
   }
 
@@ -927,6 +962,22 @@ uniform float edlOrtho;
     this.requestRender();
   }
 
+  /** Shared point appearance (radius mode/scale + range clip) for an indexed cloud. */
+  setPointCloudIndexAppearance(handle: string, appearance: PointAppearance): void {
+    this.pointCloudIndexes.get(handle)?.setAppearance(appearance);
+    this.requestRender();
+  }
+
+  /** Detail preset → the indexed cloud's SSE threshold and point budget. */
+  setPointCloudIndexDetail(handle: string, preset: DetailPreset): void {
+    const streaming = this.pointCloudIndexes.get(handle);
+    if (!streaming) return;
+    const params = detailPresetParams(preset);
+    streaming.setSseThreshold(params.sseThreshold);
+    streaming.setStreamingBudget(params.budgetMax);
+    this.requestRender();
+  }
+
   addAnalyticSurfels(hierarchy: SurfelHierarchy, fetchTiles: SurfelTileFetcher): string {
     if (this.disposed) throw new Error('ViewerEngine: addAnalyticSurfels after dispose');
     const wasNull = !this.sceneOrigin;
@@ -937,6 +988,7 @@ uniform float edlOrtho;
     const handle = `sf${++this.handleCounter}`;
     const surfels = new StreamingSurfels(handle, hierarchy, this.sceneOrigin, fetchTiles, () => this.requestRender());
     this.analyticSurfels.set(handle, surfels);
+    this.baseVisibility.set(handle, true);
     this.contentGroup.add(surfels.group);
     this.updateSceneMetrics();
     this.resetView();
@@ -949,12 +1001,15 @@ uniform float edlOrtho;
     if (!surfels) return;
     surfels.dispose();
     this.analyticSurfels.delete(handle);
+    this.baseVisibility.delete(handle);
     this.updateSceneMetrics();
     this.requestRender();
   }
 
   setAnalyticSurfelsDisplay(handle: string, visible: boolean, sizeScale: number): void {
     this.analyticSurfels.get(handle)?.setDisplay(visible, sizeScale);
+    this.baseVisibility.set(handle, visible);
+    this.applyGlobalShowWithinVisibility();
     this.requestRender();
   }
 
@@ -964,6 +1019,28 @@ uniform float edlOrtho;
 
   getPointCloudIndexDisclosure(handle: string): string | null {
     return this.pointCloudIndexes.get(handle)?.getDisclosure() ?? null;
+  }
+
+  /** Raw isolate-area accounting (null while no isolate focus/load region is active). */
+  getPointCloudIndexIsolateAccounting(handle: string): IsolateAccounting | null {
+    return this.pointCloudIndexes.get(handle)?.getIsolateAccounting() ?? null;
+  }
+
+  /**
+   * Isolate-area disclosure line, separate from the global streaming count so
+   * the budget-pinned global number never masquerades as the isolate count.
+   */
+  getPointCloudIndexIsolateDisclosure(handle: string): string | null {
+    const accounting = this.getPointCloudIndexIsolateAccounting(handle);
+    return accounting ? formatIsolateDisclosure(accounting, this.isolateSectorInfo) : null;
+  }
+
+  /** Index-metadata point estimate for a survey region, from the first visible index cloud. */
+  estimateIsolateRegionPoints(region: RegionXY): number | null {
+    for (const streaming of this.pointCloudIndexes.values()) {
+      if (streaming.group.visible) return streaming.estimateRegionPointsIn(region);
+    }
+    return null;
   }
 
   getPointCloudIndexLoadedPointCount(handle: string): number {
@@ -988,6 +1065,12 @@ uniform float edlOrtho;
   setPointCloudFog(enabled: boolean): void {
     this.fogEnabled = enabled;
     this.scene.fog = enabled && this.sceneRadius > 0 ? new THREE.FogExp2(0x0c1420, 0.00018) : null;
+    this.requestRender();
+  }
+
+  setGlobalShowWithin(distanceFt: number | null): void {
+    this.globalShowWithinFt = distanceFt !== null && distanceFt > 0 ? distanceFt : null;
+    this.applyGlobalShowWithinVisibility();
     this.requestRender();
   }
 
@@ -1081,6 +1164,7 @@ uniform float edlOrtho;
   setSurfaceVisible(handle: string, on: boolean): void {
     const s = this.surfaces.get(handle);
     if (s) s.group.visible = on;
+    this.baseVisibility.set(handle, on);
     this.updateSceneMetrics();
     this.scheduleLabelRefresh();
     this.requestRender();
@@ -1473,7 +1557,7 @@ uniform float edlOrtho;
   private resolveSurfaceZAt(x: number, y: number): number | null {
     const active = this.activeHandle ? this.surfaces.get(this.activeHandle) : undefined;
     const surface = active ?? [...this.surfaces.values()][0];
-    if (!surface?.pickMesh) return null;
+    if (!surface?.pickMesh || !surface.group.visible) return null;
     this.raycaster.set(
       new THREE.Vector3(x, y, this.sceneRadius * Math.max(this.exaggeration, 1) + 10_000),
       new THREE.Vector3(0, 0, -1),
@@ -1510,7 +1594,9 @@ uniform float edlOrtho;
     // fallback: z=0 ground plane in world space
     const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
     const intersection = new THREE.Vector3();
-    if (this.raycaster.ray.intersectPlane(plane, intersection)) return intersection;
+    if (this.raycaster.ray.intersectPlane(plane, intersection) && this.isRenderPointWithinShowWithin(intersection)) {
+      return intersection;
+    }
     return null;
   }
 
@@ -1681,14 +1767,14 @@ uniform float edlOrtho;
     const sphereCenter = new THREE.Vector3();
     const viewDir = camera.getWorldDirection(new THREE.Vector3());
     const toCenter = new THREE.Vector3();
-    const targets: { handle: string; group: THREE.Group }[] = [];
+    const targets: { handle: string; group: THREE.Group; rangeClip: number | null }[] = [];
     for (const [handle, cloud] of this.pointClouds) {
-      if (cloud.group.visible) targets.push({ handle, group: cloud.group });
+      if (cloud.group.visible) targets.push({ handle, group: cloud.group, rangeClip: cloud.getRangeClipWorld() });
     }
     for (const [handle, streaming] of this.pointCloudIndexes) {
-      if (streaming.group.visible) targets.push({ handle, group: streaming.group });
+      if (streaming.group.visible) targets.push({ handle, group: streaming.group, rangeClip: streaming.getRangeClipWorld() });
     }
-    for (const { handle, group } of targets) {
+    for (const { handle, group, rangeClip } of targets) {
       const assetId = this.snapAssetIdByHandle.get(handle);
       group.traverse((child) => {
         if (!(child instanceof THREE.Points) || !child.visible) return;
@@ -1741,6 +1827,13 @@ uniform float edlOrtho;
           const wy = me[1]! * x + me[5]! * y + me[9]! * z + me[13]!;
           if (this.isolateFocusXY && !pointInPolygonXY(wx, wy, this.isolateFocusXY)) continue;
           const wz = me[2]! * x + me[6]! * y + me[10]! * z + me[14]!;
+          if (rangeClip !== null) {
+            // CPU twin of the shader's range clip: range-hidden points never pick.
+            const dx = wx - camera.position.x;
+            const dy = wy - camera.position.y;
+            const dz = wz - camera.position.z;
+            if (dx * dx + dy * dy + dz * dz > rangeClip * rangeClip) continue;
+          }
           picks.push({
             world: [wx + ox, wy + oy, wz / this.exaggeration + oz],
             evidence: {
@@ -1797,6 +1890,7 @@ uniform float edlOrtho;
       this.contentGroup.add(this.renderFeatures.group);
     }
     this.renderFeatures.setFeatures(entries);
+    this.applyGlobalShowWithinVisibility();
     this.requestRender();
   }
 
@@ -1811,6 +1905,7 @@ uniform float edlOrtho;
       this.contentGroup.add(this.renderFeatures.group);
     }
     this.renderFeatures.setDraft(draft);
+    this.applyGlobalShowWithinVisibility();
     this.requestRender();
   }
 
@@ -1821,6 +1916,7 @@ uniform float edlOrtho;
       this.contentGroup.add(this.renderFeatures.group);
     }
     this.renderFeatures.setSnapPreview(preview);
+    this.applyGlobalShowWithinVisibility();
     this.requestRender();
   }
 
@@ -1833,6 +1929,7 @@ uniform float edlOrtho;
       this.contentGroup.add(this.renderFeatures.group);
     }
     this.renderFeatures.setFocusOverlay(overlay);
+    this.applyGlobalShowWithinVisibility();
     this.requestRender();
   }
 
@@ -1856,10 +1953,12 @@ uniform float edlOrtho;
   /**
    * Isolate load-all: streams every index tile intersecting the survey XY
    * region at full density (one sector of the isolate area); null restores
-   * SSE-only streaming.
+   * SSE-only streaming. Sector position (when the area split) feeds the
+   * isolate disclosure only.
    */
-  setIsolateLoadRegion(region: RegionXY | null): void {
+  setIsolateLoadRegion(region: RegionXY | null, sector: IsolateSectorInfo | null = null): void {
     if (this.disposed) return;
+    this.isolateSectorInfo = region ? sector : null;
     for (const streaming of this.pointCloudIndexes.values()) streaming.setFocusLoadRegion(region);
     this.requestRender();
   }
@@ -1890,7 +1989,9 @@ uniform float edlOrtho;
 
   /** Sim master toggle: shows/hides all authored features as one group. */
   setAuthoredFeaturesVisible(visible: boolean): void {
+    this.authoredFeaturesVisible = visible;
     this.renderFeatures?.setVisible(visible);
+    this.applyGlobalShowWithinVisibility();
     this.requestRender();
   }
 
@@ -1935,11 +2036,12 @@ uniform float edlOrtho;
         ) {
           continue;
         }
+        if (!this.isSurveyPointWithinShowWithin(candidate.world)) continue;
         out.push(candidate);
         pushed++;
       }
     }
-      if (!cloudHandleFilter) this.collectAuthoredSnapCandidates(out, tolerancePx, pointer.px);
+    if (!cloudHandleFilter && this.renderFeatures?.group.visible) this.collectAuthoredSnapCandidates(out, tolerancePx, pointer.px);
     return out;
   }
 
@@ -2241,6 +2343,7 @@ uniform float edlOrtho;
   }
 
   private updateSceneMetrics(): void {
+    this.applyGlobalShowWithinVisibility();
     const bounds = this.contentBounds();
     this.sceneRadius = bounds ? bounds.getSize(new THREE.Vector3()).length() / 2 : 0;
     if (this.sceneRadius > 0) {
@@ -2480,6 +2583,8 @@ uniform float edlOrtho;
     this.renderRequested = false;
     this.pickRequested = false;
 
+    this.applyGlobalShowWithinVisibility();
+
     // Hover raycast: at most once per rAF, skipped entirely while the camera is moving
     // or a button is down (07 Phase 2 lag triage).
     if (doPick && this.pointerDirty && !this.controlsActive && (!this.pointerButtonsDown || this.editSurfaceHandle !== null)) {
@@ -2549,6 +2654,8 @@ uniform float edlOrtho;
         }
       }
     }
+
+    this.applyGlobalShowWithinVisibility();
 
     if (doRender) {
       this.updateClipPlanes();
@@ -2684,7 +2791,11 @@ this.postQuad.material.uniforms['edlOrtho'].value = this.activeCamera instanceof
       // in top mode the ortho frustum already bounds the candidate set laterally.
       const controls = this.mode === 'top' ? this.topControls : this.orbitControls;
       const targetDist = camera.position.distanceTo(controls.target);
-      const maxDist = this.mode === 'top' ? Number.POSITIVE_INFINITY : targetDist * 2.5;
+      const globalRange = this.globalShowWithinWorld();
+      const maxDist =
+        this.mode === 'top'
+          ? (globalRange ?? Number.POSITIVE_INFINITY)
+          : Math.min(targetDist * 2.5, globalRange ?? Number.POSITIVE_INFINITY);
       for (const s of this.surfaces.values()) {
         const status = s.refreshLabels(camera, this.exaggeration, maxDist);
         // Lazily created label groups parent at the UNSCALED scene root (text must not
@@ -2837,6 +2948,56 @@ this.postQuad.material.uniforms['edlOrtho'].value = this.activeCamera instanceof
       hits = this.raycaster.intersectObject(object, true);
     }
     return hits;
+  }
+
+  private globalShowWithinWorld(): number | null {
+    return this.globalShowWithinFt === null ? null : this.globalShowWithinFt * feetToUnits(this.projectUnitsLinear);
+  }
+
+  private isRenderPointWithinShowWithin(point: THREE.Vector3): boolean {
+    const range = this.globalShowWithinWorld();
+    return range === null || point.distanceTo(this.activeCamera.position) <= range;
+  }
+
+  private isSurveyPointWithinShowWithin(point: Vec3): boolean {
+    if (!this.sceneOrigin) return true;
+    const [ox, oy, oz] = this.sceneOrigin;
+    return this.isRenderPointWithinShowWithin(
+      new THREE.Vector3(point[0] - ox, point[1] - oy, (point[2] - oz) * this.exaggeration),
+    );
+  }
+
+  private scaleBoundsForExaggeration(bounds: THREE.Box3): THREE.Box3 {
+    return bounds.clone().set(
+      new THREE.Vector3(bounds.min.x, bounds.min.y, bounds.min.z * this.exaggeration),
+      new THREE.Vector3(bounds.max.x, bounds.max.y, bounds.max.z * this.exaggeration),
+    );
+  }
+
+  private isBoundsWithinShowWithin(bounds: THREE.Box3): boolean {
+    const range = this.globalShowWithinWorld();
+    return range === null || this.scaleBoundsForExaggeration(bounds).distanceToPoint(this.activeCamera.position) <= range;
+  }
+
+  private setEffectiveVisibility(handle: string, group: THREE.Object3D, bounds: THREE.Box3): void {
+    group.visible = (this.baseVisibility.get(handle) ?? true) && this.isBoundsWithinShowWithin(bounds);
+  }
+
+  private applyGlobalShowWithinVisibility(): void {
+    for (const [handle, surface] of this.surfaces) this.setEffectiveVisibility(handle, surface.group, surface.bounds);
+    for (const [handle, dxf] of this.dxfs) this.setEffectiveVisibility(handle, dxf.group, dxf.bounds);
+    for (const [handle, geotiff] of this.geotiffs) this.setEffectiveVisibility(handle, geotiff.group, geotiff.bounds);
+    for (const [handle, pdf] of this.pdfs) this.setEffectiveVisibility(handle, pdf.group, pdf.bounds);
+    for (const [handle, pointCloud] of this.pointClouds) this.setEffectiveVisibility(handle, pointCloud.group, pointCloud.bounds);
+    for (const [handle, streaming] of this.pointCloudIndexes) this.setEffectiveVisibility(handle, streaming.group, streaming.bounds);
+    for (const [handle, surfels] of this.analyticSurfels) this.setEffectiveVisibility(handle, surfels.group, surfels.bounds);
+    if (this.renderFeatures) {
+      const range = this.globalShowWithinWorld();
+      const bounds = new THREE.Box3().setFromObject(this.renderFeatures.group);
+      this.baseVisibility.set(AUTHORED_FEATURES_HANDLE, this.authoredFeaturesVisible);
+      this.renderFeatures.group.visible =
+        this.authoredFeaturesVisible && (bounds.isEmpty() || range === null || bounds.distanceToPoint(this.activeCamera.position) <= range);
+    }
   }
 
   private perspectiveUnitsPerPixelAt(distance: number): number {

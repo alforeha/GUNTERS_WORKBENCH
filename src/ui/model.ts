@@ -24,6 +24,7 @@ import {
 } from '../shared/template-catalog'
 import { readRegionMetadata } from '../shared/regionMetadata'
 import { isolateBoundaryFromFeature } from '../viewer/generators'
+import { DEFAULT_POINT_APPEARANCE, type DetailPreset, type PointAppearance } from '../viewer/pointCloudAppearance'
 
 // ---------------------------------------------------------------------------
 // Shared helpers (moved from main.ts so panels and tests share one copy)
@@ -216,11 +217,27 @@ export type ColorMode = 'rgb' | 'elevation' | 'intensity'
 /** Session-only per-layer appearance (persistence decision: NOT written to the manifest). */
 export interface LayerAppearance {
   colorMode: ColorMode
+  /** Legacy 1-5 multiplier; still the auto-mode base size (no direct UI control anymore). */
   pointSize: number
   surfelScale: number
+  /** Shared point appearance: radius mode/scale + range clip (viewer model). */
+  pointAppearance: PointAppearance
+  /** Indexed-cloud refinement preset. */
+  detail: DetailPreset
 }
 
-export const DEFAULT_LAYER_APPEARANCE: LayerAppearance = { colorMode: 'rgb', pointSize: 2, surfelScale: 2 }
+export const DEFAULT_LAYER_APPEARANCE: LayerAppearance = {
+  colorMode: 'rgb',
+  pointSize: 2,
+  surfelScale: 2,
+  pointAppearance: DEFAULT_POINT_APPEARANCE,
+  detail: 'balanced',
+}
+
+/** Copy with the nested pointAppearance cloned - never hand out shared mutable state. */
+export function cloneLayerAppearance(look: LayerAppearance): LayerAppearance {
+  return { ...look, pointAppearance: { ...look.pointAppearance } }
+}
 
 export type AssetViewKind = 'preview' | 'index' | 'surfel'
 

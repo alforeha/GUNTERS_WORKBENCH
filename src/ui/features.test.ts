@@ -80,6 +80,8 @@ class FakeViewer {
 
   isolateSectors: { minX: number; minY: number; maxX: number; maxY: number }[] | null = null
   isolateLoadRegion: unknown = 'unset'
+  isolateLoadSector: { index: number; count: number } | null = null
+  regionPointEstimate: number | null = null
 
   planIsolateSectors(boundary: [number, number, number][]): { minX: number; minY: number; maxX: number; maxY: number }[] {
     if (this.isolateSectors) return this.isolateSectors
@@ -88,8 +90,13 @@ class FakeViewer {
     return [{ minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) }]
   }
 
-  setIsolateLoadRegion(region: unknown): void {
+  setIsolateLoadRegion(region: unknown, sector: { index: number; count: number } | null = null): void {
     this.isolateLoadRegion = region
+    this.isolateLoadSector = region ? sector : null
+  }
+
+  estimateIsolateRegionPoints(): number | null {
+    return this.regionPointEstimate
   }
 
   resolveEvidenceAtPointer(): FakeViewer['nextEvidence'] {
@@ -525,6 +532,36 @@ describe('FeatureController explicit evidence', () => {
     expect(controller.getObjectEdit()).toMatchObject({ featureId: 'feat-obj', kind: 'evidence' })
   })
 
+  it('window note separates caught total from stored refs when sampling occurred', async () => {
+    const { controller, session, viewer } = makeController()
+    makeObjectFeature('feat-obj', session.manifest)
+
+    controller.startEvidencePick('feat-obj')
+    viewer.windowPicks = [
+      { world: [1, 1, 1], evidence: { kind: 'asset-point', coordinate: [1, 1, 1] } },
+      { world: [2, 2, 2], evidence: { kind: 'asset-point', coordinate: [2, 2, 2] } },
+    ]
+    viewer.windowTotal = 45_000 // window caught far more than the storage cap kept
+    await controller.selectEvidenceWindow()
+
+    const note = controller.getObjectEdit()?.note ?? ''
+    expect(note).toContain('caught 45,000 visible points')
+    expect(note).toContain('stored 2 evidence refs')
+    expect(note).toContain('stride sampled')
+  })
+
+  it('window note reports an empty catch instead of staying silent', async () => {
+    const { controller, session, viewer, persistManifest } = makeController()
+    makeObjectFeature('feat-obj', session.manifest)
+
+    controller.startEvidencePick('feat-obj')
+    viewer.windowPicks = []
+    await controller.selectEvidenceWindow()
+
+    expect(controller.getObjectEdit()?.note).toContain('caught 0 visible points')
+    expect(persistManifest).not.toHaveBeenCalled()
+  })
+
   it('window selection is a no-op when cancelled or outside evidence mode', async () => {
     const { controller, session, viewer, persistManifest } = makeController()
     makeObjectFeature('feat-obj', session.manifest)
@@ -584,10 +621,12 @@ describe('FeatureController isolate load-all', () => {
     controller.startIsolateLoadAll('feat-obj')
     expect(controller.getIsolateLoad()).toMatchObject({ featureId: 'feat-obj', sectorCount: 2, activeSector: 0 })
     expect(viewer.isolateLoadRegion).toEqual(viewer.isolateSectors[0])
+    expect(viewer.isolateLoadSector).toEqual({ index: 0, count: 2 })
 
     controller.stepIsolateSector(1)
     expect(controller.getIsolateLoad()).toMatchObject({ activeSector: 1 })
     expect(viewer.isolateLoadRegion).toEqual(viewer.isolateSectors[1])
+    expect(viewer.isolateLoadSector).toEqual({ index: 1, count: 2 })
 
     controller.stepIsolateSector(1) // wraps
     expect(controller.getIsolateLoad()).toMatchObject({ activeSector: 0 })
@@ -595,6 +634,18 @@ describe('FeatureController isolate load-all', () => {
     controller.stopIsolateLoadAll()
     expect(controller.getIsolateLoad()).toBeNull()
     expect(viewer.isolateLoadRegion).toBeNull()
+    expect(viewer.isolateLoadSector).toBeNull()
+  })
+
+  it('carries the index point estimate for the active sector into the view', () => {
+    const { controller, session, viewer } = makeController()
+    makeObjectFeature('feat-obj', session.manifest)
+    session.manifest.features.at(-1)!.metadata = structuredClone(boundaryMetadata)
+    viewer.regionPointEstimate = 12_345
+    controller.setFocusedFeature('feat-obj')
+
+    controller.startIsolateLoadAll('feat-obj')
+    expect(controller.getIsolateLoad()).toMatchObject({ estimatedSectorPoints: 12_345 })
   })
 
   it('requires a stored boundary and clears when focus moves elsewhere', () => {

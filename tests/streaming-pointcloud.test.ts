@@ -3,6 +3,8 @@ import * as THREE from 'three';
 import { StreamingPointCloud, type TileFetcher } from '../src/viewer/StreamingPointCloud';
 import type { PointCloudNodePayload } from '../src/core/contract';
 import type { PointCloudIndexHierarchy } from '../src/shared/workbench-types';
+import { defaultFilterState } from '../src/viewer/pointCloudLod';
+import { DEFAULT_POINT_APPEARANCE } from '../src/viewer/pointCloudAppearance';
 
 // 4-level chain hierarchy: levels 0..2 are pinned base, level 3 refines on zoom.
 function hierarchy(): PointCloudIndexHierarchy {
@@ -170,5 +172,206 @@ describe('StreamingPointCloud', () => {
     spc.update(camAt(5000), VIEWPORT_H, FOV_Y);
     expect(spc.group.visible).toBe(false);
     expect(spc.group.children[0]!.visible).toBe(false);
+  });
+});
+
+// ── Appearance (shared model with RenderPointCloud) ───────────────────────────
+
+describe('StreamingPointCloud appearance', () => {
+  const auto = { ...DEFAULT_POINT_APPEARANCE };
+
+  async function loadedCloud(): Promise<StreamingPointCloud> {
+    const spc = new StreamingPointCloud('pc', hierarchy(), SCENE_ORIGIN, immediateFetcher());
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y);
+    await flush();
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y);
+    return spc;
+  }
+
+  function materialSizes(spc: StreamingPointCloud): number[] {
+    return spc.group.children.map(
+      (child) => ((child as THREE.Points).material as THREE.PointsMaterial).size,
+    );
+  }
+
+  it('applies a fixed 0.12 ft radius as one 0.24 world diameter across all level materials', async () => {
+    const spc = await loadedCloud();
+    spc.setAppearance({ ...auto, radiusMode: 'fixed', fixedRadiusFt: 0.12 });
+    for (const size of materialSizes(spc)) expect(size).toBeCloseTo(0.24, 9);
+    // Legacy slider changes must not override the fixed radius.
+    spc.setDisplay(true, 5);
+    for (const size of materialSizes(spc)) expect(size).toBeCloseTo(0.24, 9);
+  });
+
+  it('scales the per-level auto sizing with the quick-scale factor', async () => {
+    const spc = await loadedCloud();
+    const autoSizes = materialSizes(spc);
+    spc.setAppearance({ ...auto, radiusScale: 2 });
+    materialSizes(spc).forEach((size, i) => expect(size).toBeCloseTo(autoSizes[i]! * 2, 9));
+    spc.setAppearance({ ...auto, radiusScale: 1 });
+    materialSizes(spc).forEach((size, i) => expect(size).toBeCloseTo(autoSizes[i]!, 9));
+  });
+
+  it('sets and clears the camera range clip in world units', async () => {
+    const spc = await loadedCloud();
+    expect(spc.getRangeClipWorld()).toBeNull();
+    spc.setAppearance({ ...auto, rangeClipFt: 50 });
+    expect(spc.getRangeClipWorld()).toBe(50); // usSurveyFoot world: feet are world units
+    spc.setAppearance({ ...auto, rangeClipFt: null });
+    expect(spc.getRangeClipWorld()).toBeNull();
+  });
+});
+
+// ── Isolate load-all + accounting ─────────────────────────────────────────────
+
+/** Scene origin ≠ index origin so render-local and survey spaces are distinct. */
+const OFFSET_SCENE_ORIGIN: [number, number, number] = [10, 0, 4];
+
+/** Root payload with known survey XY points; other nodes use the default all-at-origin payload. */
+function surveyPointsFetcher(rootPoints: { x: number; y: number; cls?: number }[]): TileFetcher {
+  const rootPayload = (): PointCloudNodePayload => {
+    const count = rootPoints.length;
+    const positions = new Float32Array(count * 3);
+    const classifications = new Uint8Array(count).fill(1);
+    for (let i = 0; i < count; i++) {
+      // survey → index-origin-relative (origin is [4, 4, 4])
+      positions[i * 3] = rootPoints[i]!.x - 4;
+      positions[i * 3 + 1] = rootPoints[i]!.y - 4;
+      if (rootPoints[i]!.cls !== undefined) classifications[i] = rootPoints[i]!.cls!;
+    }
+    return { ...payloadFor(count), positions, classifications };
+  };
+  return (keys) =>
+    Promise.resolve(keys.map((key) => ({ key, payload: key === '0-0-0-0' ? rootPayload() : payloadFor() })));
+}
+
+/** Survey square x∈[0,2] y∈[0,2] as a render-local polygon for OFFSET_SCENE_ORIGIN. */
+const ISOLATE_POLYGON = [
+  { x: 0 - OFFSET_SCENE_ORIGIN[0], y: 0 },
+  { x: 2 - OFFSET_SCENE_ORIGIN[0], y: 0 },
+  { x: 2 - OFFSET_SCENE_ORIGIN[0], y: 2 },
+  { x: 0 - OFFSET_SCENE_ORIGIN[0], y: 2 },
+];
+const ISOLATE_REGION = { minX: 0, minY: 0, maxX: 2, maxY: 2 };
+
+function farCamOffset(): THREE.PerspectiveCamera {
+  const cam = new THREE.PerspectiveCamera(60, 1, 0.1, 100000);
+  // survey [4, 4, 5000] in render-local coordinates
+  cam.position.set(4 - OFFSET_SCENE_ORIGIN[0], 4, 5000 - OFFSET_SCENE_ORIGIN[2]);
+  return cam;
+}
+
+describe('StreamingPointCloud isolate accounting', () => {
+  it('returns null accounting while no isolate focus or load region is active', () => {
+    const spc = new StreamingPointCloud('pc', hierarchy(), OFFSET_SCENE_ORIGIN, immediateFetcher());
+    expect(spc.getIsolateAccounting()).toBeNull();
+  });
+
+  it('counts loaded and drawn points inside a render-local isolate polygon', async () => {
+    const spc = new StreamingPointCloud(
+      'pc',
+      hierarchy(),
+      OFFSET_SCENE_ORIGIN,
+      surveyPointsFetcher([
+        { x: 1, y: 1 }, // inside the isolate square
+        { x: 1.5, y: 0.5, cls: 7 }, // inside, but class-filtered below
+        { x: 3, y: 3 }, // outside
+        { x: 7, y: 7 }, // outside
+      ]),
+    );
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y); // pinned base loads
+    await flush();
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+
+    spc.setIsolateClip(ISOLATE_POLYGON);
+    const accounting = spc.getIsolateAccounting();
+    expect(accounting).not.toBeNull();
+    expect(accounting!.focusActive).toBe(true);
+    expect(accounting!.regionActive).toBe(false);
+    // Every chain node's bounds intersect the survey square → full metadata estimate.
+    expect(accounting!.estimatedAreaPoints).toBe(320_000);
+    expect(accounting!.loadedInArea).toBe(2);
+    expect(accounting!.drawnInArea).toBe(2);
+
+    const filter = defaultFilterState();
+    filter.classes[7] = false;
+    spc.setFilter(filter);
+    const filtered = spc.getIsolateAccounting();
+    expect(filtered!.loadedInArea).toBe(2); // still in memory
+    expect(filtered!.drawnInArea).toBe(1); // hidden by the class filter
+  });
+
+  it('streams region nodes the camera would never select and keeps them while the region is active', async () => {
+    const fetched: string[][] = [];
+    const fetcher: TileFetcher = (keys) => {
+      fetched.push([...keys]);
+      return Promise.resolve(keys.map((key) => ({ key, payload: payloadFor() })));
+    };
+    const spc = new StreamingPointCloud('pc', hierarchy(), OFFSET_SCENE_ORIGIN, fetcher);
+
+    // Far view without a region: SSE never wants the level-3 leaf.
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+    await flush();
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+    expect(fetched.flat()).not.toContain('3-0-0-0');
+    expect(spc.getLoadedPointCount()).toBe(240_000);
+
+    // Load-all region over the leaf: it streams in despite the far camera…
+    spc.setFocusLoadRegion(ISOLATE_REGION);
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+    await flush();
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+    expect(fetched.flat()).toContain('3-0-0-0');
+    expect(spc.getLoadedPointCount()).toBe(320_000);
+    const leaf = spc.group.children.find((child) => child.name.includes('3-0-0-0'));
+    expect(leaf?.visible).toBe(true);
+
+    const accounting = spc.getIsolateAccounting();
+    expect(accounting!.regionActive).toBe(true);
+    expect(accounting!.regionSelectedPoints).toBe(320_000);
+    expect(accounting!.regionLoadedPoints).toBe(320_000);
+    expect(accounting!.regionBudgetLimited).toBe(false);
+
+    // …and survives further updates while the region holds it selected.
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+    expect(spc.getLoadedPointCount()).toBe(320_000);
+
+    // Clearing the region hands the leaf back to SSE + budget: it evicts.
+    spc.setFocusLoadRegion(null);
+    spc.setStreamingBudget(280_000);
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+    expect(spc.getLoadedPointCount()).toBe(240_000);
+  });
+
+  it('reports budget-limited region selection in the accounting', () => {
+    const spc = new StreamingPointCloud('pc', hierarchy(), OFFSET_SCENE_ORIGIN, immediateFetcher());
+    spc.setStreamingBudget(280_000); // chain total is 320K → leaf cannot fit
+    spc.setFocusLoadRegion(ISOLATE_REGION);
+    const accounting = spc.getIsolateAccounting();
+    expect(accounting!.regionActive).toBe(true);
+    expect(accounting!.regionBudgetLimited).toBe(true);
+    expect(accounting!.regionSelectedPoints).toBe(240_000);
+    expect(accounting!.estimatedAreaPoints).toBe(320_000); // estimate stays uncapped
+  });
+
+  it('accounts against the region rectangle when load-all runs without a clip polygon', async () => {
+    const spc = new StreamingPointCloud(
+      'pc',
+      hierarchy(),
+      OFFSET_SCENE_ORIGIN,
+      surveyPointsFetcher([
+        { x: 1, y: 1 }, // inside the region
+        { x: 5, y: 5 }, // outside
+      ]),
+    );
+    spc.setFocusLoadRegion(ISOLATE_REGION);
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+    await flush();
+    spc.update(farCamOffset(), VIEWPORT_H, FOV_Y);
+
+    const accounting = spc.getIsolateAccounting();
+    expect(accounting!.focusActive).toBe(false);
+    expect(accounting!.regionActive).toBe(true);
+    expect(accounting!.loadedInArea).toBe(1);
   });
 });

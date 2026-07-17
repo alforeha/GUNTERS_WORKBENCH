@@ -172,6 +172,8 @@ export interface IsolateLoadView {
   featureId: string
   sectorCount: number
   activeSector: number
+  /** Index-metadata point estimate for the active sector (null: no index cloud). */
+  estimatedSectorPoints: number | null
 }
 
 const DEFAULT_OBJECT_TEMPLATE_ID = 'object.box'
@@ -205,7 +207,7 @@ export class FeatureController {
   private objectEdit: { featureId: string; kind: ObjectEditKind } | null = null
   private objectEditNote: string | null = null
   private focusedFeatureId: string | null = null
-  private isolateLoad: { featureId: string; sectors: RegionXY[]; active: number } | null = null
+  private isolateLoad: { featureId: string; sectors: RegionXY[]; estimates: (number | null)[]; active: number } | null = null
 
   constructor(deps: FeatureControllerDeps) {
     this.deps = deps
@@ -386,6 +388,7 @@ export class FeatureController {
       featureId: this.isolateLoad.featureId,
       sectorCount: this.isolateLoad.sectors.length,
       activeSector: this.isolateLoad.active,
+      estimatedSectorPoints: this.isolateLoad.estimates[this.isolateLoad.active] ?? null,
     }
   }
 
@@ -402,8 +405,11 @@ export class FeatureController {
     const viewer = this.deps.ensureViewer()
     const sectors = viewer.planIsolateSectors(boundary)
     if (sectors.length === 0) return
-    this.isolateLoad = { featureId, sectors, active: 0 }
-    viewer.setIsolateLoadRegion(sectors[0]!)
+    // Sector estimates come from index metadata at plan time - nothing loads
+    // to produce them, and they stay valid for the plan's lifetime.
+    const estimates = sectors.map((sector) => viewer.estimateIsolateRegionPoints(sector))
+    this.isolateLoad = { featureId, sectors, estimates, active: 0 }
+    viewer.setIsolateLoadRegion(sectors[0]!, { index: 0, count: sectors.length })
     this.applyFocusOverlay()
     this.deps.onAuthoringChanged()
   }
@@ -413,7 +419,10 @@ export class FeatureController {
     if (!viewer || !this.isolateLoad || this.isolateLoad.sectors.length < 2) return
     const count = this.isolateLoad.sectors.length
     this.isolateLoad.active = (this.isolateLoad.active + delta + count) % count
-    viewer.setIsolateLoadRegion(this.isolateLoad.sectors[this.isolateLoad.active]!)
+    viewer.setIsolateLoadRegion(this.isolateLoad.sectors[this.isolateLoad.active]!, {
+      index: this.isolateLoad.active,
+      count,
+    })
     this.applyFocusOverlay()
     this.deps.onAuthoringChanged()
   }
@@ -460,7 +469,14 @@ export class FeatureController {
     const featureId = this.objectEdit.featureId
     const result = await viewer.armEvidenceWindow()
     // Mode may have ended (Done/cancel) while the drag was pending.
-    if (!result || result.picks.length === 0 || this.objectEdit?.kind !== 'evidence' || this.objectEdit.featureId !== featureId) return
+    if (!result || this.objectEdit?.kind !== 'evidence' || this.objectEdit.featureId !== featureId) return
+    if (result.picks.length === 0) {
+      // An empty catch is a diagnostic in itself (nothing drawn in the window
+      // area) - say so instead of silently doing nothing.
+      this.objectEditNote = 'Window caught 0 visible points — nothing is drawn in that area'
+      this.deps.onAuthoringChanged()
+      return
+    }
     const session = this.deps.getSession()
     if (!session) return
     const manifest = structuredClone(session.manifest) as ProjectManifest
@@ -476,11 +492,15 @@ export class FeatureController {
       added.push(pick.evidence)
     }
     const duplicates = result.picks.length - added.length
-    const sampledOut = result.total - result.picks.length
+    const sampled = result.total > result.picks.length
+    // Caught total first, stored count second - a small stored count must
+    // never hide a large catch (or vice versa).
     this.objectEditNote =
-      `Window added ${added.length.toLocaleString()} points` +
-      (duplicates > 0 ? `, ${duplicates.toLocaleString()} already present` : '') +
-      (sampledOut > 0 ? `; caught ${result.total.toLocaleString()}, sampled for storage safety` : '')
+      `Window caught ${result.total.toLocaleString()} visible points; stored ${added.length.toLocaleString()} evidence refs` +
+      (duplicates > 0 ? ` (${duplicates.toLocaleString()} already present)` : '') +
+      (sampled
+        ? ` — storage cap kept ${result.picks.length.toLocaleString()} of ${result.total.toLocaleString()} (stride sampled)`
+        : '')
     if (added.length === 0) {
       this.deps.onAuthoringChanged()
       return

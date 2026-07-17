@@ -79,6 +79,10 @@ class FakeViewer {
   setIsolateLoadRegion(region: unknown): void {
     this.isolateLoadRegion = region
   }
+
+  estimateIsolateRegionPoints(): number | null {
+    return null
+  }
 }
 
 function makeHarness() {

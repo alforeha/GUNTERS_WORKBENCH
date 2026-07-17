@@ -462,8 +462,8 @@ footerApi = mountFooter(
     setEdl(on) {
       controller.setEdl(on)
     },
-    setFog(on) {
-      controller.setFog(on)
+    setShowWithin(distanceFt) {
+      controller.setShowWithin(distanceFt)
     },
     setVerticalExaggeration(k) {
       controller.ensureViewer().setVerticalExaggeration(k)
@@ -477,7 +477,7 @@ footerApi = mountFooter(
   },
   {
     edl: controller.isEdlEnabled(),
-    fog: controller.isFogEnabled(),
+    showWithinFt: controller.getShowWithin(),
     verticalExaggeration: 1,
     walkSpeed: DEFAULT_WALK_SPEED,
     walkEyeHeight: DEFAULT_WALK_EYE_HEIGHT,
@@ -577,7 +577,10 @@ leftPanel = mountLeftPanel(frame.leftPanelMount, {
   toggleAssetMaster: (assetId, on) => controller.toggleAssetMaster(assetId, on),
   removeAsset: (assetId) => controller.removeAsset(assetId),
   setLayerColorMode: (layerId, mode) => controller.setLayerColorMode(layerId, mode),
-  setLayerPointSize: (layerId, size) => controller.setLayerPointSize(layerId, size),
+  setLayerPointRadius: (layerId, radius) => controller.setLayerPointRadius(layerId, radius),
+  stepLayerRadiusScale: (layerId, factor) => controller.stepLayerRadiusScale(layerId, factor),
+  resetLayerRadiusAuto: (layerId) => controller.resetLayerRadiusAuto(layerId),
+  setLayerDetail: (layerId, preset) => controller.setLayerDetail(layerId, preset),
   setLayerSurfelScale: (layerId, scale) => controller.setLayerSurfelScale(layerId, scale),
   importPointCloud: () => controller.importPointCloud(),
   openAsset(assetId) {

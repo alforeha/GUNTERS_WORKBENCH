@@ -66,7 +66,7 @@ describe('header', () => {
 })
 
 describe('footer', () => {
-  const initial = { edl: true, fog: false, verticalExaggeration: 1, walkSpeed: 15, walkEyeHeight: 5 }
+  const initial = { edl: true, showWithinFt: null, verticalExaggeration: 1, walkSpeed: 15, walkEyeHeight: 5 }
 
   it('renders the N/E/Z + units readout', () => {
     const html = renderFooterHtml(initial)
@@ -76,10 +76,13 @@ describe('footer', () => {
     expect(html).toContain('units: --')
   })
 
-  it('renders global dials with the lighting dial as a disabled shell', () => {
+  it('renders global dials with Show Within replacing Fog and the lighting dial as a disabled shell', () => {
     const html = renderFooterHtml(initial)
     expect(html).toContain('id="dial-edl"')
-    expect(html).toContain('id="dial-fog"')
+    expect(html).toContain('id="dial-show-within"')
+    expect(html).toContain('id="footer-show-within"')
+    expect(html).toContain('id="footer-show-within-number"')
+    expect(html).toContain('Show within')
     expect(html).toContain('id="dial-ve"')
     expect(html).toMatch(/id="dial-light"[^>]*disabled/)
     expect(html).toContain('Planned - no engine lighting hook yet')
