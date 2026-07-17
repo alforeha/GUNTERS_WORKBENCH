@@ -419,6 +419,16 @@ export interface AnalyticSurfelMetricsSummary {
   outputSizeBytes: number;
   wallTimeMs: number;
   mergeMetrics?: unknown;
+  /**
+   * Which index fed the surfel build. The streaming index (derived/<asset>/index)
+   * is never rebuilt or replaced for surfel generation; incompatible formats get
+   * a dedicated derived/<asset>/surfel-index instead.
+   */
+  surfelIndex?: {
+    source: 'index' | 'surfel-index' | 'preview';
+    wpiIndexVersion: number | null;
+    built: boolean;
+  };
 }
 
 export interface AnalyticSurfelHierarchyNode {

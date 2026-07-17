@@ -43,8 +43,6 @@ export const OPEN_PROJECT_FAILURE_MESSAGE =
   'Project manifest is missing or corrupt. Manual restore is available from project.json.bak; auto-restore is not implemented yet.'
 
 const TASK_FLASH_MS = 6000
-const STRIDED_INDEX_SURFEL_REBUILD_MESSAGE =
-  'Point-cloud index uses the newer strided ownership format. Rebuild the index before generating surfels for the restored a13 path.'
 
 interface PreviewLayerEntry {
   layerId: string
@@ -911,26 +909,27 @@ export class LayerController {
     if (!target) return
     try {
       this.events.onTask('Generating surfel layer...')
-      let result
-      try {
-        result = await window.workbench.generateAnalyticSurfels({
-          assetId: target,
-          surfelCellScale: DEFAULT_SURFEL_CELL_SCALE,
-        })
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        if (!message.includes(STRIDED_INDEX_SURFEL_REBUILD_MESSAGE)) throw error
-
-        this.events.onTask('Rebuilding index for restored surfel path...')
-        const rebuiltIndex = await window.workbench.generatePointCloudIndex({ assetId: target })
-        this.adoptSession(rebuiltIndex.session)
-
-        this.events.onTask('Generating surfel layer from rebuilt index...')
-        result = await window.workbench.generateAnalyticSurfels({
-          assetId: target,
-          surfelCellScale: DEFAULT_SURFEL_CELL_SCALE,
-        })
-      }
+      const result = await window.workbench.generateAnalyticSurfels({
+        assetId: target,
+        surfelCellScale: DEFAULT_SURFEL_CELL_SCALE,
+      })
+      const streamingIndex = result.session.manifest.assets.find(
+        (asset) => asset.pointCloudIndex?.sourceAssetId === target,
+      )?.pointCloudIndex
+      const buildInput = result.metrics.surfelIndex
+      console.info(
+        `[surfel-index] streaming index: ${
+          streamingIndex
+            ? `v${streamingIndex.indexVersion}${streamingIndex.ownership ? ` (${streamingIndex.ownership})` : ''} — untouched`
+            : 'none'
+        } · surfel build input: ${
+          buildInput
+            ? buildInput.source === 'preview'
+              ? 'preview octree'
+              : `${buildInput.source} v${buildInput.wpiIndexVersion} (${buildInput.built ? 'built now' : 'reused'})`
+            : 'unknown'
+        }`,
+      )
       this.adoptSession(result.session)
       const surfelLayer = result.session.manifest.simulationLayers.find((layer) => layer.assetId === result.surfelAssetId)
       if (surfelLayer) await this.ensureLayerLoaded(surfelLayer.id, true)

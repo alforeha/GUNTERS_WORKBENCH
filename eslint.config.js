@@ -9,6 +9,10 @@ export default tseslint.config(
     files: ['src/**/*.ts', 'electron/**/*.ts', 'tests/**/*.ts'],
     rules: {
       'no-useless-assignment': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
+      ],
     },
   },
 );

@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm, writeFile, copyFile, access, appendFile, o
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { projectManifestSchema } from '../src/shared/manifest-schema';
+import { analyticSurfelSchema, projectManifestSchema } from '../src/shared/manifest-schema';
 import { createDefaultManifest } from '../src/shared/project-defaults';
 import type { PointCloudDataset, PointCloudNodePayload } from '../src/core/contract';
 import { inferRgbEncoding, parseLasMetadata } from '../src/core/las/metadata';
@@ -36,8 +36,11 @@ import type {
 import type { ProjectSession } from '../src/shared/ipc';
 import {
   ANALYTIC_SURFEL_ASSET_KIND,
+  INCOMPATIBLE_SURFEL_ARTIFACT_WARNING,
+  QUARANTINED_SURFEL_RECORD_WARNING,
   formatAnalyticSurfelWarning,
   isManagedAnalyticSurfelWarning,
+  isSupportedAnalyticSurfelVersion,
 } from '../src/shared/analytic-surfels';
 import {
   POINT_CLOUD_INDEX_ASSET_KIND,
@@ -51,6 +54,7 @@ import {
 } from '../src/shared/pointcloud-index';
 import { decodeReturnByte } from '../src/shared/wpi-tile';
 import {
+  AnalyticSurfelBuildCancelled,
   buildAnalyticSurfelsFromIndex,
   buildAnalyticSurfelsFromPreview,
   isAnalyticSurfelComplete,
@@ -61,10 +65,12 @@ import {
   readAnalyticSurfelTile,
 } from '../src/shared/analytic-surfel-format';
 import {
+  PointCloudIndexCancelled,
   decodeWpiTileFile,
   isWpiIndexComplete,
   readWpiIndexManifest,
   type BuildPointCloudIndexResult,
+  type WpiIndexManifest,
 } from './pointcloud-index-builder';
 import { createWorkerIndexBuild, type RunIndexBuild } from './pointcloud-index-runner';
 import { generateTestMesh } from '../src/viewer/synthetic';
@@ -87,6 +93,8 @@ const MISSING_SOURCE_CACHE_WARNING = 'Source file is missing; showing cached pre
 const UNIT_WARNING = 'Point-cloud units could not be confirmed from LAS VLRs.';
 const MISSING_DERIVED_SURFEL_WARNING =
   'Derived analytic surfel artifact is missing. Regenerate the surfel layer to restore it.';
+/** Unregistered build-input index for surfel generation; never touches `index/`. */
+const SURFEL_BUILD_INDEX_DIR = 'surfel-index';
 const DENSIFIED_DISCLOSURE_SUFFIX = 'source densification fallback';
 
 interface SaveIntent {
@@ -138,6 +146,10 @@ export class ProjectService {
     } catch {
       throw this.createManifestOpenError();
     }
+
+    // Derived surfel records from a newer/older build must not brick the whole
+    // project — quarantine them before strict validation (see method docs).
+    parsedJson = this.quarantineIncompatibleSurfelAssets(parsedJson);
 
     const parsed = projectManifestSchema.safeParse(parsedJson);
     if (!parsed.success) {
@@ -569,41 +581,57 @@ export class ProjectService {
 
     const controller = new AbortController();
     this.surfelBuilds.set(sourceAsset.id, controller);
-    const compatibleIndex = (asset: AssetRecord): boolean => {
-      const metadata = asset.pointCloudIndex;
-      return Boolean(metadata && metadata.indexVersion === 1 && metadata.ownership !== 'strided');
-    };
-    const incompatibleIndexAsset = (this.currentManifest as ProjectManifest).assets.find(
-      (candidate) => candidate.pointCloudIndex?.sourceAssetId === sourceAsset.id && !compatibleIndex(candidate),
-    );
-    if (incompatibleIndexAsset?.pointCloudIndex) {
-      throw new Error('Point-cloud index uses the newer strided ownership format. Rebuild the index before generating surfels for the restored a13 path.');
-    }
     const indexAsset = (this.currentManifest as ProjectManifest).assets.find(
       (candidate) => candidate.pointCloudIndex?.sourceAssetId === sourceAsset.id && hasValidIndexForStreaming(candidate),
     );
+    // The a13 surfel builder expects v1 file-order ownership. A streaming index in
+    // any other format is left completely untouched — surfels get their own build
+    // input under derived/<asset>/surfel-index instead (never registered as an
+    // asset, never used by streaming or Walk Mode).
+    const a13CompatibleIndex =
+      indexAsset?.pointCloudIndex !== undefined &&
+      indexAsset.pointCloudIndex.indexVersion === 1 &&
+      indexAsset.pointCloudIndex.ownership !== 'strided';
+    const sourceFingerprint = { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs };
     let result;
+    let surfelIndex: NonNullable<AnalyticSurfelMetricsSummary['surfelIndex']>;
     try {
-      if (indexAsset?.pointCloudIndex) {
+      if (indexAsset?.pointCloudIndex && a13CompatibleIndex) {
         const indexDir = path.join(folder, 'derived', sourceAsset.id, 'index');
         const indexManifest = await readWpiIndexManifest(indexDir);
+        surfelIndex = { source: 'index', wpiIndexVersion: indexManifest.wpiIndexVersion, built: false };
         result = await buildAnalyticSurfelsFromIndex({
           outDir: stageDir,
           sourceAssetId: sourceAsset.id,
           indexAssetId: indexAsset.id,
-          sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
+          sourceFingerprint,
           indexDir,
           indexManifest,
           onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
           shouldCancel: () => controller.signal.aborted,
         });
+      } else if (indexAsset?.pointCloudIndex) {
+        const ensured = await this.ensureSurfelBuildIndex(folder, sourceAsset, sourcePath, sourceFingerprint, controller.signal, onProgress);
+        surfelIndex = { source: 'surfel-index', wpiIndexVersion: ensured.manifest.wpiIndexVersion, built: ensured.built };
+        result = await buildAnalyticSurfelsFromIndex({
+          outDir: stageDir,
+          sourceAssetId: sourceAsset.id,
+          // Built from the dedicated surfel-index artifact, not a registered index asset.
+          indexAssetId: null,
+          sourceFingerprint,
+          indexDir: ensured.indexDir,
+          indexManifest: ensured.manifest,
+          onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
+          shouldCancel: () => controller.signal.aborted,
+        });
       } else {
         const preview = await this.loadPointCloudPreview({ assetId: sourceAsset.id });
+        surfelIndex = { source: 'preview', wpiIndexVersion: null, built: false };
         result = await buildAnalyticSurfelsFromPreview({
           outDir: stageDir,
           sourceAssetId: sourceAsset.id,
           indexAssetId: null,
-          sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
+          sourceFingerprint,
           dataset: preview.dataset,
           onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
           shouldCancel: () => controller.signal.aborted,
@@ -616,10 +644,20 @@ export class ProjectService {
       await rename(stageDir, finalDir);
     } catch (err) {
       await rm(stageDir, { recursive: true, force: true });
+      if (err instanceof PointCloudIndexCancelled) throw new AnalyticSurfelBuildCancelled();
       throw err;
     } finally {
       this.surfelBuilds.delete(sourceAsset.id);
     }
+
+    const streamingIndexNote = indexAsset?.pointCloudIndex
+      ? `v${indexAsset.pointCloudIndex.indexVersion}${indexAsset.pointCloudIndex.ownership ? ` (${indexAsset.pointCloudIndex.ownership})` : ''} — untouched`
+      : 'none';
+    const buildInputNote =
+      surfelIndex.source === 'preview'
+        ? 'preview octree'
+        : `${surfelIndex.source} v${surfelIndex.wpiIndexVersion} (${surfelIndex.built ? 'built now' : 'reused'})`;
+    console.info(`[surfel-index] streaming index: ${streamingIndexNote} · surfel build input: ${buildInputNote}`);
 
     const manifest = structuredClone(this.currentManifest as ProjectManifest);
     const surfelAssetId = `${sourceAsset.id}-analytic-surfel`;
@@ -649,6 +687,11 @@ export class ProjectService {
     };
     manifest.assets = manifest.assets.filter((a) => a.id !== surfelAssetId);
     manifest.assets.push(record);
+    // A fresh artifact supersedes any open-time quarantine of the previous one.
+    const sourceRecord = manifest.assets.find((a) => a.id === sourceAsset.id);
+    if (sourceRecord) {
+      sourceRecord.warnings = sourceRecord.warnings.filter((warning) => warning !== QUARANTINED_SURFEL_RECORD_WARNING);
+    }
     manifest.simulationLayers = manifest.simulationLayers.filter((layer) => layer.id !== `layer-${surfelAssetId}`);
     manifest.simulationLayers.push({
       id: `layer-${surfelAssetId}`,
@@ -664,12 +707,75 @@ export class ProjectService {
     return {
       session,
       surfelAssetId,
-      metrics: result.metrics,
+      metrics: { ...result.metrics, surfelIndex },
     };
   }
 
   cancelAnalyticSurfels(input: GenerateAnalyticSurfelsInput): void {
     this.surfelBuilds.get(input.assetId)?.abort();
+  }
+
+  /**
+   * Dedicated build input for the a13 surfel generator when the streaming index
+   * is a newer format: derived/<asset>/surfel-index in the v1 file-order layout.
+   * The normal derived/<asset>/index used by streaming and Walk Mode is never
+   * read, rebuilt, or replaced here. The artifact is reused across generations
+   * while it is complete, v1, and fingerprint-fresh against the current source;
+   * otherwise it is rebuilt via staging swap (a failed build leaves any prior
+   * good surfel-index in place).
+   */
+  private async ensureSurfelBuildIndex(
+    folder: string,
+    sourceAsset: AssetRecord,
+    sourcePath: string,
+    fingerprint: { headerSha256: string; fileSize: number; mtimeMs: number | null },
+    signal: AbortSignal,
+    onProgress?: (progress: AnalyticSurfelProgress) => void,
+  ): Promise<{ indexDir: string; manifest: WpiIndexManifest; built: boolean }> {
+    const parent = path.join(folder, 'derived', sourceAsset.id);
+    const finalDir = path.join(parent, SURFEL_BUILD_INDEX_DIR);
+    try {
+      const existing = await readWpiIndexManifest(finalDir);
+      const fresh =
+        existing.wpiIndexVersion === 1 &&
+        (existing as { ownership?: string }).ownership === undefined &&
+        existing.source.headerSha256 === fingerprint.headerSha256 &&
+        existing.source.fileSize === fingerprint.fileSize &&
+        (existing.source.mtimeMs === null || fingerprint.mtimeMs === null || existing.source.mtimeMs === fingerprint.mtimeMs);
+      if (fresh) {
+        onProgress?.({ assetId: sourceAsset.id, label: 'reusing surfel build index...', pct: null });
+        return { indexDir: finalDir, manifest: existing, built: false };
+      }
+    } catch {
+      // Missing, incomplete, or unreadable — build below.
+    }
+    const stageDir = path.join(parent, `${SURFEL_BUILD_INDEX_DIR}.staging`);
+    await mkdir(parent, { recursive: true });
+    await rm(stageDir, { recursive: true, force: true });
+    try {
+      const built = await this.runIndexBuild(
+        {
+          sourcePath,
+          outDir: stageDir,
+          fileName: sourceAsset.name,
+          sourceFingerprint: fingerprint,
+          generatorVersion: POINT_CLOUD_INDEX_BUILDER_VERSION,
+        },
+        {
+          onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label: `surfel build index: ${label}`, pct }),
+          signal,
+        },
+      );
+      if (!(await isWpiIndexComplete(stageDir))) {
+        throw new Error('Surfel build index finished without a completion marker.');
+      }
+      await rm(finalDir, { recursive: true, force: true });
+      await rename(stageDir, finalDir);
+      return { indexDir: finalDir, manifest: built.manifest, built: true };
+    } catch (err) {
+      await rm(stageDir, { recursive: true, force: true });
+      throw err;
+    }
   }
 
   async loadPointCloudIndexHierarchy(input: LoadPointCloudIndexHierarchyInput): Promise<PointCloudIndexHierarchy> {
@@ -978,6 +1084,66 @@ export class ProjectService {
     return lastEntry.event !== 'complete';
   }
 
+  /**
+   * Pre-validation open tolerance for derived surfel layers: a surfel asset whose
+   * `analyticSurfel` record this build cannot represent (unknown surfelVersion,
+   * malformed shape — e.g. written by a newer build) is removed from the raw
+   * manifest along with its simulation layer, and a "regenerate surfels" warning
+   * is placed on its source point-cloud asset. Surfels are derived data, so
+   * dropping the record loses nothing that regeneration cannot restore — while
+   * failing the whole project open would strand every asset in the project.
+   * Operates on raw JSON (defensively) because it runs before schema validation.
+   */
+  private quarantineIncompatibleSurfelAssets(parsedJson: unknown): unknown {
+    if (typeof parsedJson !== 'object' || parsedJson === null) return parsedJson;
+    const manifest = parsedJson as Record<string, unknown>;
+    const assets = manifest['assets'];
+    if (!Array.isArray(assets)) return parsedJson;
+
+    const asRecord = (value: unknown): Record<string, unknown> | null =>
+      typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : null;
+
+    // Strip our quarantine warning everywhere first so it never outlives its cause.
+    for (const raw of assets) {
+      const asset = asRecord(raw);
+      if (asset && Array.isArray(asset['warnings'])) {
+        asset['warnings'] = asset['warnings'].filter((warning) => warning !== QUARANTINED_SURFEL_RECORD_WARNING);
+      }
+    }
+
+    const quarantinedIds = new Set<string>();
+    const sourceIds = new Set<string>();
+    for (const raw of assets) {
+      const asset = asRecord(raw);
+      const surfel = asset ? asRecord(asset['analyticSurfel']) : null;
+      if (!asset || !surfel) continue;
+      if (analyticSurfelSchema.safeParse(surfel).success) continue;
+      if (typeof asset['id'] === 'string') quarantinedIds.add(asset['id']);
+      if (typeof surfel['sourceAssetId'] === 'string') sourceIds.add(surfel['sourceAssetId']);
+    }
+    if (quarantinedIds.size === 0) return parsedJson;
+
+    const keptAssets = assets.filter((raw) => {
+      const asset = asRecord(raw);
+      return !(asset && typeof asset['id'] === 'string' && quarantinedIds.has(asset['id']));
+    });
+    manifest['assets'] = keptAssets;
+    const layers = manifest['simulationLayers'];
+    if (Array.isArray(layers)) {
+      manifest['simulationLayers'] = layers.filter((raw) => {
+        const layer = asRecord(raw);
+        return !(layer && typeof layer['assetId'] === 'string' && quarantinedIds.has(layer['assetId']));
+      });
+    }
+    for (const raw of keptAssets) {
+      const asset = asRecord(raw);
+      if (!asset || typeof asset['id'] !== 'string' || !sourceIds.has(asset['id'])) continue;
+      if (!Array.isArray(asset['warnings'])) continue;
+      asset['warnings'] = [...asset['warnings'], QUARANTINED_SURFEL_RECORD_WARNING];
+    }
+    return parsedJson;
+  }
+
   private async applyPointCloudOpenChecks(projectFolder: string, manifest: ProjectManifest): Promise<ProjectManifest> {
     const next = structuredClone(manifest);
     for (const asset of next.assets) {
@@ -1025,6 +1191,20 @@ export class ProjectService {
       );
       if (!surfelPath || !(await this.exists(surfelPath))) {
         asset.warnings.push(MISSING_DERIVED_SURFEL_WARNING);
+        for (const layer of layers) layer.status = 'error';
+        continue;
+      }
+      // The record may be fine while the artifact on disk is from another build
+      // (or truncated). Verify it is readable and a version this build can decode
+      // before letting the layer activate; display would misparse foreign tiles.
+      let artifactVersion: unknown = null;
+      try {
+        artifactVersion = (await readAnalyticSurfelManifest(path.dirname(surfelPath))).surfelVersion;
+      } catch {
+        artifactVersion = null;
+      }
+      if (!isSupportedAnalyticSurfelVersion(artifactVersion)) {
+        asset.warnings.push(INCOMPATIBLE_SURFEL_ARTIFACT_WARNING);
         for (const layer of layers) layer.status = 'error';
         continue;
       }

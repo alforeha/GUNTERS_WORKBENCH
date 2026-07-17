@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ProjectService } from '../electron/project-service';
@@ -262,6 +262,7 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(surfelAsset.analyticSurfel?.sourceAssetId).toBe(assetId);
     expect(surfelAsset.analyticSurfel?.indexAssetId).toBeNull();
     expect(generated.metrics.surfelCount).toBeGreaterThan(0);
+    expect(generated.metrics.surfelIndex).toEqual({ source: 'preview', wpiIndexVersion: null, built: false });
     expect(existsSync(path.join(projectFolder, 'derived', assetId, 'surfels', 'index.json'))).toBe(true);
 
     const hierarchy = await svc.loadAnalyticSurfelHierarchy({ assetId: generated.surfelAssetId });
@@ -295,6 +296,9 @@ describe('ProjectService.generatePointCloudIndex', () => {
 
     const surfelAsset = surfels.session.manifest.assets.find((a) => a.id === surfels.surfelAssetId)!;
     expect(surfelAsset.analyticSurfel?.indexAssetId).toBe(index.indexAssetId);
+    // A compatible streaming index is used directly — no dedicated surfel-index appears.
+    expect(surfels.metrics.surfelIndex).toEqual({ source: 'index', wpiIndexVersion: 1, built: false });
+    expect(existsSync(path.join(projectFolder, 'derived', assetId, 'surfel-index'))).toBe(false);
 
     await svc.closeProject();
     const reopened = await svc.openProject({ projectFolder });
@@ -303,8 +307,8 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(reopenedAsset?.warnings ?? []).toEqual([]);
   });
 
-  it('rejects surfel generation from an incompatible strided index and asks for rebuild', async () => {
-    const { svc, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+  it('generates surfels from a separate surfel-index without touching a strided streaming index', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
     const generated = await svc.generatePointCloudIndex({ assetId });
     const manifest = structuredClone(generated.session.manifest);
     const indexAsset = manifest.assets.find((a) => a.id === generated.indexAssetId)!;
@@ -313,7 +317,90 @@ describe('ProjectService.generatePointCloudIndex', () => {
     indexAsset.pointCloudIndex.ownership = 'strided';
     await svc.saveProject(manifest);
 
-    await expect(svc.generateAnalyticSurfels({ assetId })).rejects.toThrow(/rebuild the index/i);
+    const streamingManifestPath = path.join(projectFolder, 'derived', assetId, 'index', 'index.json');
+    const streamingManifestBefore = await readFile(streamingManifestPath, 'utf8');
+
+    const surfels = await svc.generateAnalyticSurfels({ assetId });
+
+    // The streaming/Walk index is byte-identical and its record keeps the newer format.
+    expect(await readFile(streamingManifestPath, 'utf8')).toBe(streamingManifestBefore);
+    const streamingRecord = surfels.session.manifest.assets.find((a) => a.id === generated.indexAssetId)!.pointCloudIndex!;
+    expect(streamingRecord.indexVersion).toBe(2);
+    expect(streamingRecord.ownership).toBe('strided');
+
+    // Surfels were built from the dedicated surfel-index instead.
+    expect(existsSync(path.join(projectFolder, 'derived', assetId, 'surfel-index', 'index.json'))).toBe(true);
+    expect(existsSync(path.join(projectFolder, 'derived', assetId, 'surfel-index.staging'))).toBe(false);
+    expect(surfels.metrics.surfelIndex).toEqual({ source: 'surfel-index', wpiIndexVersion: 1, built: true });
+    expect(surfels.metrics.surfelCount).toBeGreaterThan(0);
+    const surfelAsset = surfels.session.manifest.assets.find((a) => a.id === surfels.surfelAssetId)!;
+    expect(surfelAsset.analyticSurfel?.indexAssetId).toBeNull();
+    expect(projectManifestSchema.safeParse(surfels.session.manifest).success).toBe(true);
+  });
+
+  it('reuses the dedicated surfel-index across regenerations', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    const generated = await svc.generatePointCloudIndex({ assetId });
+    const manifest = structuredClone(generated.session.manifest);
+    const indexAsset = manifest.assets.find((a) => a.id === generated.indexAssetId)!;
+    indexAsset.pointCloudIndex!.indexVersion = 2;
+    indexAsset.pointCloudIndex!.ownership = 'strided';
+    await svc.saveProject(manifest);
+
+    const first = await svc.generateAnalyticSurfels({ assetId });
+    expect(first.metrics.surfelIndex).toEqual({ source: 'surfel-index', wpiIndexVersion: 1, built: true });
+
+    const surfelIndexManifestPath = path.join(projectFolder, 'derived', assetId, 'surfel-index', 'index.json');
+    const before = await readFile(surfelIndexManifestPath, 'utf8');
+
+    const second = await svc.generateAnalyticSurfels({ assetId });
+    expect(second.metrics.surfelIndex).toEqual({ source: 'surfel-index', wpiIndexVersion: 1, built: false });
+    expect(await readFile(surfelIndexManifestPath, 'utf8')).toBe(before);
+  });
+
+  it('opens a project with an unsupported surfelVersion record by quarantining the surfel layer', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    const surfels = await svc.generateAnalyticSurfels({ assetId });
+    await svc.closeProject();
+
+    const projectFile = path.join(projectFolder, 'project.json');
+    const raw = JSON.parse(await readFile(projectFile, 'utf8')) as {
+      assets: { id: string; analyticSurfel?: { surfelVersion: number } }[];
+    };
+    const surfelRaw = raw.assets.find((a) => a.id === surfels.surfelAssetId)!;
+    surfelRaw.analyticSurfel!.surfelVersion = 3;
+    await writeFile(projectFile, JSON.stringify(raw, null, 2));
+
+    const reopened = await svc.openProject({ projectFolder });
+    expect(reopened.manifest.assets.some((a) => a.id === surfels.surfelAssetId)).toBe(false);
+    expect(reopened.manifest.simulationLayers.some((layer) => layer.assetId === surfels.surfelAssetId)).toBe(false);
+    const source = reopened.manifest.assets.find((a) => a.id === assetId)!;
+    expect(source.warnings.some((warning) => /regenerate/i.test(warning))).toBe(true);
+    expect(projectManifestSchema.safeParse(reopened.manifest).success).toBe(true);
+
+    // Regenerating replaces the quarantined layer and clears the source warning.
+    const regenerated = await svc.generateAnalyticSurfels({ assetId });
+    const restored = regenerated.session.manifest.assets.find((a) => a.id === surfels.surfelAssetId);
+    expect(restored?.analyticSurfel?.surfelVersion).toBe(1);
+    const sourceAfter = regenerated.session.manifest.assets.find((a) => a.id === assetId)!;
+    expect(sourceAfter.warnings.some((warning) => /removed from the project/i.test(warning))).toBe(false);
+  });
+
+  it('marks an on-disk surfel artifact with an unsupported version as error on reopen', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    const surfels = await svc.generateAnalyticSurfels({ assetId });
+    await svc.closeProject();
+
+    const artifactPath = path.join(projectFolder, 'derived', assetId, 'surfels', 'index.json');
+    const artifact = JSON.parse(await readFile(artifactPath, 'utf8')) as { surfelVersion: number };
+    artifact.surfelVersion = 3;
+    await writeFile(artifactPath, JSON.stringify(artifact));
+
+    const reopened = await svc.openProject({ projectFolder });
+    const surfelAsset = reopened.manifest.assets.find((a) => a.id === surfels.surfelAssetId)!;
+    const surfelLayer = reopened.manifest.simulationLayers.find((layer) => layer.assetId === surfels.surfelAssetId)!;
+    expect(surfelAsset.warnings.some((warning) => /regenerate/i.test(warning))).toBe(true);
+    expect(surfelLayer.status).toBe('error');
   });
 
   it('keeps 8-bit RGB stored in u16 bright in both preview and indexed paths', async () => {

@@ -58,7 +58,9 @@ const pointCloudIndexSchema = z.object({
   }),
 });
 
-const analyticSurfelSchema = z.object({
+// Exported so project open can quarantine (rather than fail on) derived surfel
+// records this build cannot represent — see ProjectService.openProject.
+export const analyticSurfelSchema = z.object({
   sourceAssetId: z.string().min(1),
   indexAssetId: z.string().nullable(),
   surfelType: z.literal('analytic-surfel-octree'),
