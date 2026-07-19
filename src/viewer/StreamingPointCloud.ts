@@ -108,6 +108,7 @@ export class StreamingPointCloud {
   private readonly dropped = new Set<string>();
 
   private visibleAll = true;
+  private walkDataActive = false;
   private pointSize = 2;
   private appearance: PointAppearance = DEFAULT_POINT_APPEARANCE;
   private focusRegion: RegionXY | null = null;
@@ -195,6 +196,10 @@ export class StreamingPointCloud {
     this.pointSize = THREE.MathUtils.clamp(pointSize, 1, 5);
     this.group.visible = visible;
     this.refreshMaterialSizes();
+  }
+
+  setWalkDataActive(active: boolean): void {
+    this.walkDataActive = active;
   }
 
   /** Shared appearance model: fixed/auto radius, quick scale, and range clip. */
@@ -404,8 +409,10 @@ export class StreamingPointCloud {
    */
   update(camera: THREE.Camera, viewportHeightPx: number, fovYRadians: number): boolean {
     this.tick++;
-    this.group.visible = this.visibleAll;
-    if (!this.visibleAll) {
+    const renderVisible = this.visibleAll;
+    const streamActive = this.visibleAll || this.walkDataActive;
+    this.group.visible = renderVisible;
+    if (!streamActive) {
       let changed = false;
       for (const ln of this.loaded.values()) {
         if (ln.points.visible) {
@@ -460,8 +467,12 @@ export class StreamingPointCloud {
           this.packNode(ln);
           changed = true;
         }
-        if (!ln.points.visible) {
+        if (renderVisible && !ln.points.visible) {
           ln.points.visible = true;
+          changed = true;
+        }
+        if (!renderVisible && ln.points.visible) {
+          ln.points.visible = false;
           changed = true;
         }
       }
@@ -596,7 +607,7 @@ export class StreamingPointCloud {
     colorAttr.needsUpdate = true;
     ln.points.geometry.setDrawRange(0, written);
     ln.points.geometry.computeBoundingSphere();
-    ln.points.visible = written > 0 && this.selectionKeys.has(ln.key);
+    ln.points.visible = written > 0 && this.selectionKeys.has(ln.key) && this.visibleAll;
     ln.colorEpoch = this.colorEpoch;
   }
 

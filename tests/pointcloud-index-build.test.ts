@@ -144,6 +144,23 @@ const FINGERPRINT = (buf: Buffer) => ({
 });
 
 describe('buildPointCloudIndex', () => {
+  it('emits a v2 manifest with strided ownership by default', async () => {
+    const points = makeSourcePoints(128);
+    const las = buildLas(points);
+    const outDir = await tempOutDir();
+    const result = await buildPointCloudIndex({
+      source: chunkSource(las),
+      outDir,
+      fileName: 'fixture.las',
+      sourceFingerprint: FINGERPRINT(las),
+      generatorVersion: '2.0.0',
+      nodeCapacity: 16,
+    });
+
+    expect(result.manifest.wpiIndexVersion).toBe(2);
+    expect(result.manifest.ownership).toBe('strided');
+  });
+
   it('reconstructs the source points bit-exactly from the union of tiles (single tile)', async () => {
     const points = makeSourcePoints(500);
     const las = buildLas(points);
@@ -200,6 +217,52 @@ describe('buildPointCloudIndex', () => {
       for (const child of byKey.get(key)?.childKeys ?? []) stack.push(child);
     }
     for (const node of result.manifest.nodes) expect(reachable.has(node.key)).toBe(true);
+  });
+
+  it('assigns coarse ownership by striding through traversed points rather than taking a file-order prefix', async () => {
+    const points: SourcePoint[] = [
+      ...Array.from({ length: 8 }, (_, i) => ({
+        x: i,
+        y: 0,
+        z: 0,
+        intensity: i,
+        classification: 1,
+        returnByte: 0x11,
+        r: 100,
+        g: 200,
+        b: 300,
+      })),
+      ...Array.from({ length: 8 }, (_, i) => ({
+        x: 50_000 + i,
+        y: 50_000,
+        z: 0,
+        intensity: 100 + i,
+        classification: 2,
+        returnByte: 0x11,
+        r: 400,
+        g: 500,
+        b: 600,
+      })),
+    ];
+    const las = buildLas(points);
+    const outDir = await tempOutDir();
+    const result = await buildPointCloudIndex({
+      source: chunkSource(las),
+      outDir,
+      fileName: 'fixture.las',
+      sourceFingerprint: FINGERPRINT(las),
+      generatorVersion: '2.0.0',
+      nodeCapacity: 4,
+      maxDepth: 4,
+    });
+
+    const root = result.manifest.nodes.find((node) => node.key === result.manifest.root);
+    expect(root).toBeDefined();
+    const tile = await decodeWpiTileFile(outDir, root!.tile);
+    expect(tile.pointCount).toBe(4);
+    const xs = Array.from(tile.x);
+    expect(xs.some((x) => x < 25_000)).toBe(true);
+    expect(xs.some((x) => x > 25_000)).toBe(true);
   });
 
   it('writes the completion marker last and validates it', async () => {

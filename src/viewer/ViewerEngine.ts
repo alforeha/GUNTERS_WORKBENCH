@@ -952,6 +952,11 @@ uniform float edlOrtho;
     this.requestRender();
   }
 
+  setPointCloudIndexWalkTargetActive(handle: string, active: boolean): void {
+    this.pointCloudIndexes.get(handle)?.setWalkDataActive(active);
+    this.requestRender();
+  }
+
   setPointCloudIndexDisplayMode(handle: string, mode: PointDisplayMode): void {
     this.pointCloudIndexes.get(handle)?.setDisplayMode(mode);
     this.requestRender();
@@ -2274,7 +2279,7 @@ uniform float edlOrtho;
   private resolvePointCloudGroundZAt(handle: string, x: number, y: number): number | null {
     const streaming = this.pointCloudIndexes.get(handle);
     if (!streaming) return null;
-    return streaming.estimateGroundZ(x, y, streaming.walkGroundRadius(), 0.1, 12)?.z ?? null;
+    return this.estimateWalkGroundZ(streaming, x, y);
   }
 
   /**
@@ -2285,6 +2290,10 @@ uniform float edlOrtho;
   private estimateWalkStartGroundZ(handle: string, x: number, y: number): number | null {
     const streaming = this.pointCloudIndexes.get(handle);
     if (!streaming) return null;
+    return this.estimateWalkGroundZ(streaming, x, y);
+  }
+
+  private estimateWalkGroundZ(streaming: StreamingPointCloud, x: number, y: number): number | null {
     const base = streaming.walkGroundRadius();
     for (const [mult, minPts] of [[1, 12], [2, 12], [4, 8], [8, 6]] as const) {
       const est = streaming.estimateGroundZ(x, y, base * mult, 0.1, minPts);

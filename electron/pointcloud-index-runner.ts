@@ -23,6 +23,7 @@ export interface RunIndexBuildParams {
   fileName: string;
   sourceFingerprint: { headerSha256: string; fileSize: number; mtimeMs: number | null };
   generatorVersion: string;
+  ownershipMode?: 'file-order' | 'strided';
   nodeCapacity?: number;
   maxDepth?: number;
 }
@@ -49,6 +50,7 @@ export const inlineIndexBuild: RunIndexBuild = async (params, hooks) => {
     fileName: params.fileName,
     sourceFingerprint: params.sourceFingerprint,
     generatorVersion: params.generatorVersion,
+    ownershipMode: params.ownershipMode,
     onProgress: hooks.onProgress,
     shouldCancel: () => hooks.signal?.aborted ?? false,
     nodeCapacity: params.nodeCapacity,

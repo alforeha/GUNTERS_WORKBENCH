@@ -47,9 +47,11 @@ import {
   POINT_CLOUD_INDEX_BUILDER_VERSION,
   POINT_CLOUD_INDEX_WARNING_PREFIX,
   detectIndexStaleness,
+  formatOutdatedIndexWarning,
   formatStaleIndexWarning,
   hasValidIndexForStreaming,
   isManagedIndexWarning,
+  isStaleIndexWarning,
   type CurrentSourceFingerprint,
 } from '../src/shared/pointcloud-index';
 import { decodeReturnByte } from '../src/shared/wpi-tile';
@@ -471,6 +473,7 @@ export class ProjectService {
           fileName: sourceAsset.name,
           sourceFingerprint: { headerSha256, fileSize: sourceStats.size, mtimeMs: sourceStats.mtimeMs },
           generatorVersion: POINT_CLOUD_INDEX_BUILDER_VERSION,
+          ownershipMode: 'strided',
         },
         {
           onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label, pct }),
@@ -508,6 +511,7 @@ export class ProjectService {
         sourceAssetId: sourceAsset.id,
         indexType: 'wpi-octree',
         indexVersion: built.wpiIndexVersion,
+        ownership: built.ownership,
         source: {
           headerSha256,
           fileSize: sourceStats.size,
@@ -582,7 +586,10 @@ export class ProjectService {
     const controller = new AbortController();
     this.surfelBuilds.set(sourceAsset.id, controller);
     const indexAsset = (this.currentManifest as ProjectManifest).assets.find(
-      (candidate) => candidate.pointCloudIndex?.sourceAssetId === sourceAsset.id && hasValidIndexForStreaming(candidate),
+      (candidate) =>
+        candidate.kind === POINT_CLOUD_INDEX_ASSET_KIND &&
+        candidate.pointCloudIndex?.sourceAssetId === sourceAsset.id &&
+        !candidate.warnings.some((warning) => isStaleIndexWarning(warning)),
     );
     // The a13 surfel builder expects v1 file-order ownership. A streaming index in
     // any other format is left completely untouched — surfels get their own build
@@ -760,6 +767,7 @@ export class ProjectService {
           fileName: sourceAsset.name,
           sourceFingerprint: fingerprint,
           generatorVersion: POINT_CLOUD_INDEX_BUILDER_VERSION,
+          ownershipMode: 'file-order',
         },
         {
           onProgress: (label, pct) => onProgress?.({ assetId: sourceAsset.id, label: `surfel build index: ${label}`, pct }),
@@ -919,6 +927,9 @@ export class ProjectService {
     const indexAsset = (this.currentManifest as ProjectManifest).assets.find((a) => a.id === indexAssetId && a.pointCloudIndex);
     if (!indexAsset) {
       throw new Error(`No point-cloud index is registered for asset ${assetId}.`);
+    }
+    if (!hasValidIndexForStreaming(indexAsset)) {
+      throw new Error(`Point-cloud index ${indexAssetId} is stale or outdated. Rebuild the main index before indexed display or Walk Mode.`);
     }
     const indexDir = path.join(folder, 'derived', assetId, 'index');
     const manifest = await readWpiIndexManifest(indexDir); // throws on missing marker / corrupt
@@ -1178,6 +1189,8 @@ export class ProjectService {
       } catch {
         asset.warnings.push(`${POINT_CLOUD_INDEX_WARNING_PREFIX} freshness could not be verified from the current source.`);
       }
+      const outdated = formatOutdatedIndexWarning(asset.pointCloudIndex.indexVersion);
+      if (outdated) asset.warnings.push(outdated);
     }
 
     for (const asset of next.assets) {

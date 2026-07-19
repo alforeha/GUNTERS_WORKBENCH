@@ -26,6 +26,7 @@ if (port) {
         fileName: params.fileName,
         sourceFingerprint: params.sourceFingerprint,
         generatorVersion: params.generatorVersion,
+        ownershipMode: params.ownershipMode,
         onProgress: (label, pct) => post({ type: 'progress', label, pct }),
         shouldCancel: () => cancelled,
         nodeCapacity: params.nodeCapacity,

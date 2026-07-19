@@ -1,4 +1,4 @@
-// src/shared/pointcloud-index.ts — pure, THREE-/Node-free helpers describing the WPI v1
+// src/shared/pointcloud-index.ts — pure, THREE-/Node-free helpers describing the WPI v2
 // point-cloud index record and its staleness detection. Kept free of fs/electron so the
 // comparison logic is unit-testable in isolation (same pattern as pointCloudLod.ts).
 //
@@ -12,11 +12,11 @@ export const POINT_CLOUD_INDEX_ASSET_KIND = 'point-cloud-index';
 /** The only index type this build understands. */
 export const POINT_CLOUD_INDEX_TYPE = 'wpi-octree';
 /** On-disk/manifest index format version. Bump when the tile/hierarchy layout changes. */
-export const POINT_CLOUD_INDEX_VERSION = 1;
+export const POINT_CLOUD_INDEX_VERSION = 2;
 /** Generator identity recorded on every index so provenance is honest. */
 export const POINT_CLOUD_INDEX_GENERATOR_NAME = 'workbench';
 /** Semantic version of the WPI builder; stamped into generator.version on each index. */
-export const POINT_CLOUD_INDEX_BUILDER_VERSION = '1.0.0';
+export const POINT_CLOUD_INDEX_BUILDER_VERSION = '2.0.0';
 
 /** All friendly index warnings share this prefix so open-time checks can dedupe them. */
 export const POINT_CLOUD_INDEX_WARNING_PREFIX = 'Point-cloud index';
@@ -109,9 +109,20 @@ export function formatStaleIndexWarning(result: IndexStalenessResult): string | 
   return `${POINT_CLOUD_INDEX_WARNING_PREFIX} may be out of date (${detail}). Regenerate the index to match the current source.`;
 }
 
+/** Friendly warning for indexes built with an older, no-longer-preferred format. */
+export function formatOutdatedIndexWarning(indexVersion: number): string | null {
+  if (indexVersion >= POINT_CLOUD_INDEX_VERSION) return null;
+  return `${POINT_CLOUD_INDEX_WARNING_PREFIX} format is outdated (v${indexVersion}); rebuild the index for indexed display and Walk Mode.`;
+}
+
 /** Whether a warning string is one this module produced (for idempotent open-time dedupe). */
 export function isManagedIndexWarning(warning: string): boolean {
   return warning.startsWith(POINT_CLOUD_INDEX_WARNING_PREFIX);
+}
+
+/** Whether a warning says the index format is older than the current streaming/display target. */
+export function isOutdatedIndexWarning(warning: string): boolean {
+  return isManagedIndexWarning(warning) && warning.includes('format is outdated');
 }
 
 /**
@@ -129,11 +140,11 @@ export function isStaleIndexWarning(warning: string): boolean {
  * Gate for the densification→streaming demotion (Phase 4).
  *
  * An index asset is considered *valid for streaming* when it exists, has the correct kind,
- * and carries NO stale-index warnings.  A missing-source warning does NOT disqualify the
- * index — the index tiles are self-contained under derived/ and streaming remains the only
- * viable refinement path (densification also needs the missing source).  Only genuinely
- * stale indexes (source fingerprint diverged) are treated as absent for this gate, leaving
- * densification fallback available.
+ * and carries NO stale-index or outdated-format warnings. A missing-source warning does NOT
+ * disqualify the index — the index tiles are self-contained under derived/ and streaming
+ * remains the only viable refinement path (densification also needs the missing source).
+ * Older v1/file-order indexes are also treated as absent for streaming/display so the UI
+ * can fall back to preview, prompt a rebuild, and avoid the known patchy coarse coverage.
  */
 export function hasValidIndexForStreaming(
   indexAsset: { kind: string; warnings: string[] } | undefined,
@@ -141,6 +152,6 @@ export function hasValidIndexForStreaming(
   return (
     indexAsset !== undefined &&
     indexAsset.kind === POINT_CLOUD_INDEX_ASSET_KIND &&
-    !indexAsset.warnings.some((w) => isStaleIndexWarning(w))
+    !indexAsset.warnings.some((w) => isStaleIndexWarning(w) || isOutdatedIndexWarning(w))
   );
 }

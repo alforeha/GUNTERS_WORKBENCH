@@ -7,6 +7,7 @@ import { projectManifestSchema } from '../src/shared/manifest-schema';
 import {
   POINT_CLOUD_INDEX_ASSET_KIND,
   detectIndexStaleness,
+  formatOutdatedIndexWarning,
   formatStaleIndexWarning,
   hasValidIndexForStreaming,
   isStaleIndexWarning,
@@ -71,9 +72,15 @@ async function writeSyntheticLasFile(folder: string, fileName: string, pointCoun
   return filePath;
 }
 
-function indexAssetFor(sourceAsset: AssetRecord, fingerprint: PointCloudIndexSourceFingerprint): AssetRecord {
+function indexAssetFor(
+  sourceAsset: AssetRecord,
+  fingerprint: PointCloudIndexSourceFingerprint,
+  options: { indexVersion?: 1 | 2; ownership?: 'file-order' | 'strided' } = {},
+): AssetRecord {
   const pc = sourceAsset.pointCloud!;
   const now = new Date().toISOString();
+  const indexVersion = options.indexVersion ?? 2;
+  const ownership = options.ownership ?? (indexVersion === 2 ? 'strided' : undefined);
   return {
     id: `${sourceAsset.id}-index`,
     name: `${sourceAsset.name} index`,
@@ -88,7 +95,8 @@ function indexAssetFor(sourceAsset: AssetRecord, fingerprint: PointCloudIndexSou
     pointCloudIndex: {
       sourceAssetId: sourceAsset.id,
       indexType: 'wpi-octree',
-      indexVersion: 1,
+      indexVersion,
+      ownership,
       source: { ...fingerprint, rgbEncoding: sourceAsset.pointCloud?.rgbEncoding },
       pointCount: pc.pointCount,
       bounds: pc.bounds,
@@ -122,7 +130,7 @@ async function importedProjectWithIndex(): Promise<{
     headerSha256: sourceAsset.pointCloud!.headerSha256,
     fileSize: sourceAsset.pointCloud!.fileSize,
     mtimeMs: stats.mtimeMs,
-  });
+  }, { indexVersion: 1 });
   manifest.assets.push(indexAsset);
   const saved = await svc.saveProject(manifest);
   return { svc, projectFolder: saved.projectFolder, sourceFile, sourceAsset, indexId: indexAsset.id };
@@ -173,6 +181,11 @@ describe('detectIndexStaleness', () => {
     expect(result.stale).toBe(false);
     expect(result.sourceMissing).toBe(true);
     expect(formatStaleIndexWarning(result)).toMatch(/missing/i);
+  });
+
+  it('formats an outdated warning for older main-index versions', () => {
+    expect(formatOutdatedIndexWarning(1)).toMatch(/format is outdated/i);
+    expect(formatOutdatedIndexWarning(2)).toBeNull();
   });
 });
 
@@ -285,20 +298,53 @@ describe('point-cloud index manifest record', () => {
 // ── open-time staleness against the real project service ────────────────────────
 describe('index staleness on reopen', () => {
   it('records no stale warning while the source is unchanged', async () => {
-    const { svc, projectFolder, indexId } = await importedProjectWithIndex();
+    const { svc, projectFolder, sourceFile, sourceAsset } = await importedProjectWithIndex();
+    const stats = await stat(sourceFile);
+    const manifest = structuredClone((await svc.openProject({ projectFolder })).manifest) as ProjectManifest;
+    manifest.assets = manifest.assets.map((asset) =>
+      asset.id === `${sourceAsset.id}-index`
+        ? indexAssetFor(sourceAsset, {
+            headerSha256: sourceAsset.pointCloud!.headerSha256,
+            fileSize: sourceAsset.pointCloud!.fileSize,
+            mtimeMs: stats.mtimeMs,
+          })
+        : asset,
+    );
+    await svc.saveProject(manifest);
     await svc.closeProject();
     const reopened = await svc.openProject({ projectFolder });
-    expect(indexWarnings(reopened.manifest, indexId)).toEqual([]);
+    expect(indexWarnings(reopened.manifest, `${sourceAsset.id}-index`)).toEqual([]);
   });
 
   it('keeps the index valid after the disposable cache is deleted', async () => {
-    const { svc, projectFolder, sourceAsset, indexId } = await importedProjectWithIndex();
+    const { svc, projectFolder, sourceAsset, sourceFile } = await importedProjectWithIndex();
+    const stats = await stat(sourceFile);
+    const manifest = structuredClone((await svc.openProject({ projectFolder })).manifest) as ProjectManifest;
+    manifest.assets = manifest.assets.map((asset) =>
+      asset.id === `${sourceAsset.id}-index`
+        ? indexAssetFor(sourceAsset, {
+            headerSha256: sourceAsset.pointCloud!.headerSha256,
+            fileSize: sourceAsset.pointCloud!.fileSize,
+            mtimeMs: stats.mtimeMs,
+          })
+        : asset,
+    );
+    await svc.saveProject(manifest);
     // populate then delete the preview cache for the source asset
     await svc.loadPointCloudPreview({ assetId: sourceAsset.id });
     await rm(path.join(projectFolder, 'cache', sourceAsset.id), { recursive: true, force: true });
     await svc.closeProject();
     const reopened = await svc.openProject({ projectFolder });
-    expect(indexWarnings(reopened.manifest, indexId)).toEqual([]);
+    expect(indexWarnings(reopened.manifest, `${sourceAsset.id}-index`)).toEqual([]);
+  });
+
+  it('warns when an existing main index is still v1/file-order', async () => {
+    const { svc, projectFolder, indexId } = await importedProjectWithIndex();
+    await svc.closeProject();
+    const reopened = await svc.openProject({ projectFolder });
+    expect(indexWarnings(reopened.manifest, indexId)).toEqual([
+      'Point-cloud index format is outdated (v1); rebuild the index for indexed display and Walk Mode.',
+    ]);
   });
 
   it('surfaces a stale warning after the source file changes', async () => {
@@ -377,13 +423,13 @@ describe('hasValidIndexForStreaming', () => {
     ).toBe(true);
   });
 
-  it('still returns true with a format-outdated warning (v1 stays streamable)', () => {
+  it('returns false with a format-outdated warning (v1 no longer qualifies for indexed display/walk)', () => {
     expect(
       hasValidIndexForStreaming({
         kind: POINT_CLOUD_INDEX_ASSET_KIND,
-        warnings: ['Point-cloud index format is outdated (v1); regenerate for improved coarse-level display.'],
+        warnings: ['Point-cloud index format is outdated (v1); rebuild the index for indexed display and Walk Mode.'],
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 });
 

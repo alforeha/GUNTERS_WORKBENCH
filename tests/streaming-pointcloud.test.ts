@@ -173,6 +173,22 @@ describe('StreamingPointCloud', () => {
     expect(spc.group.visible).toBe(false);
     expect(spc.group.children[0]!.visible).toBe(false);
   });
+
+  it('keeps loading walk data while hidden when a walk target is active', async () => {
+    const spc = new StreamingPointCloud('pc', hierarchy(), SCENE_ORIGIN, immediateFetcher());
+
+    spc.setDisplay(false, 2);
+    spc.setWalkDataActive(true);
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y);
+    await flush();
+    spc.update(camAt(5000), VIEWPORT_H, FOV_Y);
+
+    expect(spc.group.visible).toBe(false);
+    expect(spc.group.children.every((child) => !child.visible)).toBe(true);
+    expect(spc.getLoadedPointCount()).toBe(240_000);
+    expect(spc.isSettledState()).toBe(true);
+    expect(spc.estimateGroundZ(0, 0, spc.walkGroundRadius(), 0.1, 12)?.z).toBe(0);
+  });
 });
 
 // ── Appearance (shared model with RenderPointCloud) ───────────────────────────

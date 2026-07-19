@@ -1,4 +1,4 @@
-// electron/pointcloud-index-builder.ts — WPI v1 point-cloud index builder (Electron-main /
+// electron/pointcloud-index-builder.ts — WPI point-cloud index builder (Electron-main /
 // worker-thread side). Streaming, bounded-memory, two-pass construction modeled on
 // las.worker.ts: a topology pass discovers the octree structure, a distribution pass routes
 // every source point to exactly one node and spools it to disk, then each node's records are
@@ -54,10 +54,11 @@ export interface WpiIndexNode {
 }
 
 export interface WpiIndexManifest {
-  wpiIndexVersion: 1;
+  wpiIndexVersion: 1 | 2;
   indexType: 'wpi-octree';
   generator: { name: 'workbench'; version: string };
   generatedAt: string;
+  ownership?: 'file-order' | 'strided';
   source: {
     headerSha256: string;
     fileSize: number;
@@ -65,6 +66,7 @@ export interface WpiIndexManifest {
     pointCount: number;
     pointFormat: number;
     pointRecordLength: number;
+    rgbEncoding?: 'u16' | 'u8-in-u16';
   };
   bounds: PointCloudBounds;
   scale: [number, number, number];
@@ -87,6 +89,7 @@ export interface BuildPointCloudIndexInput {
   fileName: string;
   sourceFingerprint: { headerSha256: string; fileSize: number; mtimeMs: number | null };
   generatorVersion: string;
+  ownershipMode?: 'file-order' | 'strided';
   onProgress?: (label: string, pct: number | null) => void;
   shouldCancel?: () => boolean;
   yieldTick?: () => Promise<void>;
@@ -156,6 +159,10 @@ class BuildNode {
   ownCount = 0;
   seen = 0;
   written = 0;
+  traversed = 0;
+  strideK = 1;
+  routedSeen = 0;
+  routedOwned = 0;
   children: (BuildNode | null)[] | null = null;
 
   constructor(
@@ -190,6 +197,7 @@ function childNode(parent: BuildNode, idx: number): BuildNode {
 function insertPoint(root: BuildNode, wx: number, wy: number, wz: number, capacity: number, maxDepth: number): void {
   let cur = root;
   for (;;) {
+    cur.traversed++;
     if (cur.children) {
       const idx = childIndex(cur.bounds, wx, wy, wz);
       let child = cur.children[idx];
@@ -214,17 +222,26 @@ function insertPoint(root: BuildNode, wx: number, wy: number, wz: number, capaci
 }
 
 /** Pass 2: re-derive the owner of a point in the same file order as pass 1. */
-function routePoint(root: BuildNode, wx: number, wy: number, wz: number): BuildNode {
+function routePoint(root: BuildNode, wx: number, wy: number, wz: number, ownershipMode: 'file-order' | 'strided'): BuildNode {
   let cur = root;
   for (;;) {
     if (!cur.children) return cur; // leaf owns everything routed to it
-    if (cur.seen < cur.ownCount) {
+    if (ownershipMode === 'strided') {
+      cur.routedSeen++;
+      if (cur.routedSeen % cur.strideK === 0 && cur.routedOwned < cur.ownCount) {
+        cur.routedOwned++;
+        return cur;
+      }
+    } else if (cur.seen < cur.ownCount) {
       cur.seen++;
       return cur; // among the first `ownCount` arrivals — owned here, as in pass 1
     }
     const idx = childIndex(cur.bounds, wx, wy, wz);
-    const child = cur.children[idx];
-    if (!child) return cur; // defensive: never seen in practice; keeps the point in a real tile
+    let child = cur.children[idx];
+    if (!child) {
+      child = childNode(cur, idx);
+      cur.children[idx] = child;
+    }
     cur = child;
   }
 }
@@ -375,6 +392,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
   const onProgress = input.onProgress ?? (() => {});
   const nodeCapacity = input.nodeCapacity ?? WPI_NODE_CAPACITY;
   const maxDepth = input.maxDepth ?? WPI_MAX_DEPTH;
+  const ownershipMode = input.ownershipMode ?? 'strided';
 
   const tilesDir = path.join(input.outDir, WPI_INDEX_TILES_DIR);
   await rm(input.outDir, { recursive: true, force: true });
@@ -425,6 +443,11 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
   );
 
   const nodes = collectNodes(root);
+  if (ownershipMode === 'strided') {
+    for (const node of nodes) {
+      node.strideK = Math.max(1, Math.floor(node.traversed / nodeCapacity));
+    }
+  }
   const stride = wpiRecordStride(hasRgb);
   const spooler = new TileSpooler(tilesDir, hasRgb, stride);
 
@@ -439,7 +462,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
       const wx = ix * sx + ox;
       const wy = iy * sy + oy;
       const wz = iz * sz + oz;
-      const node = routePoint(root, wx, wy, wz);
+      const node = routePoint(root, wx, wy, wz, ownershipMode);
       spooler.write(node, {
         x: ix,
         y: iy,
@@ -517,10 +540,11 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
   }
 
   const manifest: WpiIndexManifest = {
-    wpiIndexVersion: 1,
+    wpiIndexVersion: ownershipMode === 'strided' ? 2 : 1,
     indexType: 'wpi-octree',
     generator: { name: 'workbench', version: input.generatorVersion },
     generatedAt: new Date().toISOString(),
+    ownership: ownershipMode === 'strided' ? 'strided' : undefined,
     source: {
       headerSha256: input.sourceFingerprint.headerSha256,
       fileSize: input.sourceFingerprint.fileSize,
@@ -528,6 +552,7 @@ export async function buildPointCloudIndex(input: BuildPointCloudIndexInput): Pr
       pointCount: meta.pointCount,
       pointFormat: meta.pointFormat,
       pointRecordLength: meta.pointRecordLength,
+      rgbEncoding: hasRgb ? 'u16' : undefined,
     },
     bounds: meta.bounds,
     scale: meta.scale,

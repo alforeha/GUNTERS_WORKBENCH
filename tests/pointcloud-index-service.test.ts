@@ -143,7 +143,8 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(indexAsset.truthStatus).toBe('indexed-full');
     expect(indexAsset.pointCloudIndex?.sourceAssetId).toBe(assetId);
     expect(indexAsset.pointCloudIndex?.indexType).toBe('wpi-octree');
-    expect(indexAsset.pointCloudIndex?.indexVersion).toBe(1);
+    expect(indexAsset.pointCloudIndex?.indexVersion).toBe(2);
+    expect(indexAsset.pointCloudIndex?.ownership).toBe('strided');
 
     expect(existsSync(path.join(projectFolder, 'derived', assetId, 'index', 'index.json'))).toBe(true);
     expect(existsSync(path.join(projectFolder, 'derived', assetId, 'index', 'COMPLETE'))).toBe(true);
@@ -289,16 +290,18 @@ describe('ProjectService.generatePointCloudIndex', () => {
     expect(generated.metrics.surfelCount).toBeGreaterThan(0);
   });
 
-  it('builds analytic surfels from an index and survives reopen', async () => {
+  it('builds analytic surfels from a separate surfel-index when the main index is v2 and survives reopen', async () => {
     const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
     const index = await svc.generatePointCloudIndex({ assetId });
     const surfels = await svc.generateAnalyticSurfels({ assetId });
 
     const surfelAsset = surfels.session.manifest.assets.find((a) => a.id === surfels.surfelAssetId)!;
-    expect(surfelAsset.analyticSurfel?.indexAssetId).toBe(index.indexAssetId);
-    // A compatible streaming index is used directly — no dedicated surfel-index appears.
-    expect(surfels.metrics.surfelIndex).toEqual({ source: 'index', wpiIndexVersion: 1, built: false });
-    expect(existsSync(path.join(projectFolder, 'derived', assetId, 'surfel-index'))).toBe(false);
+    expect(surfelAsset.analyticSurfel?.indexAssetId).toBeNull();
+    expect(surfels.metrics.surfelIndex).toEqual({ source: 'surfel-index', wpiIndexVersion: 1, built: true });
+    expect(existsSync(path.join(projectFolder, 'derived', assetId, 'surfel-index', 'index.json'))).toBe(true);
+    const streamingRecord = surfels.session.manifest.assets.find((a) => a.id === index.indexAssetId)!.pointCloudIndex!;
+    expect(streamingRecord.indexVersion).toBe(2);
+    expect(streamingRecord.ownership).toBe('strided');
 
     await svc.closeProject();
     const reopened = await svc.openProject({ projectFolder });
@@ -310,12 +313,6 @@ describe('ProjectService.generatePointCloudIndex', () => {
   it('generates surfels from a separate surfel-index without touching a strided streaming index', async () => {
     const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
     const generated = await svc.generatePointCloudIndex({ assetId });
-    const manifest = structuredClone(generated.session.manifest);
-    const indexAsset = manifest.assets.find((a) => a.id === generated.indexAssetId)!;
-    if (!indexAsset.pointCloudIndex) throw new Error('missing pointCloudIndex metadata');
-    indexAsset.pointCloudIndex.indexVersion = 2;
-    indexAsset.pointCloudIndex.ownership = 'strided';
-    await svc.saveProject(manifest);
 
     const streamingManifestPath = path.join(projectFolder, 'derived', assetId, 'index', 'index.json');
     const streamingManifestBefore = await readFile(streamingManifestPath, 'utf8');
@@ -340,13 +337,7 @@ describe('ProjectService.generatePointCloudIndex', () => {
 
   it('reuses the dedicated surfel-index across regenerations', async () => {
     const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
-    const generated = await svc.generatePointCloudIndex({ assetId });
-    const manifest = structuredClone(generated.session.manifest);
-    const indexAsset = manifest.assets.find((a) => a.id === generated.indexAssetId)!;
-    indexAsset.pointCloudIndex!.indexVersion = 2;
-    indexAsset.pointCloudIndex!.ownership = 'strided';
-    await svc.saveProject(manifest);
-
+    await svc.generatePointCloudIndex({ assetId });
     const first = await svc.generateAnalyticSurfels({ assetId });
     expect(first.metrics.surfelIndex).toEqual({ source: 'surfel-index', wpiIndexVersion: 1, built: true });
 
@@ -356,6 +347,20 @@ describe('ProjectService.generatePointCloudIndex', () => {
     const second = await svc.generateAnalyticSurfels({ assetId });
     expect(second.metrics.surfelIndex).toEqual({ source: 'surfel-index', wpiIndexVersion: 1, built: false });
     expect(await readFile(surfelIndexManifestPath, 'utf8')).toBe(before);
+  });
+
+  it('continues loading the visible index from derived/<asset>/index even when surfel-index exists', async () => {
+    const { svc, projectFolder, assetId } = await importedProject({ runIndexBuild: inlineIndexBuild });
+    await svc.generatePointCloudIndex({ assetId });
+    await svc.generateAnalyticSurfels({ assetId });
+
+    const surfelIndexManifestPath = path.join(projectFolder, 'derived', assetId, 'surfel-index', 'index.json');
+    await writeFile(surfelIndexManifestPath, JSON.stringify({ root: 'broken-root', nodes: [], wpiIndexVersion: 1 }, null, 2));
+
+    const hierarchy = await svc.loadPointCloudIndexHierarchy({ assetId });
+    expect(hierarchy.root).toBe('0-0-0-0');
+    const { tiles } = await svc.loadPointCloudIndexTiles({ assetId, keys: [hierarchy.root] });
+    expect(tiles).toHaveLength(1);
   });
 
   it('opens a project with an unsupported surfelVersion record by quarantining the surfel layer', async () => {

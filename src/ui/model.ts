@@ -14,7 +14,7 @@ import type {
   SimulationLayerKind,
   SimulationLayerStatus,
 } from '../shared/workbench-types'
-import { isStaleIndexWarning } from '../shared/pointcloud-index'
+import { isOutdatedIndexWarning, isStaleIndexWarning } from '../shared/pointcloud-index'
 import {
   getTemplate,
   objectCategoryLabel,
@@ -893,14 +893,17 @@ export function buildWorkSurfaceModel(manifest: ProjectManifest, assetId: string
   const surfelAsset = manifest.assets.find((candidate) => candidate.analyticSurfel?.sourceAssetId === assetId)
 
   const indexStale = indexAsset !== undefined && indexAsset.warnings.some((warning) => isStaleIndexWarning(warning))
+  const indexOutdated = indexAsset !== undefined && indexAsset.warnings.some((warning) => isOutdatedIndexWarning(warning))
   const index: DerivedStatusModel = indexAsset?.pointCloudIndex
     ? {
         present: true,
         summary: `${compactCount(indexAsset.pointCloudIndex.pointCount)} points indexed (WPI v${indexAsset.pointCloudIndex.indexVersion})`,
         generatedAt: indexAsset.pointCloudIndex.generatedAt,
-        stale: indexStale,
+        stale: indexStale || indexOutdated,
         staleNote: indexStale
           ? 'The source file changed after this index was built. Rebuild to match the current source.'
+          : indexOutdated
+            ? 'This index is an older v1/file-order build. Rebuild the main index for indexed display and Walk Mode.'
           : null,
         actionLabel: 'Rebuild index',
       }

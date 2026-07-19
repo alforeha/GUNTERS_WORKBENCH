@@ -143,7 +143,7 @@ export class LayerController {
   private readonly indexLayers = new Map<string, IndexLayerEntry>()
   private readonly derivedSurfaceLayers = new Map<string, DerivedSurfaceLayerEntry>()
   private readonly derivedSurfelLayers = new Map<string, DerivedSurfelLayerEntry>()
-  private walkVisibilityRestore: (() => void) | null = null
+  private walkTargetHandle: string | null = null
 
   /** Session-only per-layer appearance (decision recorded: not persisted to the manifest). */
   private readonly appearance = new Map<string, LayerAppearance>()
@@ -195,7 +195,7 @@ export class LayerController {
           detail: available
             ? 'Indexed point cloud walk'
             : indexAsset
-              ? 'Index is stale. Rebuild index first.'
+              ? 'Index is stale or outdated. Rebuild main index first.'
               : 'No index yet. Build index first.',
           available,
           buildIndexFirst: !available,
@@ -224,19 +224,16 @@ export class LayerController {
       return { ok: false, reason: 'The indexed point cloud could not be loaded for walking.' }
     }
     this.endWalkTarget()
-    if (layer.status === 'hidden') {
-      const look = this.appearanceFor(layer.id)
-      viewer.setPointCloudIndexDisplay(entry.handle, true, look.pointSize)
-      this.walkVisibilityRestore = () => {
-        this.viewer?.setPointCloudIndexDisplay(entry.handle, false, look.pointSize)
-      }
-    }
+    viewer.setPointCloudIndexWalkTargetActive(entry.handle, true)
+    this.walkTargetHandle = entry.handle
     return { ok: true, handle: entry.handle, label: sourceAsset.name }
   }
 
   endWalkTarget(): void {
-    this.walkVisibilityRestore?.()
-    this.walkVisibilityRestore = null
+    if (this.walkTargetHandle && this.viewer) {
+      this.viewer.setPointCloudIndexWalkTargetActive(this.walkTargetHandle, false)
+    }
+    this.walkTargetHandle = null
   }
 
   ensureViewer(): ViewerEngine {
@@ -782,6 +779,7 @@ export class LayerController {
     this.selectedPointCloudSourceAssetId = null
     this.pendingDensify = false
     this.pendingDensifyKey = ''
+    this.walkTargetHandle = null
     this.previewLayers.clear()
     this.previewLayerByHandle.clear()
     this.indexLayers.clear()
